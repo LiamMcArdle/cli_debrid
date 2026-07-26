@@ -6,6 +6,17 @@ import json
 import os
 import time
 
+# The v4 API returns only 'cached' and 'last_modified' per service - no 'expiry'
+# field. Entries with no expiry are aged out against last_modified instead, so a
+# stale claim from a peer cannot be trusted indefinitely. Override with
+# CLI_DEBRID_PHALANX_MAX_AGE_HOURS; 0 disables age-based expiry.
+try:
+    PHALANX_MAX_AGE_HOURS = float(os.environ.get('CLI_DEBRID_PHALANX_MAX_AGE_HOURS', 24))
+except ValueError:
+    logging.warning("Invalid CLI_DEBRID_PHALANX_MAX_AGE_HOURS value, using default 24.")
+    PHALANX_MAX_AGE_HOURS = 24.0
+
+
 class PhalanxDBClassManager:
     """Manager class for handling cache status checks using Phalanx-DB service"""
 
@@ -206,6 +217,19 @@ class PhalanxDBClassManager:
                             logging.info(f"Cache entry for {hash_value} is expired (expiry: {expiry}), triggering new cache check")
                             return None
 
+                elif last_modified is not None and PHALANX_MAX_AGE_HOURS > 0:
+                    # No expiry field (v4 API): age the entry out against last_modified.
+                    # Without this the guard above never runs and an arbitrarily old
+                    # claim is served as authoritative.
+                    now = datetime.now(last_modified.tzinfo)
+                    age = now - last_modified
+                    if age > timedelta(hours=PHALANX_MAX_AGE_HOURS):
+                        logging.info(
+                            f"Cache entry for {hash_value} is stale "
+                            f"(last_modified: {last_modified}, age: {age}, "
+                            f"max: {PHALANX_MAX_AGE_HOURS}h), triggering new cache check")
+                        return None
+
                 return {
                     'is_cached': service_data.get('cached', False),
                     'timestamp': last_modified,
@@ -293,6 +317,16 @@ class PhalanxDBClassManager:
                                         logging.info(f"Cache entry for {hash_value} is expired (expiry: {expiry}), triggering new cache check")
                                         continue
                         except (ValueError, AttributeError):
+                            continue
+
+                    elif last_modified is not None and PHALANX_MAX_AGE_HOURS > 0:
+                        # No expiry field (v4 API): age out against last_modified.
+                        now = datetime.now(last_modified.tzinfo)
+                        if now - last_modified > timedelta(hours=PHALANX_MAX_AGE_HOURS):
+                            logging.info(
+                                f"Cache entry for {hash_value} is stale "
+                                f"(last_modified: {last_modified}, "
+                                f"max: {PHALANX_MAX_AGE_HOURS}h), triggering new cache check")
                             continue
 
                     results[hash_value] = {
@@ -507,6 +541,12 @@ class PhalanxDBClassManager:
                                                 continue
                                 except (ValueError, AttributeError) as e:
                                     logging.warning(f"Invalid expiry format in entry {entry['infohash']}: {service_data.get('expiry')}")
+                                    continue
+
+                            elif last_modified is not None and PHALANX_MAX_AGE_HOURS > 0:
+                                # No expiry field (v4 API): age out against last_modified.
+                                now = datetime.now(last_modified.tzinfo)
+                                if now - last_modified > timedelta(hours=PHALANX_MAX_AGE_HOURS):
                                     continue
 
                             entries.append({
