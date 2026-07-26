@@ -557,10 +557,46 @@ def rank_result_key(
             # Anime pattern matching - look for episode number patterns like "Title - 20" or "Title 20"
             anime_format = result.get('anime_format')
             
-            # Check for common anime episode patterns
+            # Episode ranges ("01-17", "(01-12)", "E01-E24") identify a batch and must
+            # be detected before the single-episode pattern below. That pattern requires
+            # the character after the digits to be one of \s $ . _ [ , so it cannot
+            # consume "01-" in "Title - 01-17 (...)": it skips ahead and matches "-17 "
+            # instead, reporting episode 17. The batch was then scored as a wrong-episode
+            # single and penalised on every episode in it except the last - which is the
+            # dominant fansub naming convention.
+            anime_range_pattern = re.search(
+                r'(?:^|[\s_\[(-])(?:s\d{1,2})?e?(\d{1,4})\s*[-~]\s*(?:s\d{1,2})?e?(\d{1,4})'
+                r'(?=\s|$|[\].)_])',
+                torrent_title, re.IGNORECASE)
+            range_bounds = None
+            if anime_range_pattern:
+                start_raw, end_raw = anime_range_pattern.group(1), anime_range_pattern.group(2)
+                range_start, range_end = int(start_raw), int(end_raw)
+                # Four digits allows long-running shows (One Piece is past ep 1000) but
+                # would also swallow year spans like "2019-2021"; reject those.
+                looks_like_years = (
+                    len(start_raw) == 4 and len(end_raw) == 4
+                    and 1900 <= range_start <= 2099 and 1900 <= range_end <= 2099
+                )
+                if range_end > range_start and not looks_like_years:
+                    range_bounds = (range_start, range_end)
+
             anime_episode_pattern = re.search(r'[-\s_](\d{1,3})(\s|$|\.|_|\[)', torrent_title)
-            
-            if anime_episode_pattern:
+
+            if range_bounds:
+                range_start, range_end = range_bounds
+                if query_episode is not None and range_start <= query_episode <= range_end:
+                    # Same policy as the batch/season-pack branch below
+                    content_type_score = 30 if multi else -400
+                    logging.debug(
+                        f"Anime batch range {range_start}-{range_end} covers requested "
+                        f"episode {query_episode}; scored as batch ({content_type_score})")
+                else:
+                    content_type_score = -250
+                    logging.debug(
+                        f"Applied penalty for anime batch range {range_start}-{range_end} "
+                        f"not covering requested episode {query_episode}")
+            elif anime_episode_pattern:
                 # Found a potential episode number
                 potential_episode = int(anime_episode_pattern.group(1))
                 
