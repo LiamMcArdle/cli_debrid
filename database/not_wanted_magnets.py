@@ -2,7 +2,113 @@ import pickle
 import os
 import re
 import logging
+import tempfile
+from contextlib import contextmanager
 from utilities.settings import get_setting
+from utilities.file_lock import FileLock
+
+
+@contextmanager
+def _file_guard(target_path):
+    """Hold an exclusive lock for the duration of a read-modify-write on target_path.
+
+    The lock lives in a sidecar .lock file rather than in the pickle itself: opening
+    the pickle 'wb' truncates it before any lock on it could be acquired, which is
+    the window that loses data.
+    """
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    lock_file = open(target_path + '.lock', 'a+')
+    try:
+        with FileLock(lock_file):
+            yield
+    finally:
+        try:
+            lock_file.close()
+        except Exception:
+            pass
+
+
+def _atomic_dump(target_path, data):
+    """Write data to target_path via a temp file and an atomic rename.
+
+    Concurrent readers see either the previous complete file or the new complete
+    file, never a truncated one.
+    """
+    directory = os.path.dirname(target_path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix='.not_wanted-', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            pickle.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp creates 0600; match the 0644 a plain open() would have produced.
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, target_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _read_pickle(target_path):
+    """Return (set, trustworthy). Never raises.
+
+    trustworthy is False when the file exists but could not be understood. Callers
+    must not persist the empty set in that case: writing it back turns a transient
+    read failure into permanent loss of the whole list.
+    """
+    try:
+        with open(target_path, 'rb') as f:
+            data = pickle.load(f)
+    except FileNotFoundError:
+        return set(), True
+    except Exception as e:
+        logging.error(
+            f"not_wanted: could not read {target_path}: {e!r} - "
+            f"treating as unreadable, NOT as empty"
+        )
+        return set(), False
+
+    if not isinstance(data, set):
+        logging.error(
+            f"not_wanted: {target_path} contained {type(data).__name__}, expected set - "
+            f"treating as unreadable, NOT as empty"
+        )
+        return set(), False
+
+    return data, True
+
+
+def _load_store(target_path):
+    data, _ = _read_pickle(target_path)
+    return data
+
+
+def _save_store(target_path, values):
+    if not isinstance(values, set):
+        raise TypeError(f"expected a set for {target_path}, got {type(values).__name__}")
+    with _file_guard(target_path):
+        _atomic_dump(target_path, values)
+
+
+def _add_to_store(target_path, value):
+    """Locked read-modify-write. Returns True if the value was newly added."""
+    with _file_guard(target_path):
+        values, trustworthy = _read_pickle(target_path)
+        if not trustworthy:
+            logging.error(
+                f"not_wanted: refusing to overwrite unreadable {target_path} with a "
+                f"single-entry set; leaving it untouched"
+            )
+            return False
+        if value in values:
+            return False
+        values.add(value)
+        _atomic_dump(target_path, values)
+        return True
 
 
 def normalize_title(t: str) -> str:
@@ -50,26 +156,18 @@ def extract_nzb_segment_id(nzb_xml: str) -> str:
 
 
 def load_not_wanted_nzb_segments():
-    try:
-        with open(NOT_WANTED_NZB_SEGMENTS_FILE, 'rb') as f:
-            return pickle.load(f)
-    except (EOFError, pickle.UnpicklingError, FileNotFoundError):
-        return set()
+    return _load_store(NOT_WANTED_NZB_SEGMENTS_FILE)
 
 
 def save_not_wanted_nzb_segments(s):
-    os.makedirs(os.path.dirname(NOT_WANTED_NZB_SEGMENTS_FILE), exist_ok=True)
-    with open(NOT_WANTED_NZB_SEGMENTS_FILE, 'wb') as f:
-        pickle.dump(s, f)
+    _save_store(NOT_WANTED_NZB_SEGMENTS_FILE, s)
 
 
 def add_to_not_wanted_nzb_segment(segment_id: str):
     if not segment_id:
         return
-    s = load_not_wanted_nzb_segments()
-    s.add(segment_id.strip().strip('<>').lower())
-    save_not_wanted_nzb_segments(s)
-    logging.info(f'[NZB] Added broken NZB segment ID {segment_id!r} to not-wanted list')
+    if _add_to_store(NOT_WANTED_NZB_SEGMENTS_FILE, segment_id.strip().strip('<>').lower()):
+        logging.info(f'[NZB] Added broken NZB segment ID {segment_id!r} to not-wanted list')
 
 
 def is_nzb_segment_not_wanted(nzb_xml: str) -> bool:
@@ -122,27 +220,18 @@ def extract_nzb_guid(url_or_guid: str) -> str:
 
 
 def load_not_wanted_nzb_guids():
-    try:
-        with open(NOT_WANTED_NZB_GUIDS_FILE, 'rb') as f:
-            return pickle.load(f)
-    except (EOFError, pickle.UnpicklingError, FileNotFoundError):
-        return set()
+    return _load_store(NOT_WANTED_NZB_GUIDS_FILE)
 
 
 def save_not_wanted_nzb_guids(s):
-    os.makedirs(os.path.dirname(NOT_WANTED_NZB_GUIDS_FILE), exist_ok=True)
-    with open(NOT_WANTED_NZB_GUIDS_FILE, 'wb') as f:
-        pickle.dump(s, f)
+    _save_store(NOT_WANTED_NZB_GUIDS_FILE, s)
 
 
 def add_to_not_wanted_nzb_guid(url_or_guid: str):
     guid = extract_nzb_guid(url_or_guid)
     if not guid:
         return
-    s = load_not_wanted_nzb_guids()
-    if guid not in s:
-        s.add(guid)
-        save_not_wanted_nzb_guids(s)
+    if _add_to_store(NOT_WANTED_NZB_GUIDS_FILE, guid):
         logging.info(f'[NZB] Added broken NZB guid {guid!r} to not-wanted list')
 
 
@@ -160,28 +249,16 @@ def is_nzb_guid_not_wanted(url_or_guid: str) -> bool:
 
 
 def load_not_wanted_magnets():
-    try:
-        with open(NOT_WANTED_MAGNETS_FILE, 'rb') as f:
-            return pickle.load(f)
-    except (EOFError, pickle.UnpicklingError):
-        # If the file is empty or not a valid pickle object, return an empty set
-        return set()
-    except FileNotFoundError:
-        # If the file does not exist, create it and return an empty set
-        os.makedirs(os.path.dirname(NOT_WANTED_MAGNETS_FILE), exist_ok=True)
-        with open(NOT_WANTED_MAGNETS_FILE, 'wb') as f:
-            pickle.dump(set(), f)
-        return set()
+    return _load_store(NOT_WANTED_MAGNETS_FILE)
 
 def save_not_wanted_magnets(not_wanted_set):
-    os.makedirs(os.path.dirname(NOT_WANTED_MAGNETS_FILE), exist_ok=True)
-    with open(NOT_WANTED_MAGNETS_FILE, 'wb') as f:
-        pickle.dump(not_wanted_set, f)
+    _save_store(NOT_WANTED_MAGNETS_FILE, not_wanted_set)
 
 def add_to_not_wanted(hash_value, item_identifier=None, item=None):
-    not_wanted = load_not_wanted_magnets()
-    not_wanted.add(hash_value)
-    save_not_wanted_magnets(not_wanted)
+    if hash_value is None:
+        logging.debug("Received None value for hash in add_to_not_wanted — skipping")
+        return
+    _add_to_store(NOT_WANTED_MAGNETS_FILE, hash_value)
 
 def get_base_filename(url):
     """Extract the base filename from a URL or magnet link."""
@@ -229,7 +306,7 @@ def is_magnet_not_wanted(magnet):
         return False
         
     # Check if the hash exists in not_wanted
-    is_not_wanted = magnet_hash in [get_base_filename(nw) for nw in not_wanted if nw is not None]
+    is_not_wanted = magnet_hash in {get_base_filename(nw) for nw in not_wanted if nw is not None}
     if is_not_wanted:
         logging.info(f"Filtering out magnet {magnet[:60]}... as it is in not_wanted_magnets list")
     return is_not_wanted
@@ -241,9 +318,10 @@ def get_not_wanted_urls():
     return load_not_wanted_urls()
 
 def add_to_not_wanted_urls(url, item_identifier=None, item=None):
-    not_wanted = load_not_wanted_urls()
-    not_wanted.add(url)
-    save_not_wanted_urls(not_wanted)
+    if url is None:
+        logging.debug("Received None value for url in add_to_not_wanted_urls — skipping")
+        return
+    _add_to_store(NOT_WANTED_URLS_FILE, url)
 
 def is_url_not_wanted(url):
     if get_setting('Debug','disable_not_wanted_check', False):
@@ -255,32 +333,21 @@ def is_url_not_wanted(url):
     url_filename = get_base_filename(url)
     
     # Check if the filename exists in not_wanted
-    is_not_wanted = url_filename in [get_base_filename(nw) for nw in not_wanted]
+    is_not_wanted = url_filename in {get_base_filename(nw) for nw in not_wanted if nw is not None}
     if is_not_wanted:
         logging.info(f"Filtering out URL {url} as it is in not_wanted_urls list")
     return is_not_wanted
 
 def load_not_wanted_urls():
-    try:
-        with open(NOT_WANTED_URLS_FILE, 'rb') as f:
-            return pickle.load(f)
-    except (EOFError, pickle.UnpicklingError):
-        return set()
-    except FileNotFoundError:
-        os.makedirs(os.path.dirname(NOT_WANTED_URLS_FILE), exist_ok=True)
-        with open(NOT_WANTED_URLS_FILE, 'wb') as f:
-            pickle.dump(set(), f)
-        return set()
-    
+    return _load_store(NOT_WANTED_URLS_FILE)
+
 def save_not_wanted_urls(not_wanted_set):
-    os.makedirs(os.path.dirname(NOT_WANTED_URLS_FILE), exist_ok=True)
-    with open(NOT_WANTED_URLS_FILE, 'wb') as f:
-        pickle.dump(not_wanted_set, f)
+    _save_store(NOT_WANTED_URLS_FILE, not_wanted_set)
 
 def purge_not_wanted_magnets_file():
     # Purge the contents of the file by overwriting it with an empty set
-    with open(NOT_WANTED_MAGNETS_FILE, 'wb') as f:
-        pickle.dump(set(), f)
+    _save_store(NOT_WANTED_MAGNETS_FILE, set())
+    logging.warning("The 'not_wanted_magnets.pkl' file has been purged.")
     print("The 'not_wanted_magnets.pkl' file has been purged.")
 
 def validate_not_wanted_entries():
@@ -294,14 +361,13 @@ def validate_not_wanted_entries():
         logging.info("First 5 magnet entries:")
         for i, magnet in enumerate(list(magnets)[:5]):
             if magnet is None:
-                logging.error(f"Entry {i} is None - removing invalid entry")
-                magnets.remove(None)
+                logging.error(f"Entry {i} is None - will be removed")
                 continue
             logging.info(f"  {i+1}. {magnet[:60]}...")
-    
+
     # Save cleaned magnets if any None values were removed
     if None in magnets:
-        magnets.remove(None)
+        magnets.discard(None)
         save_not_wanted_magnets(magnets)
         logging.info("Cleaned up not wanted magnets list by removing None values")
 
