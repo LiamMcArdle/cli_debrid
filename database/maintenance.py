@@ -989,23 +989,30 @@ def check_orphaned_symlinks(cursor, symlink_base_path, checked_folders):
     
     logging.info(f"Loaded {len(db_paths)} paths from database")
 
-    # First count directories for progress tracking
-    logging.info("Counting directories to process...")
-    for root, dirs, _ in os.walk(symlink_base_path):
-        if root not in checked_folders:
-            total_dirs += 1
-    logging.info(f"Found {total_dirs} directories to check")
-
-    # Walk the symlink directory
+    # Collect the tree in a single pass. This previously walked the whole tree once
+    # just to count directories and then walked it again to do the work - two full
+    # traversals of a network/FUSE mount, the first of which logged nothing between
+    # its start and end lines (observed: ~25 minutes of silence, and ~80-100 minutes
+    # total for this phase while holding the scheduler executor).
+    logging.info("Scanning symlink tree...")
+    pending_dirs = []
     for root, _, files in os.walk(symlink_base_path):
         # Skip folders we already checked in Phase 1
         if root in checked_folders:
             continue
-            
+        pending_dirs.append((root, files))
+        if len(pending_dirs) % 250 == 0:
+            logging.info(f"Scanning: {len(pending_dirs)} directories found so far...")
+    total_dirs = len(pending_dirs)
+    logging.info(f"Found {total_dirs} directories to check")
+
+    for root, files in pending_dirs:
         processed_dirs += 1
         if processed_dirs % 10 == 0 or processed_dirs == total_dirs:
-            logging.info(f"Progress: {processed_dirs}/{total_dirs} directories checked ({(processed_dirs/total_dirs)*100:.1f}%)")
-            
+            pct = (processed_dirs / total_dirs * 100) if total_dirs else 100.0
+            logging.info(f"Progress: {processed_dirs}/{total_dirs} directories checked ({pct:.1f}%)")
+
+
         for filename in files:
             full_path = os.path.join(root, filename)
             
