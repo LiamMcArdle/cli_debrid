@@ -145,14 +145,13 @@ def filter_results(
     # --- End Language Code Filtering Setup ---
     
     # Determine base similarity threshold
-    # Override anime similarity threshold to be more restrictive to prevent false matches
     original_anime_setting = version_settings.get('similarity_threshold_anime', 0.60)
-    anime_threshold = max(0.80, float(original_anime_setting))
+    anime_threshold = float(original_anime_setting)
     base_similarity_threshold = anime_threshold if is_anime else float(version_settings.get('similarity_threshold', 0.8))
-    
+
     # Debug logging for threshold issues
     if is_anime:
-        logging.info(f"DEBUG THRESHOLD: Original anime setting: {original_anime_setting}, enforced minimum: {anime_threshold}, is_anime: {is_anime}")
+        logging.info(f"DEBUG THRESHOLD: anime similarity threshold: {anime_threshold}, is_anime: {is_anime}")
     
     # Adjust threshold for shorter titles if not anime/UFC (which have their own specific low threshold)
     # We'll check is_ufc later in the loop for each result, but for threshold setting,
