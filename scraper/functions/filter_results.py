@@ -1960,7 +1960,27 @@ def get_resolution_value(resolution: str) -> int:
         '480p': 480, 'sd': 480,
         '360p': 360
     }
-    return resolution_order.get(resolution.lower(), 0)
+    if not resolution:
+        return 0
+
+    key = resolution.lower().strip()
+    if key in resolution_order:
+        return resolution_order[key]
+
+    # PTT normalizes 16:9 dimension forms ('1920x1080' -> '1080p') but leaves
+    # non-standard widths alone, e.g. '1440x1080p' and '1448x1080p' for
+    # anamorphic broadcast anime. Those are genuinely 1080-line sources, so
+    # take the height rather than falling through to 0 (which reads as SD).
+    match = re.match(r'^\d{3,4}\s*[x*]\s*(\d{3,4})p?$', key)
+    if match:
+        return int(match.group(1))
+
+    # Bare line-count labels outside the table above ('576p', '540p').
+    match = re.match(r'^(\d{3,4})p$', key)
+    if match:
+        return int(match.group(1))
+
+    return 0
 
 def resolution_filter(result_resolution: str, max_resolution: str, resolution_wanted: str) -> bool:
     """
