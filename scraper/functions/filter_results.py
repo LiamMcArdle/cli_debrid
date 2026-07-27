@@ -733,9 +733,15 @@ def filter_results(
                     logging.info(f"  Weighting: set=0.3, sort=0.7 (parsed title prioritized)")
                 else:
                     logging.info(f"  Weighting: using set similarity only (no parsed title)")
-                # Show simple similarity calculations if they were computed
+                # Show simple similarity calculations if they were computed.
+                # simple_sim_parsed is initialized to None when there is no parsed
+                # title, and ':.3f' raises TypeError on None -- which the NameError
+                # guard does not catch. That propagates to the per-result handler,
+                # so a debug log line silently discards an otherwise valid result.
                 try:
-                    logging.info(f"  Simple similarities - result: {simple_sim_result:.3f}, parsed: {simple_sim_parsed:.3f}, combined: {simple_sim:.3f}")
+                    _sims = ["n/a" if v is None else f"{v:.3f}"
+                             for v in (simple_sim_result, simple_sim_parsed, simple_sim)]
+                    logging.info(f"  Simple similarities - result: {_sims[0]}, parsed: {_sims[1]}, combined: {_sims[2]}")
                 except NameError:
                     logging.info(f"  Simple similarities - not computed (similarity was high enough)")
                 logging.info(f"  Alias similarities: {alias_similarities}")
