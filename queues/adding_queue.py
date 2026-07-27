@@ -103,7 +103,40 @@ class AddingQueue:
         if not torrent_id:
             logging.warning("Attempted to remove torrent with empty ID")
             return
-            
+
+        # One torrent commonly backs many media items - a season pack here reaches 580
+        # episodes. Removing it because a SINGLE item no longer needs it (the usual
+        # caller is the post-upgrade cleanup, which passes the old torrent id) breaks
+        # every sibling still pointing at it. Worse, the not-wanted entry added below
+        # permanently blocks re-acquiring that release, so the siblings cannot recover:
+        # they are dropped by the missing-file cleanup on the next library pass.
+        # Only remove a torrent that nothing else is still using.
+        try:
+            from database.core import get_db_connection
+            _conn = get_db_connection()
+            try:
+                _still_used = _conn.execute(
+                    "SELECT COUNT(*) FROM media_items "
+                    "WHERE filled_by_torrent_id = ? AND state = 'Collected'",
+                    (torrent_id,)
+                ).fetchone()[0]
+            finally:
+                _conn.close()
+            if _still_used:
+                logging.info(
+                    f"Keeping torrent {torrent_id}: still backs {_still_used} collected "
+                    f"item(s). Skipping removal and not-wanted entry."
+                )
+                return
+        except Exception as e:
+            # If we cannot prove the torrent is unused, leave it alone. A stale torrent
+            # costs debrid space; a wrongly removed one costs content.
+            logging.warning(
+                f"Could not verify whether torrent {torrent_id} is still in use ({e}); "
+                f"skipping removal to avoid breaking sibling items."
+            )
+            return
+
         hash_value = None # Initialize hash_value
         try:
             # Get torrent info before removal to record hash
