@@ -591,6 +591,11 @@ SETTINGS_SCHEMA = {
             "description": "Enable upgrading of items in the queue",
             "default": False
         },
+        "upgrade_window_days": {
+            "type": "integer",
+            "description": "How many days after release an item stays eligible for upgrading. A better release often lands weeks later (a WEB-DL followed by a BluRay remux, or a 4K re-release). Set 0 for no time limit.",
+            "default": 7
+        },
         "upgrading_percentage_threshold": {
             "type": "float",
             "description": "Percentage threshold for upgrading (enter as decimal representation of percentage,0.0 to 1.0). Higher values mean an item's score must be higher than the threshold to be upgraded.",
