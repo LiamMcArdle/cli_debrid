@@ -803,8 +803,21 @@ def add_torrent_to_debrid():
                                         try:
                                             from usenet.climount_client import get_climount_client
                                             _dc_sp = get_climount_client()
+                                            # cli_mount only registers an entry as queryable-by-hash after its
+                                            # own periodic sync (default ~10 min) — a 404 in the first several
+                                            # attempts is expected, not proof the entry is gone. Only treat 404
+                                            # as final once it's persisted for that long (20 attempts x 30s).
+                                            _consecutive_404_sp = 0
                                             for _a in range(100):
-                                                if _dc_sp.rename_nzb(h, name):
+                                                _renamed_sp, _not_found_sp = _dc_sp.rename_nzb_with_status(h, name)
+                                                if _not_found_sp:
+                                                    _consecutive_404_sp += 1
+                                                    if _consecutive_404_sp >= 20:
+                                                        logging.warning(f'[DebridNaming] {h!r} not found in cli_mount (404) for {_consecutive_404_sp} consecutive attempts — giving up (season pack)')
+                                                        return
+                                                else:
+                                                    _consecutive_404_sp = 0
+                                                if _renamed_sp:
                                                     logging.info(f'[DebridNaming] Renamed {h!r} -> {name!r} (season pack)')
                                                     # Register cli_debrid IDs — match via magnet infohash
                                                     # (filled_by_torrent_id stores the RD provider ID, not the infohash)
@@ -829,6 +842,7 @@ def add_torrent_to_debrid():
                                                             if _cli_ids_sp:
                                                                 _dc_sp.register_cli_ids(h, _cli_ids_sp)
                                                                 logging.info(f'[DebridNaming] Registered {len(_cli_ids_sp)} cli_debrid IDs for {h!r} (season pack)')
+                                                                _dc_sp.push_tags_for_item(h, next(iter(_cli_ids_sp.values())))
                                                     except Exception as _reg_sp:
                                                         logging.debug(f'[DebridNaming] cli_ids registration error (season pack): {_reg_sp}')
                                                     return
@@ -947,8 +961,21 @@ def add_torrent_to_debrid():
                                         try:
                                             from usenet.climount_client import get_climount_client
                                             _dc2 = get_climount_client()
+                                            # cli_mount only registers an entry as queryable-by-hash after its
+                                            # own periodic sync (default ~10 min) — a 404 in the first several
+                                            # attempts is expected, not proof the entry is gone. Only treat 404
+                                            # as final once it's persisted for that long (20 attempts x 30s).
+                                            _consecutive_404_2 = 0
                                             for _a2 in range(100):
-                                                if _dc2.rename_nzb(h, name):
+                                                _renamed2, _not_found2 = _dc2.rename_nzb_with_status(h, name)
+                                                if _not_found2:
+                                                    _consecutive_404_2 += 1
+                                                    if _consecutive_404_2 >= 20:
+                                                        logging.warning(f'[DebridNaming] {h!r} not found in cli_mount (404) for {_consecutive_404_2} consecutive attempts — giving up (manual add)')
+                                                        return
+                                                else:
+                                                    _consecutive_404_2 = 0
+                                                if _renamed2:
                                                     logging.info(f'[DebridNaming] Renamed {h!r} -> {name!r} (manual add, attempt {_a2+1} of 100)')
                                                     if item_id:
                                                         try:
@@ -957,6 +984,7 @@ def add_torrent_to_debrid():
                                                         except Exception as _db_err:
                                                             logging.debug(f'[DebridNaming] DB update failed (manual add): {_db_err}')
                                                         _dc2.register_cli_ids_for_item(h, item_id)
+                                                        _dc2.push_tags_for_item(h, item_id)
                                                     return
                                                 _t.sleep(30)
                                             logging.warning(f'[DebridNaming] Could not rename {h!r} after 100 attempts (manual add)')
@@ -1906,8 +1934,10 @@ def _build_nzb_title(title, year, imdb_id, version, original_scraped_torrent_tit
         _em = _ep_strip.match(_orig_full)
         if _em:
             _orig = _orig_full[_em.start(1):].strip(' .')
-    # Tags block: {tags-Tag1,Tag2} — only if tags provided
-    _tags_part = f'{{tags-{tags}}}' if tags and str(tags).strip() else ''
+    # Tags are no longer embedded in the title — they're pushed to cli_mount
+    # directly via CliMountClient.push_tags() instead. Kept as a no-op var so
+    # the _assemble(...) call sites below don't need to change.
+    _tags_part = ''
 
     is_episode = media_type in ('tv', 'show', 'episode') and season is not None and episode is not None
 
@@ -1939,17 +1969,24 @@ def _build_nzb_title(title, year, imdb_id, version, original_scraped_torrent_tit
         if len(without_cs) <= _MAX_TITLE:
             return without_cs
 
-        # Truncate (original) to fit — always keep it, just shorter
+        # Truncate (original) to fit — always keep it, just shorter. Drop
+        # tags/version from fixed_part first if even that alone leaves no room,
+        # so imdb_part (the field cli_debrid uses to re-match this entry later)
+        # is the last thing ever dropped, never the first.
         if _orig:
-            fixed_part = _assemble(base, _imdb_part, _tags_part, _version)
-            # " - (" prefix + ")" suffix = 4 chars overhead
-            available = _MAX_TITLE - len(fixed_part) - 4
-            if available > 10:
-                truncated_orig = _orig[:available]
-                return f'{fixed_part} - ({truncated_orig})'
+            for fixed_part in (
+                _assemble(base, _imdb_part, _tags_part, _version),
+                _assemble(base, _imdb_part, _version),
+                _assemble(base, _imdb_part),
+            ):
+                # " - (" prefix (4 chars) + ")" suffix (1 char) = 5 chars overhead
+                available = _MAX_TITLE - len(fixed_part) - 5
+                if available > 10:
+                    truncated_orig = _orig[:available]
+                    return f'{fixed_part} - ({truncated_orig})'
 
-        # Last resort: no (original)
-        without_orig = _assemble(base, _imdb_part, _tags_part, _version)
+        # Last resort: no (original), but imdb is still present.
+        without_orig = _assemble(base, _imdb_part)
         if len(without_orig) <= _MAX_TITLE:
             return without_orig
         return base[:_MAX_TITLE]
@@ -1958,16 +1995,35 @@ def _build_nzb_title(title, year, imdb_id, version, original_scraped_torrent_tit
         base = _assemble(f'{_title} ({_year})', _season_part)
         _imdb_str = f'{{imdb-{_imdb}}}' if _imdb else ''
         _orig_part = f'({_orig})' if _orig else ''
+
+        # imdb_id must never be the thing dropped to fit _MAX_TITLE — it is the
+        # only field cli_debrid uses to re-match this entry later (see
+        # repair_engine.py Strategy 4). Drop content-source, tags, then version
+        # first; only then truncate — and finally drop — the (original) bracket,
+        # which is decorative. This mirrors the episode branch above, which
+        # already protects imdb_part the same way.
         for attempt in [
             _assemble(base, _imdb_str, _tags_part, _version, _cs_part, _orig_part),
             _assemble(base, _imdb_str, _tags_part, _version, _orig_part),
-            _assemble(base, _imdb_str, _tags_part, _orig_part),
+            _assemble(base, _imdb_str, _version, _orig_part),
             _assemble(base, _imdb_str, _orig_part),
-            _assemble(base, _orig_part),
-            base,
         ]:
             if len(attempt) <= _MAX_TITLE:
                 return attempt
+
+        # Truncate (original) to fit — always keep it, just shorter.
+        if _orig:
+            fixed_part = _assemble(base, _imdb_str)
+            # " - (" prefix (4 chars) + ")" suffix (1 char) = 5 chars overhead
+            available = _MAX_TITLE - len(fixed_part) - 5
+            if available > 10:
+                truncated_orig = _orig[:available]
+                return f'{fixed_part} - ({truncated_orig})'
+
+        # Last resort: no (original), but imdb is still present.
+        without_orig = _assemble(base, _imdb_str)
+        if len(without_orig) <= _MAX_TITLE:
+            return without_orig
         return base[:_MAX_TITLE]
 
 
@@ -1979,7 +2035,7 @@ def _build_debrid_title(title, year, imdb_id, version, original_scraped_torrent_
     This becomes the cli_mount DFS mount folder/file name for the debrid torrent.
     Completely separate from _build_nzb_title — reads Debrid Provider settings only.
     Falls back to original_scraped_torrent_title if setting is off or data missing.
-    Tags are embedded as {tags-Tag1,Tag2} between imdb and version, same as NZB naming.
+    Tags are pushed to cli_mount directly via CliMountClient.push_tags(), not embedded here.
     """
     from utilities.settings import get_setting as _gs
     if not _gs('Debrid Provider', 'enable_debrid_naming', False):
@@ -2017,8 +2073,10 @@ def _build_debrid_title(title, year, imdb_id, version, original_scraped_torrent_
         _em = _ep_strip.match(_orig_full)
         if _em:
             _orig = _orig_full[_em.start(1):].strip(' .')
-    # Tags block: {tags-Tag1,Tag2} — only if tags provided (same format as NZB naming)
-    _tags_part = f'{{tags-{tags}}}' if tags and str(tags).strip() else ''
+    # Tags are no longer embedded in the title — they're pushed to cli_mount
+    # directly via CliMountClient.push_tags() instead. Kept as a no-op var so
+    # the _assemble(...) call sites below don't need to change.
+    _tags_part = ''
 
     is_episode = media_type in ('tv', 'show', 'episode') and season is not None and episode is not None
 
@@ -2037,32 +2095,67 @@ def _build_debrid_title(title, year, imdb_id, version, original_scraped_torrent_
         _ep_title = _san(episode_title or '')
         base = _assemble(f'{_title} ({_year})', f'S{int(season):02d}E{int(episode):02d}')
         _imdb_part = f'{{imdb-{_imdb}}}' if _imdb else ''
+
+        # imdb_id must never be the thing dropped to fit _MAX_TITLE — it is the
+        # only field cli_debrid uses to re-match this entry later (see
+        # repair_engine.py Strategy 4). Drop ep_title/cs/tags/version first;
+        # only then truncate — and finally drop — the (original) bracket,
+        # which is decorative.
         for attempt in [
             _assemble(base, _ep_title, _imdb_part, _tags_part, _version, _cs_part, _orig_part),
             _assemble(base, _imdb_part, _tags_part, _version, _cs_part, _orig_part),
             _assemble(base, _imdb_part, _tags_part, _version, _orig_part),
-            _assemble(base, _imdb_part, _tags_part, _orig_part),
             _assemble(base, _imdb_part, _orig_part),
-            _assemble(base, _orig_part),
-            base,
         ]:
             if len(attempt) <= _MAX_TITLE:
                 return attempt
+
+        # Truncate (original) to fit — always keep it, just shorter.
+        if _orig:
+            fixed_part = _assemble(base, _imdb_part)
+            # " - (" prefix (4 chars) + ")" suffix (1 char) = 5 chars overhead
+            available = _MAX_TITLE - len(fixed_part) - 5
+            if available > 10:
+                truncated_orig = _orig[:available]
+                return f'{fixed_part} - ({truncated_orig})'
+
+        # Last resort: no (original), but imdb is still present.
+        without_orig = _assemble(base, _imdb_part)
+        if len(without_orig) <= _MAX_TITLE:
+            return without_orig
         return base[:_MAX_TITLE]
     else:
         _season_part = f'S{int(season):02d}' if season is not None else ''
         base = _assemble(f'{_title} ({_year})', _season_part)
         _imdb_str = f'{{imdb-{_imdb}}}' if _imdb else ''
+
+        # imdb_id must never be the thing dropped to fit _MAX_TITLE — it is the
+        # only field cli_debrid uses to re-match this entry later (see
+        # repair_engine.py Strategy 4). Drop content-source and tags first;
+        # only then truncate — and finally drop — the (original) bracket,
+        # which is decorative.
         for attempt in [
             _assemble(base, _imdb_str, _tags_part, _version, _cs_part, _orig_part),
             _assemble(base, _imdb_str, _tags_part, _version, _orig_part),
-            _assemble(base, _imdb_str, _tags_part, _orig_part),
+            _assemble(base, _imdb_str, _version, _orig_part),
             _assemble(base, _imdb_str, _orig_part),
-            _assemble(base, _orig_part),
-            base,
         ]:
             if len(attempt) <= _MAX_TITLE:
                 return attempt
+
+        # Truncate (original) to fit — always keep it, just shorter.
+        if _orig:
+            fixed_part = _assemble(base, _imdb_str)
+            # " - (" prefix (4 chars) + ")" suffix (1 char) = 5 chars overhead
+            available = _MAX_TITLE - len(fixed_part) - 5
+            if available > 10:
+                truncated_orig = _orig[:available]
+                return f'{fixed_part} - ({truncated_orig})'
+
+        # Last resort: no (original), but imdb is still present.
+        without_orig = _assemble(base, _imdb_str)
+        if len(without_orig) <= _MAX_TITLE:
+            return without_orig
         return base[:_MAX_TITLE]
 
 

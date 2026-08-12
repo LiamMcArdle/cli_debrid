@@ -7,7 +7,18 @@ WORKDIR /app
 # Install build dependencies and Node.js
 RUN apt-get update && \
     apt-get install -y gcc gosu nodejs npm ffmpeg \
-    build-essential gyp && \
+    build-essential gyp \
+    # xvfb + Chromium runtime deps for the Cloudflare-challenge bypass browser
+    # (see utilities/cloudflare_bypass.py) — headless mode alone fails the
+    # challenge, so a real headed browser under a virtual display is required.
+    # Installed explicitly (not via `patchright install --with-deps`) because
+    # that command's OS detection doesn't recognize Debian trixie and falls
+    # back to Ubuntu 20.04 package names, two of which (ttf-ubuntu-font-family,
+    # ttf-unifont) don't exist on trixie and fail the build.
+    xvfb fonts-liberation fonts-unifont libnss3 libnspr4 libatk1.0-0 \
+    libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
+    libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 \
+    libcairo2 libatspi2.0-0 && \
     # Cleanup
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
@@ -25,6 +36,19 @@ RUN pip install --upgrade pip "setuptools<78" wheel supervisor
 
 # Install the requirements
 RUN pip install --no-cache-dir -r requirements-linux.txt
+
+# Install Chromium for patchright (Cloudflare-challenge bypass browser, see
+# utilities/cloudflare_bypass.py). OS-level deps are installed explicitly above
+# (not via --with-deps, which fails on this base image — see comment above).
+# Installed to a fixed, UID-independent path instead of the default $HOME-based
+# cache: this RUN executes as root at build time ($HOME=/root), but the
+# entrypoint below runs the app as a separate `appuser` (HOME=/app) whenever a
+# custom PUID/PGID is set, which would otherwise look for the browser at
+# /app/.cache/ms-playwright — a path that was never populated — and fail with
+# "Executable doesn't exist".
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN patchright install chromium && \
+    chmod -R a+rX /ms-playwright
 
 # Copy the current directory contents into the container at /app
 COPY . .

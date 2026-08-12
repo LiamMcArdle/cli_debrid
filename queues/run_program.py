@@ -41,13 +41,18 @@ from content_checkers.overseerr import get_wanted_from_overseerr
 from content_checkers.collected import get_wanted_from_collected
 from content_checkers.plex_rss_watchlist import get_wanted_from_plex_rss, get_wanted_from_friends_plex_rss
 from content_checkers.trakt import (
-    get_wanted_from_trakt_lists, 
-    get_wanted_from_trakt_watchlist, 
-    get_wanted_from_trakt_collection, 
+    get_wanted_from_trakt_lists,
+    get_wanted_from_trakt_watchlist,
+    get_wanted_from_trakt_collection,
     get_wanted_from_friend_trakt_watchlist,
     get_wanted_from_special_trakt_lists # New import
 )
-from content_checkers.mdb_list import get_wanted_from_mdblists
+from content_checkers.scrob import (
+    get_wanted_from_scrob_lists,
+    get_wanted_from_scrob_collection,
+    get_wanted_from_scrob_special
+)
+from content_checkers.mdb_list import get_wanted_from_mdblist_source
 from content_checkers.content_source_detail import append_content_source_detail
 from database.not_wanted_magnets import purge_not_wanted_magnets_file
 import traceback
@@ -154,10 +159,15 @@ class ProgramRunner:
         self._task_schedule_file = _os.path.join(_db_dir, 'task_schedule.json')
         self._task_schedules = self._load_task_schedules()
 
-        # Persistent job store — survives restarts so task timers are not reset.
-        from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-        _scheduler_db = f"sqlite:///{_os.path.join(_db_dir, 'scheduler.db')}"
-        _jobstores = {'default': SQLAlchemyJobStore(url=_scheduler_db)}
+        # In-memory job store. Task next-run times are NOT restored from this store —
+        # that's handled separately by _load_task_schedules()/task_schedule.json above,
+        # which is the mechanism _schedule_task's initial_run branch actually reads from.
+        # A persistent (pickling) store like SQLAlchemyJobStore cannot be used here: every
+        # task's target is a bound method on this ProgramRunner instance, which itself
+        # holds self.scheduler, and APScheduler refuses to pickle a job whose bound-method
+        # owner carries a scheduler reference ("Schedulers cannot be serialized").
+        from apscheduler.jobstores.memory import MemoryJobStore
+        _jobstores = {'default': MemoryJobStore()}
 
         # Configure scheduler timezone using the local timezone helper
         try:
@@ -314,6 +324,7 @@ class ProgramRunner:
             'task_repair_broken_nzbs': 6 * 60 * 60, # Run every 6 hours
             'task_repair_broken_debrids': 6 * 60 * 60, # Run every 6 hours
             'task_sync_cli_mount_changes': 5 * 60, # Run every 5 minutes
+            'task_push_pending_climount_tags': 5 * 60, # Run every 5 minutes — catches tags changed on cli_debrid side only
             'task_nzb_health_check': 10,             # Run every 10 seconds — polls NZB items in Adding
             'task_backfill_plex_guids': 24 * 60 * 60,    # Run once (disabled by default)
             'task_backfill_plex_ms_item_id': 24 * 60 * 60, # Run once (disabled by default)
@@ -554,6 +565,7 @@ class ProgramRunner:
             'task_repair_broken_nzbs',
             'task_repair_broken_debrids',
             'task_sync_cli_mount_changes',
+            'task_push_pending_climount_tags',
         }
         logging.info("Initialized base enabled tasks.")
         # (The accurate default snapshot will be captured later, after content-source and conditional tasks.)
@@ -1046,9 +1058,12 @@ class ProgramRunner:
 
                 if target_func:
                     try:
-                        # Wrap the target function
-                        # For regular tasks, actual_job_id and task_name_for_logging are the same (job_id)
-                        wrapped_func = functools.partial(self._run_and_measure_task, job_id, task_name, target_func, args, kwargs)
+                        # For regular tasks, actual_job_id and task_name_for_logging are the same (job_id).
+                        # Pass the bound method + its args separately (not via functools.partial) —
+                        # APScheduler's SQLAlchemyJobStore pickles jobs on start()/add_job(), and
+                        # functools.partial objects can never be resolved to a serializable reference
+                        # (apscheduler.util.obj_to_ref unconditionally rejects partials), which crashes
+                        # scheduling with "This Job cannot be serialized...".
 
                         # *** START EDIT: Explicitly pass scheduler's timezone to add_job ***
                         # This should prevent the IntervalTrigger from calling tzlocal.get_localzone()
@@ -1110,7 +1125,8 @@ class ProgramRunner:
                         _executor = 'queue' if job_id in _QUEUE_TASKS else 'default'
 
                         add_job_kwargs = {
-                            'func': wrapped_func,
+                            'func': self._run_and_measure_task,
+                            'args': (job_id, task_name, target_func, args, kwargs),
                             'trigger': trigger,
                             'id': job_id,
                             'name': job_id,
@@ -1375,20 +1391,27 @@ class ProgramRunner:
         # Watchdog: ensure critical queue tasks are still scheduled.
         # APScheduler can silently drop jobs when misfire_grace_time=None and the thread
         # pool is saturated (e.g. task_nzb_health_check consuming 99% of runtime).
-        try:
-            _CRITICAL_QUEUES = {
-                'Scraping': 1,
-                'Adding': 1,
-                'Checking': 30,
-                'Wanted': 30,
-            }
-            _scheduled_job_ids = {job.id for job in self.scheduler.get_jobs()}
-            for _task_name, _interval in _CRITICAL_QUEUES.items():
-                if _task_name not in _scheduled_job_ids and _task_name in self.enabled_tasks:
-                    logging.warning(f'[Heartbeat] Watchdog: {_task_name!r} missing from scheduler — rescheduling')
-                    self._schedule_task(_task_name, _interval)
-        except Exception as _wd_err:
-            logging.debug(f'[Heartbeat] Watchdog error: {_wd_err}')
+        #
+        # Skipped while a reinitialize() is in progress: scheduler.shutdown(wait=True)
+        # blocks the executor's shutdown on this very task finishing, while get_jobs()
+        # below needs the same _jobstores_lock shutdown() already holds — calling it here
+        # during a reinit deadlocks task_heartbeat against reinitialize() forever, which is
+        # exactly what made adding/deleting a content source "take forever".
+        if not getattr(self, '_reinitializing', False):
+            try:
+                _CRITICAL_QUEUES = {
+                    'Scraping': 1,
+                    'Adding': 1,
+                    'Checking': 30,
+                    'Wanted': 30,
+                }
+                _scheduled_job_ids = {job.id for job in self.scheduler.get_jobs()}
+                for _task_name, _interval in _CRITICAL_QUEUES.items():
+                    if _task_name not in _scheduled_job_ids and _task_name in self.enabled_tasks:
+                        logging.warning(f'[Heartbeat] Watchdog: {_task_name!r} missing from scheduler — rescheduling')
+                        self._schedule_task(_task_name, _interval)
+            except Exception as _wd_err:
+                logging.debug(f'[Heartbeat] Watchdog error: {_wd_err}')
 
         # Scraping-queue stuck detector: if the in-memory Scraping queue has been at the
         # same size >= WANTED_THROTTLE_SCRAPING_SIZE (100) for more than 10 minutes without
@@ -1450,6 +1473,9 @@ class ProgramRunner:
                 'My Friends Plex RSS Watchlist': 900,
                 'My Friends Trakt Watchlist': 900,
                 'Special Trakt Lists': 900,
+                'Scrob Lists': 900,
+                'Scrob Collection': 900,
+                'Special Scrob Lists': 900,
                 'Adaptive List': 900  # TMDB discover-based adaptive lists
             }
             
@@ -1948,11 +1974,7 @@ class ProgramRunner:
             if source_type == 'Overseerr':
                 wanted_content = get_wanted_from_overseerr(versions_from_config)
             elif source_type == 'MDBList':
-                mdblist_urls = data.get('urls', '').split(',')
-                for mdblist_url in mdblist_urls:
-                    mdblist_url = mdblist_url.strip()
-                    if mdblist_url: # Ensure not empty
-                        wanted_content.extend(get_wanted_from_mdblists(mdblist_url, versions_from_config))
+                wanted_content = get_wanted_from_mdblist_source(data, versions_from_config)
             elif source_type == 'Trakt Watchlist':
                 try:
                     wanted_content = get_wanted_from_trakt_watchlist(versions_from_config, unblacklist=unblacklist_on_source_run)
@@ -1977,6 +1999,12 @@ class ProgramRunner:
             elif source_type == 'Special Trakt Lists': # New elif block
                 # 'data' is the source_config, 'versions_dict' is the resolved simple versions map
                 wanted_content = get_wanted_from_special_trakt_lists(data, versions_from_config, unblacklist=unblacklist_on_source_run)
+            elif source_type == 'Scrob Lists':
+                wanted_content = get_wanted_from_scrob_lists(data.get('scrob_list_ids', ''), versions_from_config, unblacklist=unblacklist_on_source_run)
+            elif source_type == 'Scrob Collection':
+                wanted_content = get_wanted_from_scrob_collection(versions_from_config, unblacklist=unblacklist_on_source_run)
+            elif source_type == 'Special Scrob Lists':
+                wanted_content = get_wanted_from_scrob_special(data, versions_from_config, unblacklist=unblacklist_on_source_run)
             elif source_type == 'Collected':
                 wanted_content = get_wanted_from_collected() # Doesn't take versions arg
             elif source_type == 'My Plex Watchlist':
@@ -2314,7 +2342,7 @@ class ProgramRunner:
             # Use config 'type' field for matching — source_type is split on '_' which
             # truncates multi-word types like 'Trakt Lists' to just 'Trakt'
             _source_config_type = data.get('type', source_type)
-            if _source_config_type in ('MDBList', 'Trakt Lists', 'Adaptive List'):
+            if _source_config_type in ('MDBList', 'Trakt Lists', 'Scrob Lists', 'Adaptive List'):
                 # Always read live settings — cached source_data may be stale if plex_collection
                 # was enabled after startup without a full restart
                 try:
@@ -2668,10 +2696,16 @@ class ProgramRunner:
             cpu_monitor_interval = 300.0  # Log CPU usage every 5 minutes
             loop_count = 0
             
-            while self._running:
+            while self._running or getattr(self, '_reinitializing', False):
                 try:
                     # Check scheduler status periodically
                     if not self.scheduler or not self.scheduler.running:
+                         if getattr(self, '_reinitializing', False):
+                             # reinitialize() intentionally shuts the scheduler down
+                             # (and its own __init__ call transiently resets _running)
+                             # before building a new one — this is expected, not a crash.
+                             time.sleep(1.0)
+                             continue
                          logging.error("APScheduler is not running. Stopping program.")
                          self.stop() # Trigger stop if scheduler died
                          break
@@ -3616,12 +3650,28 @@ class ProgramRunner:
                             if _remaining:
                                 _has_more_results = True
                                 # Delete the broken job from cli_mount so prefix-match in
-                                # torrent_processor won't reuse it on the next retry attempt
+                                # torrent_processor won't reuse it on the next retry attempt.
+                                # Safety: never delete if another live item (e.g. a different
+                                # version sharing this job id due to a since-fixed dedup bug)
+                                # still references it — that would delete its file too.
                                 try:
                                     from usenet.repair_engine import _delete_from_provider as _dfp
+                                    from database import get_db_connection as _gdb_stuck
                                     _broken_hash = torrent_id.replace('nzb:', '') if torrent_id else ''
-                                    _dfp(_broken_hash, item.get('filled_by_file', '') or '')
-                                    logging.debug(f'[NZB] Deleted broken job {_broken_hash} from provider before retry')
+                                    _conn_stuck = _gdb_stuck()
+                                    try:
+                                        _stuck_sibs = _conn_stuck.execute(
+                                            "SELECT COUNT(*) FROM media_items "
+                                            "WHERE filled_by_torrent_id = ? AND state IN ('Collected','Upgrading','Checking') AND id != ?",
+                                            (torrent_id, item_id)
+                                        ).fetchone()[0]
+                                    finally:
+                                        _conn_stuck.close()
+                                    if _stuck_sibs:
+                                        logging.info(f'[NZB] Skipping provider delete of {_broken_hash} — {_stuck_sibs} sibling(s) still active')
+                                    else:
+                                        _dfp(_broken_hash, item.get('filled_by_file', '') or '')
+                                        logging.debug(f'[NZB] Deleted broken job {_broken_hash} from provider before retry')
                                 except Exception as _del_err:
                                     logging.debug(f'[NZB] Could not delete broken job from provider: {_del_err}')
                                 from database.database_writing import update_media_item as _umi_retry
@@ -3723,13 +3773,29 @@ class ProgramRunner:
                                     break
                                 _page_to += 1
                             if _real_hash_to:
-                                _dr_to = _req_to.delete(f'{_dcy_url_to}/api/torrents',
-                                                        headers=_headers_to,
-                                                        params={'hashes': _real_hash_to}, timeout=10)
-                                if _dr_to.status_code == 200:
-                                    logging.info(f'[NZB] Deleted stalled job {_real_hash_to} from cli_mount')
+                                # Safety: never delete if another live item (e.g. a different
+                                # version sharing this job id due to a since-fixed dedup bug)
+                                # still references it — that would delete its file too.
+                                from database import get_db_connection as _gdb_stall
+                                _conn_stall = _gdb_stall()
+                                try:
+                                    _stall_sibs = _conn_stall.execute(
+                                        "SELECT COUNT(*) FROM media_items "
+                                        "WHERE filled_by_torrent_id = ? AND state IN ('Collected','Upgrading','Checking') AND id != ?",
+                                        (torrent_id, item_id)
+                                    ).fetchone()[0]
+                                finally:
+                                    _conn_stall.close()
+                                if _stall_sibs:
+                                    logging.info(f'[NZB] Skipping provider delete of stalled job {_real_hash_to} — {_stall_sibs} sibling(s) still active')
                                 else:
-                                    logging.warning(f'[NZB] Could not delete stalled job: HTTP {_dr_to.status_code}')
+                                    _dr_to = _req_to.delete(f'{_dcy_url_to}/api/torrents',
+                                                            headers=_headers_to,
+                                                            params={'hashes': _real_hash_to}, timeout=10)
+                                    if _dr_to.status_code == 200:
+                                        logging.info(f'[NZB] Deleted stalled job {_real_hash_to} from cli_mount')
+                                    else:
+                                        logging.warning(f'[NZB] Could not delete stalled job: HTTP {_dr_to.status_code}')
                         except Exception as _del_to_err:
                             logging.debug(f'[NZB] Could not delete stalled job from cli_mount: {_del_to_err}')
                         # Handle siblings sharing this stalled job
@@ -4227,7 +4293,14 @@ class ProgramRunner:
                                             # Resolve info_hash for provider deletion
                                             _ihash = _resolve_info_hash_from_provider(_ename)
                                             # Find DB items
+                                            from usenet.repair_engine import AMBIGUOUS as _AMBIGUOUS_WD
                                             _items = _find_db_items_by_entry_name(_ename)
+                                            if _items is _AMBIGUOUS_WD:
+                                                # Multiple versions ambiguously matched — do not delete
+                                                # from provider, a live row we can't identify may need it.
+                                                logging.warning(f'[NZBHealthCheck] {_ename!r} — ambiguous multi-version match, skipping without deleting')
+                                                self._webdav_repaired_entries.add(_ename)
+                                                continue
                                             _items = [i for i in _items
                                                       if i.get('state') in ('Collected', 'Checking', 'Upgrading')]
                                             if not _items:
@@ -4671,6 +4744,16 @@ class ProgramRunner:
                 self.resume_queue()
                 logging.info('[CMSync] Initial full sync complete — queue resumed')
 
+    def task_push_pending_climount_tags(self):
+        """Push tags for media_items rows whose tags changed on the cli_debrid
+        side only — sync_changes_from_climount can't detect these since it only
+        re-fetches entries cli_mount itself has changed."""
+        from usenet.climount_sync import push_pending_tags
+        try:
+            push_pending_tags()
+        except Exception as e:
+            logging.error(f'[CMSync] push_pending_tags task error: {e}', exc_info=True)
+
     def _is_system_idle_for_backup(self):
         """
         Check if the system is idle enough to run a database backup.
@@ -4817,7 +4900,7 @@ class ProgramRunner:
             if items_to_update:
                 try:
                     promoted_rows = cursor.execute(
-                        f"SELECT id, type, imdb_id, season_number, episode_number, filled_by_torrent_id "
+                        f"SELECT id, type, imdb_id, season_number, episode_number, filled_by_torrent_id, version "
                         f"FROM media_items WHERE id IN ({','.join(['?']*len(items_to_update))})",
                         items_to_update
                     ).fetchall()
@@ -4840,9 +4923,11 @@ class ProgramRunner:
                             old_replace_rows = cursor.execute(
                                 f'''SELECT {_recon_select} FROM media_items
                                    WHERE imdb_id = ? AND season_number = ? AND episode_number = ?
-                                   AND type = 'episode' AND manual_replace = 1 AND id != ?''',
+                                   AND type = 'episode' AND manual_replace = 1 AND id != ?
+                                   AND REPLACE(COALESCE(version,''),'*','') = ?''',
                                 (promoted['imdb_id'], promoted['season_number'],
-                                 promoted['episode_number'], promoted['id'])
+                                 promoted['episode_number'], promoted['id'],
+                                 (promoted['version'] or '').replace('*', ''))
                             ).fetchall()
                             log_tag = 'REPLACE_SEASON'
                             removal_reason = 'Replaced by new season pack'
@@ -4851,8 +4936,10 @@ class ProgramRunner:
                         elif promoted['type'] == 'movie':
                             old_replace_rows = cursor.execute(
                                 f'''SELECT {_recon_select} FROM media_items
-                                   WHERE imdb_id = ? AND type = 'movie' AND manual_replace = 1 AND id != ?''',
-                                (promoted['imdb_id'], promoted['id'])
+                                   WHERE imdb_id = ? AND type = 'movie' AND manual_replace = 1 AND id != ?
+                                   AND REPLACE(COALESCE(version,''),'*','') = ?''',
+                                (promoted['imdb_id'], promoted['id'],
+                                 (promoted['version'] or '').replace('*', ''))
                             ).fetchall()
                             log_tag = 'REPLACE_MOVIE'
                             removal_reason = 'Replaced by new movie torrent'
@@ -4865,14 +4952,22 @@ class ProgramRunner:
                             old_id = old_item['id']
                             old_torrent_id = old_item['filled_by_torrent_id']
                             if old_torrent_id and old_torrent_id != new_torrent_id and _debrid_prov:
-                                try:
-                                    _debrid_prov.remove_torrent(old_torrent_id, removal_reason=removal_reason)
-                                    logging.info(f"[{log_tag}] Removed debrid torrent {old_torrent_id} for replaced item {old_id}")
-                                except Exception as _debrid_err:
-                                    if '404' in str(_debrid_err):
-                                        logging.debug(f"[{log_tag}] Old torrent {old_torrent_id} already removed (404)")
-                                    else:
-                                        logging.error(f"[{log_tag}] Failed to remove torrent {old_torrent_id}: {_debrid_err}")
+                                _sibs = cursor.execute(
+                                    "SELECT COUNT(*) FROM media_items "
+                                    "WHERE filled_by_torrent_id = ? AND state IN ('Collected','Upgrading','Checking') AND id != ?",
+                                    (old_torrent_id, old_id)
+                                ).fetchone()[0]
+                                if _sibs:
+                                    logging.info(f"[{log_tag}] Skipping debrid removal of {old_torrent_id} for replaced item {old_id} — {_sibs} sibling(s) still active")
+                                else:
+                                    try:
+                                        _debrid_prov.remove_torrent(old_torrent_id, removal_reason=removal_reason)
+                                        logging.info(f"[{log_tag}] Removed debrid torrent {old_torrent_id} for replaced item {old_id}")
+                                    except Exception as _debrid_err:
+                                        if '404' in str(_debrid_err):
+                                            logging.debug(f"[{log_tag}] Old torrent {old_torrent_id} already removed (404)")
+                                        else:
+                                            logging.error(f"[{log_tag}] Failed to remove torrent {old_torrent_id}: {_debrid_err}")
                             if old_id not in items_to_delete_filepath and old_id not in items_to_update:
                                 # Plex removal
                                 _old_path = old_item['location_on_disk'] or old_item['filled_by_file']
@@ -4896,24 +4991,27 @@ class ProgramRunner:
                     _imdb_sweep = {}
                     for _p in promoted_rows:
                         if _p['imdb_id'] and _p['type'] in ('episode', 'movie'):
-                            if _p['imdb_id'] not in _imdb_sweep:
-                                _imdb_sweep[_p['imdb_id']] = {'type': _p['type'], 'seasons': set()}
+                            _sw_key = (_p['imdb_id'], (_p['version'] or '').replace('*', ''))
+                            if _sw_key not in _imdb_sweep:
+                                _imdb_sweep[_sw_key] = {'type': _p['type'], 'seasons': set()}
                             if _p['type'] == 'episode' and _p['season_number'] is not None:
-                                _imdb_sweep[_p['imdb_id']]['seasons'].add(_p['season_number'])
-                    for _sw_imdb, _sw_info in _imdb_sweep.items():
+                                _imdb_sweep[_sw_key]['seasons'].add(_p['season_number'])
+                    for (_sw_imdb, _sw_version), _sw_info in _imdb_sweep.items():
                         if _sw_info['type'] == 'episode':
                             for _sw_season in _sw_info['seasons']:
                                 _sw_rows = cursor.execute(
                                     f'''SELECT {_recon_select} FROM media_items m
                                        WHERE m.imdb_id = ? AND m.season_number = ? AND m.type = 'episode'
                                        AND m.manual_replace = 1
+                                       AND REPLACE(COALESCE(m.version,''),'*','') = ?
                                        AND EXISTS (
                                            SELECT 1 FROM media_items m2
                                            WHERE m2.imdb_id = m.imdb_id AND m2.season_number = m.season_number
                                            AND m2.episode_number = m.episode_number AND m2.type = 'episode'
                                            AND m2.manual_replace = 0 AND m2.state = 'Collected'
+                                           AND REPLACE(COALESCE(m2.version,''),'*','') = REPLACE(COALESCE(m.version,''),'*','')
                                        )''',
-                                    (_sw_imdb, _sw_season)
+                                    (_sw_imdb, _sw_season, _sw_version)
                                 ).fetchall()
                                 for _sr in _sw_rows:
                                     _sid = _sr['id']
@@ -4923,12 +5021,20 @@ class ProgramRunner:
                                     elif _sid not in items_to_delete_filepath and _sid not in ids_to_delete_replace:
                                         _st = _sr['filled_by_torrent_id']
                                         if _st and _debrid_prov:
-                                            try:
-                                                _debrid_prov.remove_torrent(_st, removal_reason='Replaced by new season pack')
-                                                logging.info(f"[REPLACE_SEASON] Removed debrid torrent {_st} for stale item {_sid}")
-                                            except Exception as _de:
-                                                if '404' not in str(_de):
-                                                    logging.error(f"[REPLACE_SEASON] Failed to remove torrent {_st}: {_de}")
+                                            _sw_sibs = cursor.execute(
+                                                "SELECT COUNT(*) FROM media_items "
+                                                "WHERE filled_by_torrent_id = ? AND state IN ('Collected','Upgrading','Checking') AND id != ?",
+                                                (_st, _sid)
+                                            ).fetchone()[0]
+                                            if _sw_sibs:
+                                                logging.info(f"[REPLACE_SEASON] Skipping debrid removal of {_st} for stale item {_sid} — {_sw_sibs} sibling(s) still active")
+                                            else:
+                                                try:
+                                                    _debrid_prov.remove_torrent(_st, removal_reason='Replaced by new season pack')
+                                                    logging.info(f"[REPLACE_SEASON] Removed debrid torrent {_st} for stale item {_sid}")
+                                                except Exception as _de:
+                                                    if '404' not in str(_de):
+                                                        logging.error(f"[REPLACE_SEASON] Failed to remove torrent {_st}: {_de}")
                                         _sw_path = _sr['location_on_disk'] or _sr['filled_by_file']
                                         if _sw_path:
                                             try:
@@ -4947,12 +5053,14 @@ class ProgramRunner:
                                 f'''SELECT {_recon_select} FROM media_items m
                                    WHERE m.imdb_id = ? AND m.type = 'movie'
                                    AND m.manual_replace = 1
+                                   AND REPLACE(COALESCE(m.version,''),'*','') = ?
                                    AND EXISTS (
                                        SELECT 1 FROM media_items m2
                                        WHERE m2.imdb_id = m.imdb_id AND m2.type = 'movie'
                                        AND m2.manual_replace = 0 AND m2.state = 'Collected'
+                                       AND REPLACE(COALESCE(m2.version,''),'*','') = REPLACE(COALESCE(m.version,''),'*','')
                                    )''',
-                                (_sw_imdb,)
+                                (_sw_imdb, _sw_version)
                             ).fetchall()
                             for _sr in _sw_rows:
                                 _sid = _sr['id']
@@ -4962,12 +5070,20 @@ class ProgramRunner:
                                 elif _sid not in items_to_delete_filepath and _sid not in ids_to_delete_replace:
                                     _st = _sr['filled_by_torrent_id']
                                     if _st and _debrid_prov:
-                                        try:
-                                            _debrid_prov.remove_torrent(_st, removal_reason='Replaced by new movie torrent')
-                                            logging.info(f"[REPLACE_MOVIE] Removed debrid torrent {_st} for stale item {_sid}")
-                                        except Exception as _de:
-                                            if '404' not in str(_de):
-                                                logging.error(f"[REPLACE_MOVIE] Failed to remove torrent {_st}: {_de}")
+                                        _sw_sibs = cursor.execute(
+                                            "SELECT COUNT(*) FROM media_items "
+                                            "WHERE filled_by_torrent_id = ? AND state IN ('Collected','Upgrading','Checking') AND id != ?",
+                                            (_st, _sid)
+                                        ).fetchone()[0]
+                                        if _sw_sibs:
+                                            logging.info(f"[REPLACE_MOVIE] Skipping debrid removal of {_st} for stale item {_sid} — {_sw_sibs} sibling(s) still active")
+                                        else:
+                                            try:
+                                                _debrid_prov.remove_torrent(_st, removal_reason='Replaced by new movie torrent')
+                                                logging.info(f"[REPLACE_MOVIE] Removed debrid torrent {_st} for stale item {_sid}")
+                                            except Exception as _de:
+                                                if '404' not in str(_de):
+                                                    logging.error(f"[REPLACE_MOVIE] Failed to remove torrent {_st}: {_de}")
                                     _sw_path = _sr['location_on_disk'] or _sr['filled_by_file']
                                     if _sw_path:
                                         try:
@@ -5194,22 +5310,46 @@ class ProgramRunner:
     def reinitialize(self):
         """Force reinitialization of the program runner to pick up new settings"""
         logging.info("Reinitializing ProgramRunner...")
-        # Need to shutdown and restart scheduler carefully
-        with self.scheduler_lock:
-            if self.scheduler and self.scheduler.running:
-                logging.info("Shutting down scheduler for reinitialization...")
-                self.scheduler.shutdown(wait=True)
-                logging.info("Scheduler stopped.")
+        # Tell the run() monitoring loop to tolerate a momentarily-stopped
+        # scheduler during this window, instead of treating it as a crash
+        # and tearing down the whole run loop out from under us.
+        self._reinitializing = True
+        was_running_before_reinit = self._running
+        try:
+            # Need to shutdown and restart scheduler carefully
+            with self.scheduler_lock:
+                if self.scheduler and self.scheduler.running:
+                    logging.info("Shutting down scheduler for reinitialization...")
+                    # wait=False: don't block here until every in-flight job finishes.
+                    # shutdown(wait=True) holds APScheduler's internal _jobstores_lock
+                    # while it waits — and any running task that itself calls back into
+                    # self.scheduler (e.g. task_heartbeat's watchdog, which calls
+                    # scheduler.get_jobs()) needs that same lock, deadlocking forever.
+                    # In-flight jobs aren't killed by wait=False, they just keep running
+                    # to completion on their own threads, detached from this call.
+                    self.scheduler.shutdown(wait=False)
+                    logging.info("Scheduler stopped.")
 
-        self._initialized_runner_attributes = False
-        self.__init__() # Re-runs init, including scheduling initial tasks
+            self._initialized_runner_attributes = False
+            self.__init__() # Re-runs init, including scheduling initial tasks
 
-        # Restart scheduler if it was running before
-        # self.start() will handle starting the scheduler
-        logging.info("ProgramRunner reinitialized successfully. Restarting...")
-        # The restart might need to happen externally depending on how reinit is called
-        # If called internally, we might need to call self.start() here,
-        # but need to be careful about threading/context.
+            # __init__ unconditionally resets _running to False — restore it so
+            # the still-alive run() loop (in the 'was already running' case)
+            # doesn't see _running=False and exit on its next iteration.
+            if was_running_before_reinit:
+                self._running = True
+
+                # __init__ only builds a fresh scheduler object, it doesn't start
+                # it — without this, jobs would be scheduled but never fire.
+                with self.scheduler_lock:
+                    if self.scheduler and not self.scheduler.running:
+                        start_paused = self._is_within_pause_schedule()
+                        self.scheduler.start(paused=start_paused)
+                        logging.info(f"Scheduler restarted after reinitialization. Paused: {start_paused}")
+
+            logging.info("ProgramRunner reinitialized successfully.")
+        finally:
+            self._reinitializing = False
 
     def handle_rate_limit(self):
         """Handle rate limit by pausing relevant jobs for a period."""
@@ -5704,6 +5844,7 @@ class ProgramRunner:
         item_type = promoted_dict.get('type')
         item_id = promoted_dict.get('id')
         new_torrent_id = promoted_dict.get('filled_by_torrent_id')
+        item_version = (promoted_dict.get('version') or '').replace('*', '')
 
         if not imdb_id or item_type not in ('episode', 'movie'):
             return
@@ -5727,8 +5868,9 @@ class ProgramRunner:
                 old_rows = cur.execute(
                     f'''SELECT {_select_fields} FROM media_items
                        WHERE imdb_id = ? AND season_number = ? AND episode_number = ?
-                       AND type = 'episode' AND manual_replace = 1 AND id != ?''',
-                    (imdb_id, season_number, episode_number, item_id)
+                       AND type = 'episode' AND manual_replace = 1 AND id != ?
+                       AND REPLACE(COALESCE(version,''),'*','') = ?''',
+                    (imdb_id, season_number, episode_number, item_id, item_version)
                 ).fetchall()
                 log_tag = 'REPLACE_SEASON'
                 removal_reason = 'Replaced by new season pack'
@@ -5736,8 +5878,9 @@ class ProgramRunner:
             else:  # movie
                 old_rows = cur.execute(
                     f'''SELECT {_select_fields} FROM media_items
-                       WHERE imdb_id = ? AND type = 'movie' AND manual_replace = 1 AND id != ?''',
-                    (imdb_id, item_id)
+                       WHERE imdb_id = ? AND type = 'movie' AND manual_replace = 1 AND id != ?
+                       AND REPLACE(COALESCE(version,''),'*','') = ?''',
+                    (imdb_id, item_id, item_version)
                 ).fetchall()
                 log_tag = 'REPLACE_MOVIE'
                 removal_reason = 'Replaced by new movie torrent'
@@ -5751,14 +5894,22 @@ class ProgramRunner:
                 old_id = row['id']
                 old_torrent_id = row['filled_by_torrent_id']
                 if old_torrent_id and old_torrent_id != new_torrent_id and _debrid_prov:
-                    try:
-                        _debrid_prov.remove_torrent(old_torrent_id, removal_reason=removal_reason)
-                        logging.info(f"[{log_tag}] Removed debrid torrent {old_torrent_id} for {reason_label} {old_id}")
-                    except Exception as debrid_err:
-                        if '404' in str(debrid_err):
-                            logging.debug(f"[{log_tag}] Old torrent {old_torrent_id} already removed (404)")
-                        else:
-                            logging.error(f"[{log_tag}] Failed to remove torrent {old_torrent_id}: {debrid_err}")
+                    _sibs = cur.execute(
+                        "SELECT COUNT(*) FROM media_items "
+                        "WHERE filled_by_torrent_id = ? AND state IN ('Collected','Upgrading','Checking') AND id != ?",
+                        (old_torrent_id, old_id)
+                    ).fetchone()[0]
+                    if _sibs:
+                        logging.info(f"[{log_tag}] Skipping debrid removal of {old_torrent_id} for {reason_label} {old_id} — {_sibs} sibling(s) still active")
+                    else:
+                        try:
+                            _debrid_prov.remove_torrent(old_torrent_id, removal_reason=removal_reason)
+                            logging.info(f"[{log_tag}] Removed debrid torrent {old_torrent_id} for {reason_label} {old_id}")
+                        except Exception as debrid_err:
+                            if '404' in str(debrid_err):
+                                logging.debug(f"[{log_tag}] Old torrent {old_torrent_id} already removed (404)")
+                            else:
+                                logging.error(f"[{log_tag}] Failed to remove torrent {old_torrent_id}: {debrid_err}")
                 # Plex removal
                 item_path = row['location_on_disk'] or row['filled_by_file']
                 if item_path:
@@ -5786,25 +5937,29 @@ class ProgramRunner:
                     f'''SELECT {_select_fields} FROM media_items m
                        WHERE m.imdb_id = ? AND m.season_number = ? AND m.type = 'episode'
                        AND m.manual_replace = 1 AND m.id != ?
+                       AND REPLACE(COALESCE(m.version,''),'*','') = ?
                        AND EXISTS (
                            SELECT 1 FROM media_items m2
                            WHERE m2.imdb_id = m.imdb_id AND m2.season_number = m.season_number
                            AND m2.episode_number = m.episode_number AND m2.type = 'episode'
                            AND m2.manual_replace = 0 AND m2.state = 'Collected'
+                           AND REPLACE(COALESCE(m2.version,''),'*','') = REPLACE(COALESCE(m.version,''),'*','')
                        )''',
-                    (imdb_id, season_number, item_id)
+                    (imdb_id, season_number, item_id, item_version)
                 ).fetchall()
             else:  # movie
                 stale_rows = cur.execute(
                     f'''SELECT {_select_fields} FROM media_items m
                        WHERE m.imdb_id = ? AND m.type = 'movie'
                        AND m.manual_replace = 1 AND m.id != ?
+                       AND REPLACE(COALESCE(m.version,''),'*','') = ?
                        AND EXISTS (
                            SELECT 1 FROM media_items m2
                            WHERE m2.imdb_id = m.imdb_id AND m2.type = 'movie'
                            AND m2.manual_replace = 0 AND m2.state = 'Collected'
+                           AND REPLACE(COALESCE(m2.version,''),'*','') = REPLACE(COALESCE(m.version,''),'*','')
                        )''',
-                    (imdb_id, item_id)
+                    (imdb_id, item_id, item_version)
                 ).fetchall()
 
             for stale_row in stale_rows:
@@ -6543,6 +6698,11 @@ class ProgramRunner:
                                                             if not hasattr(_dc, 'rename_nzb'):
                                                                 return  # active usenet provider (e.g. nzbdav) has no rename semantics
                                                             for _a in range(5):
+                                                                # This short loop (5 attempts x 10s = 50s total) isn't long
+                                                                # enough to distinguish "genuinely gone" from "cli_mount
+                                                                # hasn't finished its periodic sync yet" (can take ~10 min
+                                                                # per torrent_processor.py) — so a 404 here is never treated
+                                                                # as final, just run the fixed attempt budget like before.
                                                                 if _dc.rename_nzb(h, name):
                                                                     logging.info(f'[DebridNaming] Renamed {h!r} -> {name!r} (collected, attempt {_a+1})')
                                                                     if iid:
@@ -6552,6 +6712,7 @@ class ProgramRunner:
                                                                         except Exception as _db_err:
                                                                             logging.debug(f'[DebridNaming] DB update failed (collected): {_db_err}')
                                                                         _dc.register_cli_ids_for_item(h, iid)
+                                                                        _dc.push_tags_for_item(h, iid)
                                                                     return
                                                                 _t.sleep(10)
                                                             logging.warning(f'[DebridNaming] Could not rename {h!r} after 5 attempts (collected)')
@@ -6576,40 +6737,46 @@ class ProgramRunner:
                                             log_successful_upgrade(_notif)
                                         except Exception as _lsu_err:
                                             logging.debug(f"[PlexCheck] log_successful_upgrade failed: {_lsu_err}")
-                                    # Upgrade cleanup: delete old torrent/NZB and remove old Plex entry
+                                    # Upgrade cleanup: delete old torrent/NZB and remove old Plex entry.
+                                    # Gated on Scraping.enable_upgrading_cleanup — when disabled, the old
+                                    # file/torrent must be left in place (same "keep both files" contract
+                                    # as local_library_scan.py's upgrade handling).
                                     _old_torrent_id = _notif.get('upgrading_from_torrent_id')
                                     _upgrading_from_path = _notif.get('upgrading_from')
-                                    if _old_torrent_id:
-                                        if _old_torrent_id.startswith('nzb:'):
-                                            # Old item was an NZB — remove via cli_mount
+                                    if not get_setting("Scraping", "enable_upgrading_cleanup", default=False):
+                                        logging.info(f"[PlexCheck] Scraping.enable_upgrading_cleanup is disabled — keeping old file/torrent for item {item_id} ({item_title_for_log}).")
+                                    else:
+                                        if _old_torrent_id:
+                                            if _old_torrent_id.startswith('nzb:'):
+                                                # Old item was an NZB — remove via cli_mount
+                                                try:
+                                                    from usenet import get_usenet_client as _guc
+                                                    _uc = _guc()
+                                                    if _uc:
+                                                        _uc.remove_nzb(_old_torrent_id[4:], entry_name=_upgrading_from_path or '')
+                                                        logging.info(f"[PlexCheck] Removed old upgrade NZB {_old_torrent_id} for item {item_id} ({item_title_for_log})")
+                                                except Exception as _ct_err:
+                                                    logging.warning(f"[PlexCheck] Failed to remove old upgrade NZB {_old_torrent_id}: {_ct_err}")
+                                            else:
+                                                # Old item was a debrid torrent
+                                                try:
+                                                    from debrid import get_debrid_provider as _gdp
+                                                    _dp = _gdp()
+                                                    if _dp:
+                                                        _dp.remove_torrent(_old_torrent_id, removal_reason='Replaced by upgrade')
+                                                        logging.info(f"[PlexCheck] Removed old upgrade torrent {_old_torrent_id} for item {item_id} ({item_title_for_log})")
+                                                except Exception as _ct_err:
+                                                    if '404' in str(_ct_err):
+                                                        logging.debug(f"[PlexCheck] Old torrent {_old_torrent_id} already removed (404)")
+                                                    else:
+                                                        logging.warning(f"[PlexCheck] Failed to remove old upgrade torrent {_old_torrent_id}: {_ct_err}")
+                                        if _upgrading_from_path:
                                             try:
-                                                from usenet import get_usenet_client as _guc
-                                                _uc = _guc()
-                                                if _uc:
-                                                    _uc.remove_nzb(_old_torrent_id[4:], entry_name=_upgrading_from_path or '')
-                                                    logging.info(f"[PlexCheck] Removed old upgrade NZB {_old_torrent_id} for item {item_id} ({item_title_for_log})")
-                                            except Exception as _ct_err:
-                                                logging.warning(f"[PlexCheck] Failed to remove old upgrade NZB {_old_torrent_id}: {_ct_err}")
-                                        else:
-                                            # Old item was a debrid torrent
-                                            try:
-                                                from debrid import get_debrid_provider as _gdp
-                                                _dp = _gdp()
-                                                if _dp:
-                                                    _dp.remove_torrent(_old_torrent_id, removal_reason='Replaced by upgrade')
-                                                    logging.info(f"[PlexCheck] Removed old upgrade torrent {_old_torrent_id} for item {item_id} ({item_title_for_log})")
-                                            except Exception as _ct_err:
-                                                if '404' in str(_ct_err):
-                                                    logging.debug(f"[PlexCheck] Old torrent {_old_torrent_id} already removed (404)")
-                                                else:
-                                                    logging.warning(f"[PlexCheck] Failed to remove old upgrade torrent {_old_torrent_id}: {_ct_err}")
-                                    if _upgrading_from_path:
-                                        try:
-                                            from utilities.plex_functions import remove_file_from_plex
-                                            remove_file_from_plex(item_title_for_log, _upgrading_from_path)
-                                            logging.info(f"[PlexCheck] Removed old upgrade file from Plex for item {item_id} ({item_title_for_log})")
-                                        except Exception as _cp_err:
-                                            logging.warning(f"[PlexCheck] Failed to remove old upgrade file from Plex for item {item_id}: {_cp_err}")
+                                                from utilities.plex_functions import remove_file_from_plex
+                                                remove_file_from_plex(item_title_for_log, _upgrading_from_path)
+                                                logging.info(f"[PlexCheck] Removed old upgrade file from Plex for item {item_id} ({item_title_for_log})")
+                                            except Exception as _cp_err:
+                                                logging.warning(f"[PlexCheck] Failed to remove old upgrade file from Plex for item {item_id}: {_cp_err}")
                                 # Check if the Plex episode has a local:// guid (episode-level mismatch)
                                 # or the show has no external IDs (show-level mismatch).
                                 # In both cases, use the Plex GUID from battery to fix directly.
@@ -7119,9 +7286,11 @@ class ProgramRunner:
                 manual_job_instance_id = f"manual_{job_id_base}_{uuid.uuid4()}"
                 
                 # Pass the unique manual_job_instance_id as the first arg (actual_job_id_from_scheduler)
-                # and job_id_base as the second arg (task_name_for_logging) to _run_and_measure_task
-                wrapped_func = functools.partial(self._run_and_measure_task, manual_job_instance_id, job_id_base, target_func, args, kwargs)
-                
+                # and job_id_base as the second arg (task_name_for_logging) to _run_and_measure_task.
+                # Pass the bound method + its args separately (not via functools.partial) — see the
+                # matching comment in _schedule_task for why partials break APScheduler's job store.
+                manual_job_args = (manual_job_instance_id, job_id_base, target_func, args, kwargs)
+
                 # Get timezone safely, with fallback if scheduler is None
                 if self.scheduler and hasattr(self.scheduler, 'timezone'):
                     scheduler_timezone = self.scheduler.timezone
@@ -7153,7 +7322,8 @@ class ProgramRunner:
                     }
                     _manual_executor = 'queue' if job_id_base in _QUEUE_TASKS_MANUAL else 'default'
                     self.scheduler.add_job(
-                        func=wrapped_func,
+                        func=self._run_and_measure_task,
+                        args=manual_job_args,
                         trigger='date',
                         run_date=run_now_date,
                         id=manual_job_instance_id,
@@ -8767,6 +8937,9 @@ class ProgramRunner:
     def task_upgrade_hub_scan(self):
         """Scheduled nightly scan for better-quality releases via Zilean."""
         try:
+            if 'task_upgrade_hub_scan' not in self.enabled_tasks:
+                logging.debug("[UPGRADE_HUB] Scheduled scan skipped — task disabled in Task Manager")
+                return
             from database.zilean_upgrade import scan_for_upgrades, get_scan_status
             from utilities.settings import get_setting
             if get_scan_status()['in_progress']:
@@ -8794,6 +8967,9 @@ class ProgramRunner:
     def task_upgrade_hub_auto_queue(self):
         """Auto-queue upgrade candidates found in the most recent scan."""
         try:
+            if 'task_upgrade_hub_auto_queue' not in self.enabled_tasks:
+                logging.debug("[UPGRADE_HUB] Auto-queue skipped — task disabled in Task Manager")
+                return
             from utilities.settings import get_setting
             from database.zilean_upgrade import (
                 get_last_results, scan_for_upgrades, get_scan_status, queue_upgrade_candidates

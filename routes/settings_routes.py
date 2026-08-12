@@ -929,6 +929,26 @@ def get_trakt_friends():
         logging.error(f"Error listing Trakt friends: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@settings_bp.route('/content-sources/scrob-lists')
+def get_scrob_lists():
+    """Get the user's Scrob lists (id + name) for the multi-select picker."""
+    try:
+        from content_checkers.scrob import get_scrob_config, _scrob_get
+
+        if not get_scrob_config():
+            return jsonify({'success': False, 'error': 'Scrob URL/API key not configured in Additional Settings → Scrob'}), 400
+
+        data = _scrob_get('/lists')
+        if data is None:
+            return jsonify({'success': False, 'error': 'Failed to reach Scrob. Check the URL/API key in Additional Settings → Scrob.'}), 502
+
+        lists = [{'id': lst['id'], 'name': lst.get('name', f"List {lst['id']}"), 'item_count': lst.get('item_count', 0)}
+                 for lst in data.get('lists', [])]
+        return jsonify({'success': True, 'lists': lists})
+    except Exception as e:
+        logging.error(f"Error fetching Scrob lists: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @settings_bp.route('/content-sources/overseerr-users')
 def get_overseerr_users():
     from utilities.settings import get_setting, get_all_settings
@@ -3628,6 +3648,7 @@ def add_default_mdblists():
         default_mdblists = {
             "MDBList_1": {
                 "enabled": True,
+                "source_mode": "json_url",
                 "urls": "https://mdblist.com/lists/hdlists/top-ten-pirated-movies-of-the-week-torrent-freak-com",
                 "versions": {
                     default_version: True
@@ -3642,6 +3663,7 @@ def add_default_mdblists():
             },
             "MDBList_2": {
                 "enabled": True,
+                "source_mode": "json_url",
                 "urls": "https://mdblist.com/lists/godver3/top-10-shows",
                 "versions": {
                     default_version: True
@@ -4037,7 +4059,7 @@ def create_virtual_folder():
                     continue
                 dc_config['custom_folders'][fname] = {
                     'filters': {
-                        'regex': f'(?i)\\{{tags-[^}}]*{tag}[^}}]*\\}}'
+                        'tags': tag
                     }
                 }
                 created.append(fname)
@@ -4045,10 +4067,10 @@ def create_virtual_folder():
             # One combined folder for all selected tags
             if folder_name in dc_config['custom_folders']:
                 return jsonify({'success': False, 'error': f'Folder "{folder_name}" already exists'}), 400
-            tag_pattern = '|'.join(tag.strip() for tag in tags if tag.strip())
+            tag_value = ','.join(tag.strip() for tag in tags if tag.strip())
             dc_config['custom_folders'][folder_name] = {
                 'filters': {
-                    'regex': f'(?i)\\{{tags-[^}}]*(?:{tag_pattern})[^}}]*\\}}'
+                    'tags': tag_value
                 }
             }
             created.append(folder_name)

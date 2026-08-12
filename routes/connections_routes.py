@@ -1006,6 +1006,57 @@ def check_content_source_connection(source_id: str, source_config: Dict[str, Any
     try:
         # --- MDBList ---
         if source_type == 'MDBList':
+            source_mode = (source_config.get('source_mode') or 'json_url').strip() or 'json_url'
+
+            # API modes talk to api.mdblist.com directly and need the configured API key
+            if source_mode != 'json_url':
+                from content_checkers.mdb_list import build_mdblist_api_url
+
+                api_key = (get_setting('MDBList', 'api_key', '') or '').strip()
+                if not api_key:
+                    base_response['error'] = 'MDBList API key not configured (Additional Settings -> MDBList)'
+                    base_response['connected'] = False
+                    return base_response
+
+                try:
+                    # Only the first list ID needs testing to prove the endpoint works
+                    endpoint = build_mdblist_api_url(
+                        source_mode,
+                        username=source_config.get('username'),
+                        listname=source_config.get('listname'),
+                        list_id=str(source_config.get('list_id') or '').split(',')[0]
+                    )
+                except ValueError as e:
+                    base_response['error'] = str(e)
+                    base_response['connected'] = False
+                    return base_response
+
+                try:
+                    response = requests.get(
+                        endpoint,
+                        params={'apikey': api_key, 'limit': 1},
+                        headers={'Accept': 'application/json'},
+                        timeout=10
+                    )
+                    if response.status_code == 200:
+                        base_response['connected'] = True
+                        base_response['error'] = f'Successfully connected to {endpoint}'
+                    elif response.status_code in (401, 403):
+                        base_response['error'] = 'MDBList authentication failed - check your API key'
+                    elif response.status_code == 404:
+                        base_response['error'] = f'MDBList list not found: {endpoint}'
+                    else:
+                        base_response['error'] = f'MDBList API returned status {response.status_code}'
+                except requests.exceptions.RequestException as e:
+                    base_response['error'] = f'MDBList API error: {str(e)}'
+
+                base_response['details'].update({
+                    'source_mode': source_mode,
+                    'endpoint': endpoint,
+                    'versions': source_config.get('versions', {'Default': True})
+                })
+                return base_response
+
             urls = source_config.get('urls', '').strip()
             if not urls:
                 base_response['error'] = 'URLs not configured'
@@ -1056,6 +1107,7 @@ def check_content_source_connection(source_id: str, source_config: Dict[str, Any
                 base_response['error'] = f'Successfully connected to all {len(successful_urls)} URLs'
                 
             base_response['details'].update({
+                'source_mode': source_mode,
                 'successful_urls': successful_urls,
                 'failed_urls': failed_urls,
                 'total_urls': len(url_list),
@@ -1222,6 +1274,31 @@ def check_content_source_connection(source_id: str, source_config: Dict[str, Any
 
             except Exception as e:
                 base_response['error'] = f'TMDB API error: {str(e)}'
+                base_response['connected'] = False
+
+        # --- Scrob Sources (Lists, Collection, Special Lists) ---
+        elif source_type in ['Scrob Lists', 'Scrob Collection', 'Special Scrob Lists']:
+            from content_checkers.scrob import get_scrob_config, _scrob_get
+
+            scrob_config = get_scrob_config()
+            if not scrob_config:
+                base_response['error'] = 'Scrob URL or API key not configured in Additional Settings'
+                base_response['connected'] = False
+                return base_response
+
+            try:
+                data = _scrob_get('/lists')
+                if data is not None:
+                    base_response['connected'] = True
+                    base_response['details'].update({
+                        'url': scrob_config['base_url'],
+                        'list_count': len(data.get('lists', []))
+                    })
+                else:
+                    base_response['error'] = 'Failed to connect to Scrob API'
+                    base_response['connected'] = False
+            except Exception as e:
+                base_response['error'] = f'Scrob API error: {str(e)}'
                 base_response['connected'] = False
 
         # --- Agregarr ---

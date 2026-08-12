@@ -191,11 +191,52 @@ def signal_handler(signum, frame):
 
 def run_server():
     from routes.extensions import app
-    
+    from werkzeug.serving import make_server, WSGIRequestHandler
+
     # Get port from environment variable or use default
     port = int(os.environ.get('CLI_DEBRID_PORT', 5000))
+
+    class WebSocketAwareHandler(WSGIRequestHandler):
+        """Threaded Werkzeug handler that supports SignalR WebSocket upgrades.
+
+        SignalR WebSocket sessions are handled here directly (not via Flask) so
+        app before_request / session middleware cannot block the 101 handshake.
+        """
+
+        protocol_version = "HTTP/1.1"
+
+        def make_environ(self):
+            environ = super().make_environ()
+            environ['werkzeug.socket'] = self.connection
+            return environ
+
+        def run_wsgi(self):
+            upgrade = (self.headers.get('Upgrade') or '').lower().strip()
+            path = (self.path or '').split('?', 1)[0]
+            if upgrade == 'websocket' and path in ('/signalr/messages', '/signalr'):
+                self.environ = environ = self.make_environ()
+                try:
+                    from routes.bazarr_spoofing_routes import run_signalr_websocket_session
+                    run_signalr_websocket_session(environ)
+                except (BrokenPipeError, ConnectionError, ConnectionResetError):
+                    pass
+                except Exception as e:
+                    logging.error(f"[SignalR] WebSocket handler error: {e}", exc_info=True)
+                return
+            return super().run_wsgi()
+
     try:
-        app.run(debug=True, use_reloader=False, host='0.0.0.0', port=port, threaded=True)
+        # Use make_server (not app.run) so we control the request handler and
+        # avoid the Flask debugger wrapper interfering with Upgrade requests.
+        logging.info(f"Starting Werkzeug threaded server with WebSocket support on 0.0.0.0:{port}")
+        server = make_server(
+            '0.0.0.0',
+            port,
+            app,
+            threaded=True,
+            request_handler=WebSocketAwareHandler,
+        )
+        server.serve_forever()
     except Exception as e:
         logging.error(f"Error running server: {str(e)}")
         cleanup_port(port)
@@ -516,52 +557,40 @@ def check_service_connectivity():
                 "message": f"Connectivity check error: {_ue}"
             })
 
-    # Check Metadata Battery connectivity and Trakt authorization
-    try:
-        from cli_battery.app.direct_api import DirectAPI
-        result = DirectAPI.check_trakt_auth()
-        trakt_status = result.get('status')
+    # Check Trakt authorization — only if the user has actually configured Trakt.
+    # Trakt is an optional integration; an unconfigured or unauthorized Trakt
+    # account must never block program start or pause the running queues.
+    trakt_client_id = get_setting('Trakt', 'client_id')
+    trakt_client_secret = get_setting('Trakt', 'client_secret')
 
-        if trakt_status != 'authorized':
-            logging.warning("Metadata Battery is reachable, but Trakt is not authorized.")
+    if trakt_client_id and trakt_client_secret:
+        try:
+            from cli_battery.app.direct_api import DirectAPI
+            result = DirectAPI.check_trakt_auth()
+            trakt_status = result.get('status')
 
-            # Attempt automatic re-authentication
-            auto_reauth_success = attempt_trakt_auto_reauth()
-            if auto_reauth_success:
-                logging.info("Automatic Trakt re-authentication successful. Re-checking authorization...")
-                result = DirectAPI.check_trakt_auth()
-                trakt_status = result.get('status')
+            if trakt_status != 'authorized':
+                logging.warning("Trakt is configured, but not authorized.")
 
-                if trakt_status == 'authorized':
-                    logging.info("Trakt authorization restored after automatic re-authentication.")
+                # Attempt automatic re-authentication
+                auto_reauth_success = attempt_trakt_auto_reauth()
+                if auto_reauth_success:
+                    logging.info("Automatic Trakt re-authentication successful. Re-checking authorization...")
+                    result = DirectAPI.check_trakt_auth()
+                    trakt_status = result.get('status')
+
+                    if trakt_status == 'authorized':
+                        logging.info("Trakt authorization restored after automatic re-authentication.")
+                    else:
+                        logging.warning("Trakt still not authorized after automatic re-authentication attempt. Continuing without Trakt.")
                 else:
-                    logging.warning("Trakt still not authorized after automatic re-authentication attempt.")
-                    services_reachable = False
-                    failed_services_details.append({
-                        "service": "Trakt",
-                        "type": "UNAUTHORIZED",
-                        "message": "Trakt not authorized after auto-reauth attempt. Manual re-authorization is required. Please re-authorize Trakt in the settings UI."
-                    })
-            else:
-                logging.warning("Automatic Trakt re-authentication failed.")
-                services_reachable = False
+                    logging.warning("Automatic Trakt re-authentication failed. Continuing without Trakt.")
 
-                error_message = "Trakt not authorized. Automatic re-authentication failed. Manual re-authorization is required. Please re-authorize Trakt in the settings UI."
+        except Exception as e:
+            logging.error(f"Error checking Trakt auth via battery (non-fatal, Trakt is optional): {e}")
+    else:
+        logging.debug("Trakt is not configured; skipping Trakt authorization check.")
 
-                if is_refresh_token_expired():
-                    error_message = "Trakt refresh token has expired. Manual re-authentication is required. Please re-authorize Trakt in the settings UI."
-
-                failed_services_details.append({
-                    "service": "Trakt",
-                    "type": "UNAUTHORIZED",
-                    "message": error_message
-                })
-
-    except Exception as e:
-        logging.error(f"Error checking Trakt auth via battery: {e}")
-        services_reachable = False
-        failed_services_details.append({"service": "Metadata Battery", "type": "CONNECTION_ERROR", "status_code": None, "message": str(e)})
-    
     return services_reachable, failed_services_details
 
 def attempt_trakt_auto_reauth():

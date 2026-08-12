@@ -480,6 +480,11 @@ class UpgradingQueue:
                             from database import update_media_item_state
                             update_media_item_state(item_id, state="Collected")
                             logging.info(f"Moved item {item_id} to Collected state due to timeout.")
+                    elif not get_setting("Scraping", "enable_upgrading", default=False):
+                        logging.info(f"Item {item_id} is in the Upgrading queue but Scraping.enable_upgrading is disabled — reverting to Collected without scraping.")
+                        self.remove_item(item)
+                        from database import update_media_item_state
+                        update_media_item_state(item_id, state="Collected")
                     elif self.should_perform_hourly_scrape(item_id, current_time):
                         logging.info(f"Performing hourly scrape for item {item_id} which has been in queue for {time_in_queue}.")
                         self.hourly_scrape(item, queue_manager) # This might remove the item if upgraded
@@ -1222,8 +1227,9 @@ class UpgradingQueue:
                         # We might need to update the 'upgrading' flag back to False if restore_item_state doesn't
                         update_media_item(item['id'], upgrading=False)
                     else:
-                        logging.error(f"Failed to restore previous state for {item_identifier}, manual intervention may be needed")
-                        # Item might be stuck, consider moving to a failed state?
+                        # No snapshot to restore; revert to Collected instead of leaving it stuck mid-upgrade.
+                        logging.error(f"Failed to restore previous state for {item_identifier}; reverting to Collected")
+                        update_media_item(item['id'], state='Collected', upgrading=False, upgrading_from=None)
 
                     # Log failure to Upgrade Hub activity (after purge/not_wanted so we can include outcomes)
                     if pre_candidate is not None:

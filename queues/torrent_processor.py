@@ -457,8 +457,15 @@ class TorrentProcessor:
                             last_error = err_str
                             break
                     except Exception as ex:
-                        logging.error(f"[{provider.PROVIDER_NAME}] Unexpected error: {ex}", exc_info=True)
-                        last_error = str(ex)
+                        err_str = str(ex)
+                        if "space is full" in err_str.lower():
+                            # Account-storage exhaustion — an action only the user can take
+                            # (free up space / upgrade plan), not a code-level failure. A full
+                            # traceback here is just noise; a short warning is enough to act on.
+                            logging.warning(f"[{provider.PROVIDER_NAME}] Account storage is full — cannot add torrent. Free up space or upgrade your plan.")
+                        else:
+                            logging.error(f"[{provider.PROVIDER_NAME}] Unexpected error: {ex}", exc_info=True)
+                        last_error = err_str
                         break
 
                 if not torrent_id:
@@ -565,13 +572,17 @@ class TorrentProcessor:
                     from database import get_db_connection as _gdb
                     _conn = _gdb()
                     import re as _re_dedup
+                    # Matches SQL's REPLACE(COALESCE(version,''),'*','') exactly — fall back
+                    # to '' (not a literal like 'Default') so NULL/empty version rows still compare equal.
+                    _sibling_ver = (item.get('version') or '').rstrip('*')
                     try:
                         _sibling = _conn.execute(
                             "SELECT filled_by_torrent_id, filled_by_file FROM media_items "
                             "WHERE imdb_id=? AND season_number=? AND type='episode' "
                             "AND id!=? AND filled_by_torrent_id LIKE 'nzb:%' "
+                            "AND REPLACE(COALESCE(version,''),'*','')=? "
                             "AND state IN ('Adding','Checking','Collected','Upgrading') LIMIT 1",
-                            (_imdb, _season, item.get('id', -1))
+                            (_imdb, _season, item.get('id', -1), _sibling_ver)
                         ).fetchone()
                     finally:
                         _conn.close()
@@ -612,8 +623,9 @@ class TorrentProcessor:
                                         "SELECT id, filled_by_torrent_id FROM media_items "
                                         "WHERE imdb_id=? AND season_number=? AND type='episode' "
                                         "AND filled_by_torrent_id LIKE 'nzb:%' "
+                                        "AND REPLACE(COALESCE(version,''),'*','')=? "
                                         "AND state IN ('Adding','Checking')",
-                                        (_imdb, _season)
+                                        (_imdb, _season, _sibling_ver)
                                     ).fetchall()
                                 finally:
                                     _conn2.close()
@@ -662,7 +674,14 @@ class TorrentProcessor:
                 episode_title=None if _is_season_pack else (item or {}).get('episode_title'),
                 tags=(item or {}).get('tags') or None,
             ) or title
-        except Exception:
+        except Exception as _bnt_exc:
+            # Falling back to the raw scraped title silently here means the
+            # resulting cli_mount entry has no imdb tag, no version tag, and no
+            # structured name at all — indistinguishable from naming being
+            # disabled. Log it so a real bug (bad settings lookup, unexpected
+            # season/episode type, etc.) is visible instead of masquerading as
+            # "naming worked but produced a plain title".
+            logging.warning(f'[{item_identifier}] _build_nzb_title failed, falling back to raw title: {_bnt_exc}', exc_info=True)
             job_title = title
 
         # Check if same NZB title already in cli_mount/NzbDAV to avoid duplicates.
@@ -680,21 +699,31 @@ class TorrentProcessor:
 
         # DB-level dedup: check if same item already in Adding/Checking with nzb: torrent ID.
         # Works for both cli_mount and NzbDAV since it uses the DB, not provider API.
+        # Version-scoped: different versions (e.g. 1080p vs 4k) of the same movie/episode
+        # must never be treated as duplicates of each other — reusing another version's
+        # job id corrupts both DB rows and can lead to one version's file being deleted
+        # when the other's lifecycle (health check, cleanup, repair) acts on that job id.
         try:
             from database.core import get_db_connection as _get_dbc_dd
             _item_imdb = (item or {}).get('imdb_id')
             _item_type = (item or {}).get('type', '')
+            _item_id = (item or {}).get('id', -1)
+            # Matches SQL's REPLACE(COALESCE(version,''),'*','') exactly.
+            _item_ver = ((item or {}).get('version') or '').rstrip('*')
             if _item_imdb and _item_type:
                 _dd_q = ("SELECT filled_by_torrent_id FROM media_items "
                          "WHERE imdb_id=? AND type=? AND state IN ('Adding','Checking') "
-                         "AND filled_by_torrent_id LIKE 'nzb:%'")
-                _dd_p = (_item_imdb, _item_type)
+                         "AND filled_by_torrent_id LIKE 'nzb:%' "
+                         "AND REPLACE(COALESCE(version,''),'*','')=? AND id!=?")
+                _dd_p = (_item_imdb, _item_type, _item_ver, _item_id)
                 if _item_type == 'episode':
                     _dd_q = ("SELECT filled_by_torrent_id FROM media_items "
                              "WHERE imdb_id=? AND type=? AND season_number=? AND episode_number=? "
-                             "AND state IN ('Adding','Checking') AND filled_by_torrent_id LIKE 'nzb:%'")
+                             "AND state IN ('Adding','Checking') AND filled_by_torrent_id LIKE 'nzb:%' "
+                             "AND REPLACE(COALESCE(version,''),'*','')=? AND id!=?")
                     _dd_p = (_item_imdb, _item_type,
-                             (item or {}).get('season_number'), (item or {}).get('episode_number'))
+                             (item or {}).get('season_number'), (item or {}).get('episode_number'),
+                             _item_ver, _item_id)
                 with _get_dbc_dd() as _dbc:
                     _dd_row = _dbc.execute(_dd_q, _dd_p).fetchone()
                 if _dd_row:
@@ -1251,8 +1280,22 @@ class TorrentProcessor:
                                                 if not hasattr(_dc, 'rename_nzb'):
                                                     logging.info(f'[DebridNaming] Client has no rename_nzb for {ident!r}')
                                                     return  # active usenet provider (e.g. nzbdav) has no rename semantics
+                                                # cli_mount only registers an entry as queryable-by-hash after its
+                                                # own periodic sync (default ~10 min) — a 404 in the first several
+                                                # attempts is expected, not proof the entry is gone. Only treat 404
+                                                # as final once it's persisted for that long (20 attempts x 30s).
+                                                _consecutive_404 = 0
+                                                _confirmed_gone_after = 20
                                                 for _attempt in range(100):
-                                                    if _dc.rename_nzb(h, name):
+                                                    _renamed, _not_found = _dc.rename_nzb_with_status(h, name)
+                                                    if _not_found:
+                                                        _consecutive_404 += 1
+                                                        if _consecutive_404 >= _confirmed_gone_after:
+                                                            logging.warning(f'[DebridNaming] {h!r} not found in cli_mount (404) for {_consecutive_404} consecutive attempts — giving up for {ident}')
+                                                            return
+                                                    else:
+                                                        _consecutive_404 = 0
+                                                    if _renamed:
                                                         logging.info(f'[DebridNaming] Renamed {h!r} -> {name!r} for {ident}')
                                                         if item_id:
                                                             try:
@@ -1287,6 +1330,8 @@ class TorrentProcessor:
                                                                     if _cli_ids_dn:
                                                                         _dc.register_cli_ids(h, _cli_ids_dn)
                                                                         logging.info(f'[DebridNaming] Registered {len(_cli_ids_dn)} cli_debrid IDs for {h!r}')
+                                                            if item_id:
+                                                                _dc.push_tags_for_item(h, item_id)
                                                         except Exception as _reg_dn_err:
                                                             logging.debug(f'[DebridNaming] cli_ids registration error: {_reg_dn_err}')
                                                         return
