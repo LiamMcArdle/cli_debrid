@@ -14,10 +14,92 @@ from scraper.functions.anime_utils import detect_absolute_numbering
 
 class MediaMatcher:
     """Handles media content matching and validation"""
-    
+
+    # Season declared by a containing folder. Lookarounds rather than consuming
+    # groups: 'S01+S02' must yield BOTH seasons, and a pattern that ate the '+'
+    # as S01's trailing delimiter would leave nothing for S02 to match against,
+    # reporting a two-season pack as season 1.
+    _CONTAINER_SEASON = re.compile(r'(?<![A-Za-z0-9])S(\d{1,2})(?![0-9])', re.I)
+    # 'S01+02', 'S01-05' -- a span written without repeating the S.
+    _CONTAINER_SPAN = re.compile(r'(?<![A-Za-z0-9])S\d{1,2}\s*[-+&,]\s*(?:S)?\d{1,2}', re.I)
+    _CONTAINER_MULTI = ('complete', 'seasons', 'batch', ' to ', '~')
+
     def __init__(self, relaxed_matching: bool = False):
         self.episode_count_cache: Dict[str, Dict[int, int]] = {}
         self.relaxed_matching = relaxed_matching
+
+    def _season_from_container(self, file_path: str) -> Optional[int]:
+        """Season the containing folder declares, only when the claim is unambiguous.
+
+        PTT parses the basename alone, so a pack of bare-numbered files
+        ('Show - 04.mkv') yields no season and gets indexed under (None, ep) --
+        which then satisfies that episode number in EVERY season. The season is
+        usually right there in the folder ('Show - S01 (1080p)/'), so use it to
+        rule out the wrong seasons.
+
+        Returns None whenever the folder cannot pin down exactly one season, so
+        multi-season packs keep today's behaviour rather than being mislabelled.
+        """
+        folder = os.path.basename(os.path.dirname(file_path or ''))
+        if not folder:
+            return None
+        if any(w in folder.lower() for w in self._CONTAINER_MULTI):
+            return None
+        if self._CONTAINER_SPAN.search(folder):
+            return None
+        hits = {int(m) for m in self._CONTAINER_SEASON.findall(folder)}
+        return hits.pop() if len(hits) == 1 else None
+
+    def _basenames_already_in_use(self, basenames: List[str], imdb_id: Optional[str],
+                                  exclude_item_id: Optional[int] = None) -> set:
+        """Of these torrent files, the ones a collected item of this series already owns.
+
+        An in-memory set only covers a single assignment pass, and collisions are
+        not built that way: of 413 shared files observed, 145 spanned different
+        torrent IDs and 218 different collection times -- one Dragon Ball Z file
+        was claimed across three torrents over four months. Each pass started with
+        an empty set and saw nothing wrong, so the check has to hit the database.
+
+        Scoped to one imdb_id on purpose. filled_by_file is a bare filename and
+        names like '01.mkv' recur across unrelated shows; a global match would
+        block a legitimate file that merely shares a name.
+        """
+        if not basenames or not imdb_id:
+            return set()
+        try:
+            from database.core import get_db_connection
+            conn = get_db_connection()
+            try:
+                placeholders = ','.join('?' * len(basenames))
+                sql = (f"SELECT filled_by_file FROM media_items "
+                       f"WHERE imdb_id = ? AND filled_by_file IN ({placeholders}) "
+                       f"AND state IN ('Collected','Upgrading')")
+                params = [imdb_id, *basenames]
+                if exclude_item_id is not None:
+                    sql += " AND id != ?"
+                    params.append(exclude_item_id)
+                return {row[0] for row in conn.execute(sql, params) if row[0]}
+            finally:
+                conn.close()
+        except Exception as e:
+            # Fail open. If we cannot prove a file is free, matching behaves as it
+            # did before rather than starving episodes on a transient DB error.
+            logging.warning(f"Could not determine which files are already in use ({e}); "
+                            f"proceeding without the cross-pass collision guard.")
+            return set()
+
+    def _container_season_conflicts(self, parsed_file_info: Dict[str, Any],
+                                    target_season: Optional[int]) -> bool:
+        """True if the file's folder declares a season other than the one wanted.
+
+        Season 0 is exempt: specials are routinely bundled into a season pack
+        ('Show S01 [BD]/' containing the OVAs), so a folder/target difference
+        there is expected rather than evidence of a bad match.
+        """
+        if target_season is None or target_season == 0:
+            return False
+        folder_season = self._season_from_container(parsed_file_info.get('path', ''))
+        return folder_season is not None and folder_season != target_season
 
     def _get_season_episode_counts_cached(self, tmdb_id: Optional[int]) -> Optional[Dict[int, int]]:
         """Return season→episode-count map cached per tmdb_id."""
@@ -843,8 +925,12 @@ class MediaMatcher:
                 for pf in by_season_episode.get((target_season, target_episode), []):
                     if id(pf) not in seen_ids:
                         seen_ids.add(id(pf)); candidate_files.append(pf)
-                # Index hits: (None, episode)
+                # Index hits: (None, episode) -- files whose name carries no season.
+                # Skip any whose folder declares a different season, or one
+                # bare-numbered season pack satisfies this episode in every season.
                 for pf in by_season_episode.get((None, target_episode), []):
+                    if self._container_season_conflicts(pf, target_season):
+                        continue
                     if id(pf) not in seen_ids:
                         seen_ids.add(id(pf)); candidate_files.append(pf)
                 # Index hits: episode-only
@@ -1060,7 +1146,7 @@ class MediaMatcher:
              return abs(int(item_year) - int(parsed_year)) <= 1
         return True # Acceptable if one or both years are missing
 
-    def find_related_items(self, parsed_torrent_files: List[Dict[str, Any]], scraping_items: List[Dict[str, Any]], wanted_items: List[Dict[str, Any]], original_item: Dict[str, Any], xem_mapping: Optional[Dict[str, int]] = None, torrent_title: Optional[str] = None) -> List[Tuple[Dict[str, Any], str]]:
+    def find_related_items(self, parsed_torrent_files: List[Dict[str, Any]], scraping_items: List[Dict[str, Any]], wanted_items: List[Dict[str, Any]], original_item: Dict[str, Any], xem_mapping: Optional[Dict[str, int]] = None, torrent_title: Optional[str] = None, claimed_file_paths: Optional[List[str]] = None) -> List[Tuple[Dict[str, Any], str]]:
         """
         Find items in the scraping and wanted queues that match pre-parsed files in the torrent.
 
@@ -1071,11 +1157,29 @@ class MediaMatcher:
             original_item: The original item being processed, used to match version/title.
             xem_mapping: Optional dictionary with 'season' from PTT of the torrent title, to enforce season-matching for packs.
             torrent_title: Optional torrent title string to parse for season information.
+            claimed_file_paths: Paths already assigned to another item (e.g. the file the
+                primary item matched), which must not be handed to a second episode.
 
         Returns:
             List of tuples, where each tuple contains (related_item_dict, matching_filepath_basename).
         """
         related_matches = []
+        # One file may satisfy at most one episode. Without this, a pack of
+        # bare-numbered files hands the SAME file to the same episode number in
+        # every season -- one Dragon Ball Z file was claimed by S01E23 through
+        # S09E23. Season labels legitimately disagree with the metadata provider
+        # (a file marked S01E03 really can be the provider's S00E03), so the
+        # season is not a safe discriminator; reuse of one file is.
+        # Keyed on basename, which is the file identity used everywhere else here
+        # (related_matches and filled_by_file both store basenames).
+        claimed_basenames = {os.path.basename(p) for p in (claimed_file_paths or ())}
+        # Plus anything a previous pass already handed out -- see
+        # _basenames_already_in_use for why the in-memory set alone is not enough.
+        claimed_basenames |= self._basenames_already_in_use(
+            [os.path.basename(pf['path']) for pf in parsed_torrent_files],
+            original_item.get('imdb_id'),
+            exclude_item_id=original_item.get('id'),
+        )
         original_version = original_item.get('version')
         # Ensure consistent title check (e.g., using series_title if available)
         original_title_to_check = original_item.get('series_title') or original_item.get('title')
@@ -1237,8 +1341,11 @@ class MediaMatcher:
                     for pf in by_season_episode.get((target_season, target_episode), []):
                         if id(pf) not in seen_ids:
                             seen_ids.add(id(pf)); candidate_files.append(pf)
-                    # (None, episode)
+                    # (None, episode) -- see _container_season_conflicts: a
+                    # bare-numbered pack would otherwise match every season.
                     for pf in by_season_episode.get((None, target_episode), []):
+                        if self._container_season_conflicts(pf, target_season):
+                            continue
                         if id(pf) not in seen_ids:
                             seen_ids.add(id(pf)); candidate_files.append(pf)
                     # Episode-only
@@ -1273,7 +1380,11 @@ class MediaMatcher:
                 if parsed_file_info.get('parsed_info', {}).get('is_anime_special_content', False):
                     logging.debug(f"Skipping anime special file '{parsed_file_info['path']}' for related item matching.")
                     continue
-                
+
+                # Already handed to another episode (or to the primary item).
+                if os.path.basename(parsed_file_info['path']) in claimed_basenames:
+                    continue
+
                 # Pass per-candidate mapping (if available) so scene numbering is considered correctly
                 if self._check_match(
                     parsed_file_info,
@@ -1284,6 +1395,7 @@ class MediaMatcher:
                     logging.info(f"Found related item ID {item_id} (State: {item.get('state', 'Unknown')}) matching file '{parsed_file_info['path']}'")
                     # Store the item and the *basename* of the matched file path
                     related_matches.append((item, os.path.basename(parsed_file_info['path'])))
+                    claimed_basenames.add(os.path.basename(parsed_file_info['path']))
                     processed_item_ids.add(item_id) # Mark as processed
                     found_match_for_this_item = True
                     break # Move to the next candidate item once a match is found for this one

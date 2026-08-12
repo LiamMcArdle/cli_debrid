@@ -753,7 +753,10 @@ class AddingQueue:
                         wanted_items,   # Fetched before loop
                         item,           # Original item for context
                         xem_mapping=xem_mapping, # Pass XEM mapping for season context
-                        torrent_title=torrent_title # Pass torrent title for enhanced season detection
+                        torrent_title=torrent_title, # Pass torrent title for enhanced season detection
+                        # The primary item already owns this file; it must not be
+                        # handed to a related episode as well.
+                        claimed_file_paths=[matched_file_basename]
                     )
 
                     if related_matches:

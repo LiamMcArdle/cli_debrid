@@ -249,7 +249,10 @@ class PendingUncachedQueue:
                 parsed_torrent_files=parsed_torrent_files,
                 scraping_items=scraping_items,
                 wanted_items=wanted_items,
-                original_item=item 
+                original_item=item,
+                # This item already owns 'filename'; it must not be handed to a
+                # related episode as well (the adding_queue path does the same).
+                claimed_file_paths=[filename] if filename else None,
             )
                 
             if related_item_tuples:
