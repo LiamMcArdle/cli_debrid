@@ -150,10 +150,6 @@ def filter_results(
     anime_threshold = float(original_anime_setting)
     base_similarity_threshold = anime_threshold if is_anime else float(version_settings.get('similarity_threshold', 0.8))
 
-    # Debug logging for threshold issues
-    if is_anime:
-        logging.info(f"DEBUG THRESHOLD: anime similarity threshold: {anime_threshold}, is_anime: {is_anime}")
-    
     # Adjust threshold for shorter titles if not anime/UFC (which have their own specific low threshold)
     # We'll check is_ufc later in the loop for each result, but for threshold setting,
     # we only care if the *overall query* might be for anime (which has a low threshold).
