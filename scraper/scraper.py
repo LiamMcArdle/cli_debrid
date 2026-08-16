@@ -36,6 +36,34 @@ except ImportError:
 # Initialize DirectAPI at module level
 direct_api = DirectAPI()
 
+# Trakt keys its alias map by country, while a version's `language_code` setting
+# is a language. Only the countries a language is actually titled in belong here
+# -- widening this makes the title filter more permissive, which is the direction
+# that lets an unrelated show's release match, so keep it tight.
+ALIAS_COUNTRIES_BY_LANGUAGE = {
+    'en': {'us', 'gb', 'uk', 'ca', 'au', 'nz', 'ie'},
+    'ja': {'jp'},
+    'ko': {'kr'},
+    'zh': {'cn', 'tw', 'hk'},
+    'es': {'es', 'mx', 'ar'},
+    'pt': {'pt', 'br'},
+    'fr': {'fr', 'be'},
+    'de': {'de', 'at'},
+    'it': {'it'},
+    'ru': {'ru'},
+    'nl': {'nl'},
+    'sv': {'se'},
+    'da': {'dk'},
+    'no': {'no'},
+    'fi': {'fi'},
+    'pl': {'pl'},
+    'tr': {'tr'},
+    'ar': {'sa', 'ae', 'eg'},
+    'he': {'il'},
+    'th': {'th'},
+    'hi': {'in'},
+}
+
 def normalize_episode_format_for_dedup(episode_format: str) -> str:
     """
     Normalize episode format for deduplication purposes.
@@ -1147,9 +1175,24 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                         full_aliases, _ = direct_api_instance.get_show_aliases(imdb_id_for_fallback)
                     if full_aliases:
                         lang_code = version_settings.get('language_code', 'en').lower()
+                        # The alias map is keyed by COUNTRY (trakt_client.get_show_aliases
+                        # builds it from item['country']), but this setting holds a
+                        # LANGUAGE code. 'en'.startswith against 'us'/'gb'/'jp' never
+                        # matched, so this block added nothing at all -- and the whole
+                        # point of it is to pick up a sequel season's own name, e.g.
+                        # 'Bleach: Thousand-Year Blood War' living under the 'us' key of
+                        # a show whose own country is 'jp'.
+                        # English is always included on top of the configured
+                        # language: release titles are Latin-script by convention
+                        # whatever the show's origin, and the Anime version runs
+                        # language_code 'ja', which alone yields only Japanese and
+                        # romaji names -- never 'Bleach: Thousand-Year Blood War',
+                        # which is exactly how the packs on disk are named.
+                        countries = set(ALIAS_COUNTRIES_BY_LANGUAGE.get(lang_code, {lang_code}))
+                        countries |= ALIAS_COUNTRIES_BY_LANGUAGE['en']
                         existing_lower = {a.lower() for a in effective_matching_aliases}
                         for key, aliases in full_aliases.items():
-                            if key.lower().startswith(lang_code):
+                            if key.lower() in countries:
                                 for alias in (aliases or []):
                                     if alias and alias.lower() != original_media_title.lower() and alias.lower() not in existing_lower:
                                         effective_matching_aliases.append(alias)
