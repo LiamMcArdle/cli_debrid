@@ -17,6 +17,8 @@ already-parsed facts, which is what makes this testable in isolation.
 """
 
 import logging
+import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 # Verdict reasons, for logging and tests.
@@ -124,6 +126,122 @@ def season_verdict(
     return False, ABSOLUTE_MISMATCH
 
 
+# --- Episode identity by title ---------------------------------------------
+#
+# Season and episode numbers are a release's *numbering*, and some packs cannot
+# be reconciled with the metadata provider's numbering at all. The Danganronpa
+# 'Complete Package' batch flattens four different series into one folder and
+# labels every one of them S01Exx, so the name 'S01E01' belongs to four
+# different episodes and nothing but the episode title separates them.
+#
+# This is a narrow escape hatch, not a general relaxation. A title only counts
+# as evidence when it is long and specific enough to identify an episode on its
+# own, AND when no other episode of the same show could claim the same filename.
+
+TITLE_MATCH = 'filename names this episode by title'
+TITLE_NOT_DISTINCTIVE = 'episode title too generic to identify an episode'
+TITLE_ABSENT = 'episode title not present in filename'
+TITLE_AMBIGUOUS = 'another episode of this show also fits this filename'
+
+MIN_TITLE_CHARS = 12
+MIN_TITLE_WORDS = 2
+
+# Placeholder titles carry no information. Providers emit these in bulk for
+# shows they have no episode data for, so they would otherwise match wholesale.
+_GENERIC_TITLE_RE = re.compile(
+    r'^(?:episode|ep|part|chapter|act|volume|vol|special|ova|ona|movie|film|'
+    r'season|series|pilot|finale|prologue|epilogue|tba|tbd|untitled|unknown)'
+    r'(?:\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten))?$')
+
+
+def normalize_title_text(text: str) -> str:
+    """Lowercase; apostrophes deleted, every other run of non-alphanumerics a space.
+
+    Apostrophes are deleted rather than spaced so that "Time's" and "Times"
+    collapse to the same token. Spacing them would yield "time s" and stop
+    "Third Time's the Charm" from matching a release that spells it "Times".
+    """
+    stripped = re.sub(r"['‘’ʼ`]", '', (text or '').lower())
+    return re.sub(r'[^a-z0-9]+', ' ', stripped).strip()
+
+
+def _strip_part_marker(title: str) -> str:
+    """Drop a trailing '(2)' part marker.
+
+    TMDB writes two-parters as 'The Gates of Warp! (1)' and 'Showdown at the
+    Gates of Warp! (2)'; the release filenames carry neither marker.
+    """
+    return re.sub(r'\s*\(\d{1,2}\)\s*$', '', title or '').strip()
+
+
+def episode_title_is_distinctive(normalized_title: str) -> bool:
+    """Whether an already-normalized title is strong enough to stand as evidence."""
+    if not normalized_title or len(normalized_title) < MIN_TITLE_CHARS:
+        return False
+    if len(normalized_title.split()) < MIN_TITLE_WORDS:
+        return False
+    return not _GENERIC_TITLE_RE.match(normalized_title)
+
+
+def episode_title_is_usable(episode_title: str) -> bool:
+    """Whether a raw episode title could identify an episode on its own."""
+    return episode_title_is_distinctive(
+        normalize_title_text(_strip_part_marker(episode_title)))
+
+
+def episode_title_verdict(
+    episode_title: Optional[str],
+    filename: Optional[str],
+    other_episode_titles: Optional[List[str]] = None,
+    series_title: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Decide whether `filename` names the episode called `episode_title`.
+
+    Args:
+        episode_title: the target episode's title, as the provider gives it.
+        filename: the release filename (basename only -- a pack folder may list
+            many titles, which would make every file in it look like a hit).
+        other_episode_titles: titles of every OTHER episode of the same show.
+            This is what makes the check safe; without it a title that another
+            episode also carries, or that sits inside a longer title, would be
+            accepted. Callers must exclude the target episode's own title.
+        series_title: the show's name, used to reject an episode titled after
+            its own show.
+
+    Returns:
+        (matches, reason)
+    """
+    target = normalize_title_text(_strip_part_marker(episode_title))
+    if not episode_title_is_distinctive(target):
+        return False, TITLE_NOT_DISTINCTIVE
+
+    # An episode named after its show ('Kingdom' in Kingdom) proves nothing:
+    # every file in the show's pack contains it.
+    if series_title:
+        show = normalize_title_text(series_title)
+        if show and target in show:
+            return False, TITLE_NOT_DISTINCTIVE
+
+    haystack = ' %s ' % normalize_title_text(filename)
+    if ' %s ' % target not in haystack:
+        return False, TITLE_ABSENT
+
+    # If another episode's title also fits this filename, the filename does not
+    # single ours out. Two distinct cases, both caught by comparing lengths:
+    #   equal  -- two episodes genuinely share a title;
+    #   longer -- containment, where 'The Gates of Warp' (E41) sits inside
+    #             'Showdown at the Gates of Warp' (E42). The longer title is the
+    #             one the file actually names, so E41 must not claim E42's file.
+    for other in (other_episode_titles or []):
+        other_norm = normalize_title_text(_strip_part_marker(other))
+        if not other_norm or not episode_title_is_distinctive(other_norm):
+            continue
+        if len(other_norm) >= len(target) and ' %s ' % other_norm in haystack:
+            return False, TITLE_AMBIGUOUS
+
+    return True, TITLE_MATCH
+
+
 def container_season_from_path(file_path: str) -> Optional[int]:
     """Season the containing folder declares, only when the claim is unambiguous.
 
@@ -131,9 +249,6 @@ def container_season_from_path(file_path: str) -> Optional[int]:
     multi-season packs fall through to the absolute-number rule rather than
     being mislabelled as their first season.
     """
-    import os
-    import re
-
     # Lookarounds rather than consuming groups: 'S01+S02' must yield BOTH
     # seasons, and a pattern that ate the '+' as S01's trailing delimiter would
     # leave nothing for S02 to match, reporting a two-season pack as season 1.

@@ -29,6 +29,14 @@ ABSOLUTE_MATCH = _sr.ABSOLUTE_MATCH
 ABSOLUTE_MISMATCH = _sr.ABSOLUTE_MISMATCH
 ABSOLUTE_UNKNOWN = _sr.ABSOLUTE_UNKNOWN
 
+episode_title_verdict = _sr.episode_title_verdict
+episode_title_is_usable = _sr.episode_title_is_usable
+normalize_title_text = _sr.normalize_title_text
+TITLE_MATCH = _sr.TITLE_MATCH
+TITLE_NOT_DISTINCTIVE = _sr.TITLE_NOT_DISTINCTIVE
+TITLE_ABSENT = _sr.TITLE_ABSENT
+TITLE_AMBIGUOUS = _sr.TITLE_AMBIGUOUS
+
 # Demon Slayer: S1=26, S2=7, S3=11, S4=11, S5=8
 DS_ABS = {1: 0, 2: 26, 3: 33, 4: 44, 5: 55}
 
@@ -215,6 +223,136 @@ class TestContainerSeasonParsing(unittest.TestCase):
     def test_no_folder(self):
         self.assertIsNone(container_season_from_path('ep.mkv'))
         self.assertIsNone(container_season_from_path(''))
+
+
+class TestEpisodeTitleNormalization(unittest.TestCase):
+
+    def test_apostrophes_collapse_rather_than_split(self):
+        # "time s the charm" would never match a release spelling it "Times".
+        self.assertEqual(normalize_title_text("Third Time's the Charm"),
+                         'third times the charm')
+        self.assertEqual(normalize_title_text('Third Time’s the Charm'),
+                         'third times the charm')
+
+    def test_punctuation_becomes_a_single_space(self):
+        self.assertEqual(normalize_title_text('Death, Destruction, Despair'),
+                         'death destruction despair')
+        self.assertEqual(normalize_title_text('S01E08-Who Killed Cock Robin [A38F14E4].mkv'),
+                         's01e08 who killed cock robin a38f14e4 mkv')
+
+
+class TestEpisodeTitleIsUsable(unittest.TestCase):
+
+    def test_real_danganronpa_titles_all_usable(self):
+        for title in ("Third Time's the Charm", 'Hang the Witch',
+                      'Cruel Violence and Hollow Words', 'Who Is a Liar',
+                      'Dreams of Distant Days', 'No Man Is an Island',
+                      'Ultra Despair Girls', 'Who Killed Cock Robin?',
+                      'You Are My Reason to Die', 'Death, Destruction, Despair',
+                      'All Good Things', 'It Is Always Darkest'):
+            self.assertTrue(episode_title_is_usable(title), title)
+
+    def test_placeholder_titles_rejected(self):
+        # Bleach S02E41's real title. Matching on this would be catastrophic.
+        for title in ('Episode 41', 'Episode 9', 'Part 2', 'TBA', 'Untitled',
+                      'Special 1', 'Chapter Three'):
+            self.assertFalse(episode_title_is_usable(title), title)
+
+    def test_short_or_single_word_titles_rejected(self):
+        for title in ('Garbage', 'Unforgiven', 'Clash!', 'Outwit'):
+            self.assertFalse(episode_title_is_usable(title), title)
+
+
+class TestEpisodeTitleVerdict(unittest.TestCase):
+    """The EMBER pack labels four different Danganronpa series S01Exx, so the
+    episode title is the only thing that separates four distinct episodes."""
+
+    EMBER = [
+        "S01E01-Hello Again, Hope's Peak High School [3A7E8C12].mkv",
+        'S01E01-The School of Hope and the Students of Despair [1E6347F2].mkv',
+        "S01E01-Third Time's the Charm [56BECC03].mkv",
+        'S01E01-Welcome to Despair High School [3D812AF5].mkv',
+    ]
+
+    def test_picks_the_one_file_that_names_the_title(self):
+        others = ['Hello Again, Hope\'s Peak High School',
+                  'The School of Hope and the Students of Despair',
+                  'Welcome to Despair High School']
+        hits = [f for f in self.EMBER
+                if episode_title_verdict("Third Time's the Charm", f, others)[0]]
+        self.assertEqual(hits, ["S01E01-Third Time's the Charm [56BECC03].mkv"])
+
+    def test_absent_title_is_not_a_match(self):
+        ok, reason = episode_title_verdict('Hang the Witch', self.EMBER[0], [])
+        self.assertFalse(ok)
+        self.assertEqual(reason, TITLE_ABSENT)
+
+    def test_generic_title_never_matches_even_when_present(self):
+        ok, reason = episode_title_verdict('Episode 41', 'Bleach - Episode 41.mkv', [])
+        self.assertFalse(ok)
+        self.assertEqual(reason, TITLE_NOT_DISTINCTIVE)
+
+    def test_duplicate_title_in_another_season_is_ambiguous(self):
+        # Same show, two episodes genuinely sharing a name: nothing in the
+        # filename says which one it is.
+        ok, reason = episode_title_verdict(
+            'The Long Way Home', 'Show.S01E05.The.Long.Way.Home.mkv',
+            other_episode_titles=['The Long Way Home'])
+        self.assertFalse(ok)
+        self.assertEqual(reason, TITLE_AMBIGUOUS)
+
+    def test_episode_named_after_its_show_is_not_evidence(self):
+        ok, reason = episode_title_verdict(
+            'Kingdom Season Three', 'Kingdom Season Three - 04.mkv', [],
+            series_title='Kingdom Season Three')
+        self.assertFalse(ok)
+        self.assertEqual(reason, TITLE_NOT_DISTINCTIVE)
+
+    def test_word_boundaries_are_respected(self):
+        # 'All Good Things' must not match 'All Good Thingsomething'.
+        self.assertFalse(episode_title_verdict(
+            'All Good Things', 'S01E11-All Good Thingsxyz.mkv', [])[0])
+
+
+class TestPokemonTwoParter(unittest.TestCase):
+    """Pokemon S24E41 'The Gates of Warp! (1)' and S24E42 'Showdown at the
+    Gates of Warp! (2)': one title is a substring of the other, and the file on
+    disk carries neither part marker."""
+
+    FILE = 'Pokemon S19E90 Showdown at the Gates of Warp.mkv'
+    E41 = 'The Gates of Warp! (1)'
+    E42 = 'Showdown at the Gates of Warp! (2)'
+
+    def test_part_marker_stripped_so_the_longer_title_matches(self):
+        ok, reason = episode_title_verdict(self.E42, self.FILE, [self.E41])
+        self.assertTrue(ok)
+        self.assertEqual(reason, TITLE_MATCH)
+
+    def test_shorter_title_must_not_steal_the_longer_ones_file(self):
+        ok, reason = episode_title_verdict(self.E41, self.FILE, [self.E42])
+        self.assertFalse(ok)
+        self.assertEqual(reason, TITLE_AMBIGUOUS)
+
+    def test_part_one_still_matches_its_own_file(self):
+        ok, _ = episode_title_verdict(
+            self.E41, 'Pokemon S19E89 The Gates of Warp.mkv', [self.E42])
+        self.assertTrue(ok)
+
+
+class TestTitleMatchingDoesNotReopenTheOriginalBug(unittest.TestCase):
+    """The bug that started all this: a bare-numbered season-1 batch filling
+    every season. None of those filenames carry an episode title, so the escape
+    hatch cannot fire for them."""
+
+    def test_bare_numbered_file_has_no_title_to_match(self):
+        for title in ('Hashira Training', 'Swordsmith Village Arc'):
+            self.assertFalse(episode_title_verdict(
+                title, '[SCY] Demon Slayer - 04.mkv', [])[0])
+
+    def test_wrong_season_file_of_the_same_show_is_not_rescued(self):
+        self.assertFalse(episode_title_verdict(
+            'Ultimate Lifeform', 'One Punch Man S01E02 - Strategy Meeting.mkv',
+            other_episode_titles=['Strategy Meeting'])[0])
 
 
 if __name__ == '__main__':

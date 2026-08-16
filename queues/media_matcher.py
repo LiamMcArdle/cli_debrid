@@ -12,14 +12,90 @@ from fuzzywuzzy import fuzz
 from PTT import parse_title
 from scraper.functions.anime_utils import detect_absolute_numbering
 from scraper.functions.season_resolution import (
-    season_verdict, container_season_from_path, log_verdict)
+    season_verdict, container_season_from_path, log_verdict,
+    episode_title_verdict, episode_title_is_usable)
 
 class MediaMatcher:
     """Handles media content matching and validation"""
 
     def __init__(self, relaxed_matching: bool = False):
         self.episode_count_cache: Dict[str, Dict[int, int]] = {}
+        self.episode_title_cache: Dict[str, Dict[Tuple[int, int], str]] = {}
         self.relaxed_matching = relaxed_matching
+
+    def _get_episode_titles_cached(self, imdb_id: Optional[str]) -> Dict[Tuple[int, int], str]:
+        """(season, episode) -> episode title for every episode of one show.
+
+        Exists solely to prove an episode title is unique within its show, which
+        is the guard that makes title matching safe. Returns {} on any failure;
+        the caller treats an empty map as "cannot verify" and declines rather
+        than falling back to the title alone.
+        """
+        if not imdb_id:
+            return {}
+        if imdb_id in self.episode_title_cache:
+            return self.episode_title_cache[imdb_id]
+        titles: Dict[Tuple[int, int], str] = {}
+        try:
+            from database.core import get_db_connection
+            conn = get_db_connection()
+            try:
+                for season, episode, title in conn.execute(
+                        "SELECT DISTINCT season_number, episode_number, episode_title "
+                        "FROM media_items WHERE imdb_id = ? AND type = 'episode' "
+                        "AND episode_title IS NOT NULL AND episode_title != ''",
+                        (imdb_id,)):
+                    if season is not None and episode is not None:
+                        titles[(season, episode)] = title
+            finally:
+                conn.close()
+        except Exception as e:
+            logging.debug(f"Could not load episode titles for {imdb_id}: {e}")
+            return {}
+        self.episode_title_cache[imdb_id] = titles
+        return titles
+
+    def _episode_title_identifies(self, item: Dict[str, Any], filename: str) -> bool:
+        """Does this filename name this exact episode by title?
+
+        The escape hatch for releases whose numbering cannot be reconciled with
+        the provider's. Ordered so the pure string work runs first and the
+        database is consulted only for a filename that already looks like a hit.
+        """
+        episode_title = item.get('episode_title')
+        if not episode_title or not filename:
+            return False
+
+        series_title = item.get('series_title') or item.get('title')
+        matched, _ = episode_title_verdict(episode_title, filename,
+                                           series_title=series_title)
+        if not matched:
+            return False
+
+        show_titles = self._get_episode_titles_cached(item.get('imdb_id'))
+        if not show_titles:
+            logging.debug(f"Episode-title match declined for '{filename}': no "
+                          f"episode-title map for {item.get('imdb_id')}")
+            return False
+
+        season = item.get('season_number')
+        if season is None:
+            season = item.get('season')
+        episode = item.get('episode_number')
+        if episode is None:
+            episode = item.get('episode')
+        own = (season, episode)
+        others = [t for key, t in show_titles.items() if key != own]
+
+        matched, reason = episode_title_verdict(
+            episode_title, filename, other_episode_titles=others,
+            series_title=series_title)
+        if matched:
+            logging.info(f"Episode-title match: '{episode_title}' identifies "
+                         f"S{season}E{episode} in '{filename}' despite its numbering")
+        else:
+            logging.debug(f"Episode-title match declined for '{filename}': {reason}")
+        return matched
 
     def _basenames_already_in_use(self, basenames: List[str], imdb_id: Optional[str],
                                   exclude_item_id: Optional[int] = None) -> set:
@@ -382,6 +458,13 @@ class MediaMatcher:
                         logging.info(f"Episode matched via original episode number {original_item_episode} found in filename for '{ptt_result.get('original_filename', '')}'")
             # --- End original episode fallback ---
 
+            # The numbering could not place this file. If the filename names the
+            # episode by title, that identifies it more precisely than any
+            # number does -- see season_resolution.episode_title_verdict.
+            if not (season_match and episode_match) and self._episode_title_identifies(
+                    item, ptt_result.get('original_filename', '')):
+                season_match = episode_match = True
+
             if season_match and episode_match:
                  logging.debug(f"Relaxed match successful: S:{season_match} E:{episode_match}")
                  return True
@@ -498,6 +581,11 @@ class MediaMatcher:
                     # --- End original episode fallback for strict mode ---
 
                 season_episode_match = season_match and episode_match
+                # Same escape hatch as the relaxed branch: a filename that names
+                # the episode by title identifies it regardless of numbering.
+                if not season_episode_match and self._episode_title_identifies(
+                        item, ptt_result.get('original_filename', '')):
+                    season_episode_match = True
                 logging.debug(f"Strict match S/E component result: {season_episode_match}")
 
 
@@ -684,6 +772,27 @@ class MediaMatcher:
                     # Return the first match found
                     logging.info(f"Match found for item '{item.get('title')}' S{target_season}E{target_episode} (using XEM: {xem_mapping is not None}) -> File: {parsed_file_info['path']}")
                     return (os.path.basename(parsed_file_info['path']), item) # Return basename path and item
+
+            # Last resort: the indexes above are keyed on the episode NUMBER, so
+            # a release that renumbers wholesale is not even offered as a
+            # candidate -- a Pokemon pack calling S24E42 'S19E90' never reaches
+            # _check_match, and its episode-title escape hatch never runs.
+            # Scanning the rest is only worth it when the item's title can
+            # identify an episode by itself, so the cost falls on failures only.
+            if episode_title_is_usable(item.get('episode_title') or ''):
+                already_tried = {id(pf) for pf in candidate_files}
+                for parsed_file_info in parsed_files:
+                    if id(parsed_file_info) in already_tried:
+                        continue
+                    parsed_info = parsed_file_info.get('parsed_info', {})
+                    if parsed_info.get('is_anime_special_content', False):
+                        continue
+                    if self._episode_title_identifies(
+                            item, parsed_info.get('original_filename', '')):
+                        logging.info(
+                            f"Match found by episode title for item '{item.get('title')}' "
+                            f"S{target_season}E{target_episode} -> File: {parsed_file_info['path']}")
+                        return (os.path.basename(parsed_file_info['path']), item)
 
             try:
                 logging.debug(
