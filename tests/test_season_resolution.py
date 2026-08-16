@@ -136,12 +136,21 @@ class TestLegitimateMatchesStillPass(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(reason, ABSOLUTE_MISMATCH)
 
-    def test_specials_are_exempt(self):
+    def test_special_target_is_lenient(self):
+        """Specials metadata disagrees everywhere, so a season-0 TARGET stays lenient."""
         ok, reason = season_verdict(
-            file_seasons=[0], target_season=3, file_numbers=[2],
-            absolute_episode=35, is_anime=True)
+            file_seasons=[2], target_season=0, file_numbers=[2],
+            absolute_episode=None, is_anime=True)
         self.assertTrue(ok)
         self.assertEqual(reason, SPECIALS)
+
+    def test_special_file_cannot_fill_a_real_season(self):
+        """'Ace.of.Diamond.S00E04' must not be chosen for S04E04."""
+        ok, reason = season_verdict(
+            file_seasons=[0], target_season=4, file_numbers=[4],
+            absolute_episode=142, is_anime=True)
+        self.assertFalse(ok)
+        self.assertEqual(reason, EXPLICIT_MISMATCH)
 
 
 class TestNonAnime(unittest.TestCase):

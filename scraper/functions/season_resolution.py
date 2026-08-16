@@ -69,9 +69,14 @@ def season_verdict(
 
     seasons = [s for s in (file_seasons or []) if isinstance(s, int)]
 
-    # 1. Specials are bundled into ordinary season packs all the time, so a
-    #    season-0 claim never counts as a conflict.
-    if 0 in seasons or target_season == 0:
+    # 1. Specials metadata is inconsistent everywhere, so when the TARGET is a
+    #    special we stay lenient about what the file calls itself.
+    #
+    #    The converse is NOT safe. A file that names season 0 must not satisfy a
+    #    real season: allowing it picked 'Ace.of.Diamond.S00E04' (a special) as
+    #    the replacement for S04E04. A season-0 claim therefore falls through to
+    #    rule 2 and is rejected against any non-zero target.
+    if target_season == 0:
         return True, SPECIALS
 
     # 2. The file names its own season. Believe it, in both directions. This is
