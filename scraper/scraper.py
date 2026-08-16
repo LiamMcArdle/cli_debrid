@@ -144,7 +144,7 @@ def convert_anime_episode_format(season: int, episode: int, season_episode_count
                         api_absolute_episode = 0
                         
                         # Sort seasons and sum episodes up to our target season
-                        sorted_api_seasons = sorted([s for s in show_seasons.keys() if isinstance(s, int) and s < season])
+                        sorted_api_seasons = sorted([s for s in show_seasons.keys() if isinstance(s, int) and 0 < s < season])
                         
                         for s_num in sorted_api_seasons:
                             s_data = show_seasons.get(s_num, {})
@@ -164,7 +164,7 @@ def convert_anime_episode_format(season: int, episode: int, season_episode_count
             # Use arithmetic calculation for season 1 or if DirectAPI failed
             if absolute_episode is None:
                 absolute_episode = 0
-                sorted_seasons = sorted([s for s in season_episode_counts.keys() if isinstance(s, int) and s < season])
+                sorted_seasons = sorted([s for s in season_episode_counts.keys() if isinstance(s, int) and 0 < s < season])
                 for s_num in sorted_seasons:
                     absolute_episode += season_episode_counts.get(s_num, 0)
                 absolute_episode += episode
@@ -227,7 +227,7 @@ def convert_anime_episode_format(season: int, episode: int, season_episode_count
                     api_absolute_episode = 0
                     
                     # Sort seasons and sum episodes up to our target season
-                    sorted_api_seasons = sorted([s for s in show_seasons.keys() if isinstance(s, int) and s < season])
+                    sorted_api_seasons = sorted([s for s in show_seasons.keys() if isinstance(s, int) and 0 < s < season])
                     logging.info(f"Sorted API seasons for calculation: {sorted_api_seasons}")
                     
                     for s_num in sorted_api_seasons:
@@ -257,7 +257,7 @@ def convert_anime_episode_format(season: int, episode: int, season_episode_count
         # Use arithmetic calculation for season 1 or if DirectAPI failed
         if absolute_episode is None:
             absolute_episode = 0
-            sorted_seasons = sorted([s for s in season_episode_counts.keys() if isinstance(s, int) and s < season])
+            sorted_seasons = sorted([s for s in season_episode_counts.keys() if isinstance(s, int) and 0 < s < season])
             for s_num in sorted_seasons:
                 absolute_episode += season_episode_counts.get(s_num, 0)
             absolute_episode += episode

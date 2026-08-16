@@ -8,6 +8,7 @@ from scraper.functions.similarity_checks import improved_title_similarity, norma
 from scraper.functions.file_processing import compare_resolutions, parse_size, calculate_bitrate
 from scraper.functions.other_functions import smart_search
 from scraper.functions.adult_terms import adult_terms
+from scraper.functions.season_resolution import season_verdict, log_verdict
 from scraper.functions.common import *
 from datetime import datetime, timezone
 # --- Import DirectAPI if type hinting is desired, ensure it's available in the execution path ---
@@ -1231,9 +1232,6 @@ def filter_results(
                     
                     result_seasons = season_episode_info.get('seasons', [])
                     result_episodes = season_episode_info.get('episodes', [])
-                    
-                    # Determine if parsed season info is missing or defaulted (for anime leniency later)
-                    parsed_season_is_missing_or_default = not result_seasons or result_seasons == [1]
 
                     # --- Season Check --- 
                     season_match = False
@@ -1275,58 +1273,32 @@ def filter_results(
                             # season scene releases aren't rejected purely due to the XEM remap.
                             season_match = True
                             logging.debug(f"Season matched via original TVDB season S{original_season} (XEM remapped to S{season}) for '{original_title}'")
-                        elif is_anime and parsed_season_is_missing_or_default and season > 1:
-                             # Check if title explicitly mentions a different season before applying leniency
-                             # Example: Searching S7, title says "S01". We should NOT be lenient here.
-                             # Allow leniency only if no other season is clearly stated.
-                             if not re.search(rf'[Ss](?!{season:02d})\\d\\d?', original_title):
-                                 season_match = True
-                                 lenient_season_pass = True
-                                 #logging.debug(f"Allowing anime result ({original_title}) parsed as S1/None when target is S{season} (no conflicting season found in title)")
-                             else:
+                        else:
+                            # Same authority as MediaMatcher._check_match -- see
+                            # scraper/functions/season_resolution.py. This is a
+                            # torrent title, not a path, so there is no
+                            # containing folder to consult.
+                            # target_abs_episode is only populated on one path in
+                            # scraper.py, so derive it here when absent rather
+                            # than treating "not supplied" as "no absolute
+                            # exists" -- that would reject every legitimate
+                            # absolute-numbered release reaching this branch.
+                            _abs = result.get('target_abs_episode')
+                            if _abs is None and season_episode_counts and episode is not None:
+                                _abs = sum(c for s_, c in season_episode_counts.items()
+                                           if isinstance(s_, int) and 0 < s_ < season) + episode
+                            season_match, _reason = season_verdict(
+                                file_seasons=result_seasons,
+                                target_season=season,
+                                file_numbers=list(result_episodes or []),
+                                absolute_episode=_abs,
+                                container_season=None,
+                                is_anime=is_anime,
+                            )
+                            log_verdict(season_match, _reason, original_title, season, episode)
+                            lenient_season_pass = season_match and not result_seasons
+                            if not season_match and result_seasons:
                                 explicit_season_mismatch = True
-                                #logging.debug(f"Anime result ({original_title}) parsed as S1/None has conflicting season info when target is S{season}. Not applying leniency.")
-                        elif not result_seasons:
-                             # Allow titles with NO season info at all (might be absolute)
-                             # BUT: For anime with XEM mapping, be more restrictive
-                             # If we're searching for a specific season (not S1) and the torrent has no season info,
-                             # we should be more cautious to avoid grabbing episodes from wrong seasons
-                             if is_anime and season > 1:
-                                 # For anime S2+, if no season info, be more restrictive
-                                 # This prevents grabbing "Episode 07" from any season when we want S02E07
-                                 # Only allow if we have absolute episode numbers or other strong indicators
-                                 has_absolute_episode = result.get('target_abs_episode') is not None
-                                 has_episode_in_title = bool(re.search(rf'\b{episode}\b', original_title))
-                                 
-                                 # Additional check: if the title only contains episode number without season,
-                                 # and we're searching for a specific season (not S1), be more restrictive
-                                 # This catches cases like "Dandadan - 07" when we want S02E07
-                                 title_has_only_episode = (
-                                     has_episode_in_title and 
-                                     not re.search(r'[Ss]\d+', original_title) and  # No season info in title
-                                     not has_absolute_episode  # No absolute episode number
-                                 )
-                                 
-                                 if title_has_only_episode:
-                                     season_match = False
-                                     logging.info(f"Rejecting anime result with only episode number (no season/absolute) when searching for S{season}E{episode}: '{original_title}'")
-                                 elif not has_absolute_episode and not has_episode_in_title:
-                                     season_match = False
-                                     logging.info(f"Rejecting anime result with no season info when searching for S{season}E{episode}: '{original_title}' (no absolute episode or strong episode indicator)")
-                                 else:
-                                     # Even if we have episode indicator, be more restrictive for S2+
-                                     # Only allow if we have absolute episode numbers that provide proper context
-                                     if has_absolute_episode:
-                                         season_match = True
-                                         lenient_season_pass = True
-                                         logging.info(f"Allowing anime result with no season info but with absolute episode evidence for S{season}E{episode}: '{original_title}'")
-                                     else:
-                                         season_match = False
-                                         logging.info(f"Rejecting anime result with episode indicator but no absolute episode evidence for S{season}E{episode}: '{original_title}'")
-                             else:
-                                 season_match = True
-                                 lenient_season_pass = True # Mark as lenient pass
-                                 #logging.debug(f"Allowing result ({original_title}) with no season info to pass season check")
 
                     if not season_match:
                         # Reject if we didn't find an explicit match OR a lenient pass

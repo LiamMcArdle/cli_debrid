@@ -1188,7 +1188,7 @@ class ScrapingQueue:
 
                             target_absolute_episode = 0
                             # Sort seasons to ensure correct order and handle potential non-integer keys from bad metadata
-                            sorted_seasons = sorted([s for s in season_episode_counts.keys() if isinstance(s, int) and s < base_season])
+                            sorted_seasons = sorted([s for s in season_episode_counts.keys() if isinstance(s, int) and 0 < s < base_season])
                             for s_num in sorted_seasons:
                                 target_absolute_episode += season_episode_counts.get(s_num, 0)
                             target_absolute_episode += base_episode
@@ -1420,7 +1420,7 @@ class ScrapingQueue:
 
                                 target_absolute_episode = 0
                                 # Sort seasons to ensure correct order and handle potential non-integer keys from bad metadata
-                                sorted_seasons = sorted([s for s in season_episode_counts.keys() if isinstance(s, int) and s < base_season])
+                                sorted_seasons = sorted([s for s in season_episode_counts.keys() if isinstance(s, int) and 0 < s < base_season])
                                 for s_num in sorted_seasons:
                                     target_absolute_episode += season_episode_counts.get(s_num, 0)
                                 target_absolute_episode += base_episode
