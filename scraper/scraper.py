@@ -1357,10 +1357,13 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             """Helper function to scrape a single title with deduplication protection"""
             source, search_title = args
             
-            # For anime, check if we've already scraped this episode format
+            # For anime, check if we've already scraped this title+episode format.
+            # The search title MUST be part of the key: episode_formats is
+            # identical for every title in titles_to_try, so a format-only key
+            # skips every alias after the first title and the alternative-title
+            # searches never run at all.
             if is_anime and episode_formats:
-                # Create a key based on the episode formats to avoid duplicate scraping
-                format_key = tuple(sorted(episode_formats.values()))
+                format_key = (search_title.lower(), tuple(sorted(episode_formats.values())))
                 with all_results_lock:
                     if format_key in scraped_episode_formats:
                         logging.info(f"Skipping duplicate episode format scrape for {source}: {search_title}")
