@@ -198,9 +198,15 @@ def convert_anime_episode_format(season: int, episode: int, season_episode_count
                 absolute_episode += episode
                 logging.info(f"Arithmetic calculated absolute episode number for season pack: {absolute_episode}")
 
-        # Build season pack formats
+        # Build season pack formats. Nyaa is a plain full-text search, so each
+        # of these must literally appear in a release title to match it:
+        # 'S01' finds scene-named packs, 'Season 1' finds fansub packs
+        # ('[NAN0] ... Season 4 (BD Remux ...)'), and the bare title finds
+        # batches that carry neither ('Dragon Ball Super (001-131)').
         formats = {
             'season': f"S{season:02d}",
+            'season_word': f"Season {season}",
+            'batch': '',
             'absolute': str(absolute_episode)  # No leading zeros
         }
         
@@ -297,6 +303,10 @@ def convert_anime_episode_format(season: int, episode: int, season_episode_count
         'absolute': str(absolute_episode),  # No leading zeros
         'combined': f"S{season:02d}E{absolute_episode}"
     }
+    # Long-running shows are released as 'Title - 015'; Nyaa's full-text
+    # search will not find '015' with the query '15'.
+    if absolute_episode and f"{absolute_episode:03d}" != str(absolute_episode):
+        formats['absolute_padded'] = f"{absolute_episode:03d}"
     
     logging.info(f"Generated single episode formats: {formats}")
     return formats
