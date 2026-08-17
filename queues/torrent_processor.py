@@ -414,6 +414,22 @@ class TorrentProcessor:
         caller_info = f"{caller_frame.f_code.co_filename}:{caller_frame.f_code.co_name}:{caller_frame.f_lineno}"
         logging.info(f"TorrentProcessor.add_to_account called from {caller_info}")
 
+        def _remember_blocked(magnet_str: Optional[str], reason: str) -> None:
+            """Record a permanently-unaddable hash so ranking skips it next scrape.
+
+            Without this, a DMCA-blocked release stays the top-ranked result and
+            every retry/sibling/wake re-attempts the identical add forever
+            (observed: 800+ RD 451 responses in one evening).
+            """
+            import re as _re
+            try:
+                m = _re.search(r'btih:([a-fA-F0-9]{40})', magnet_str or '')
+                if m:
+                    add_to_not_wanted(m.group(1).lower())
+                    logging.warning(f"Hash {m.group(1).lower()} is permanently blocked ({reason}); added to not_wanted.")
+            except Exception as nw_err:
+                logging.error(f"Could not record blocked hash: {nw_err}")
+
         try:
             magnet, temp_file = self.process_torrent(magnet_or_url)
             if not magnet and not temp_file:
@@ -422,6 +438,8 @@ class TorrentProcessor:
 
             providers = self._providers
             last_error = None
+            blocked_451 = False
+            vanished_after_add = False
 
             for provider in providers:
                 torrent_id = None
@@ -447,6 +465,7 @@ class TorrentProcessor:
                         if "451" in err_str:
                             logging.warning(f"[{provider.PROVIDER_NAME}] 451 DMCA block — trying next provider.")
                             last_error = f"451 DMCA ({provider.PROVIDER_NAME})"
+                            blocked_451 = True
                             break  # Skip remaining retries, move to next provider
                         elif "429" in err_str and attempt < add_max_retries - 1:
                             wait_time = add_retry_delay_seconds * (2 ** attempt)
@@ -493,9 +512,18 @@ class TorrentProcessor:
                             pass
                     logging.warning(f"[{provider.PROVIDER_NAME}] Torrent added but no files found.")
                 except Exception as e:
+                    # A 404 on a torrent id we were just handed means the provider
+                    # accepted the magnet and instantly deleted it — its takedown
+                    # behavior for blocked content, not a transient failure.
+                    if "404" in str(e):
+                        vanished_after_add = True
                     logging.error(f"[{provider.PROVIDER_NAME}] Error fetching torrent info: {e}", exc_info=True)
 
             logging.error(f"All providers failed to add torrent. Last error: {last_error}")
+            if blocked_451:
+                _remember_blocked(magnet, "451 DMCA")
+            elif vanished_after_add:
+                _remember_blocked(magnet, "deleted by provider immediately after add")
             return None
 
         except Exception as e:
