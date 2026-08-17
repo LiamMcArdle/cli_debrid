@@ -1014,6 +1014,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             imdb_id_for_fallback: str,
             direct_api_instance: DirectAPI,
             is_alias: bool = False,
+            skip_id_based: bool = False,
             alias_country: str = None,
             preferred_language: str = None,
             translated_title: str = None,
@@ -1076,6 +1077,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             # Determine if the current search is using the translated title
             is_translated = bool(translated_title and search_title == translated_title)
             all_results = scraper_manager.scrape_all(
+                skip_id_based=skip_id_based,
                 imdb_id=imdb_id_for_fallback,
                 title=search_title,
                 year=year,
@@ -1403,6 +1405,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                     imdb_id_for_fallback=imdb_id,
                     direct_api_instance=direct_api,
                     is_alias=(source not in ['original', 'original_language', 'original_language_romanized', 'romanized_alias']),
+                    skip_id_based=(source != 'original'),
                     alias_country=media_country_code if source not in ['original', 'original_language', 'original_language_romanized', 'romanized_alias'] else None,
                     preferred_language=preferred_language,
                     translated_title=translated_title, # Always pass the actual translation

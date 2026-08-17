@@ -27,6 +27,12 @@ _CIRCUIT_TIMEOUT_THRESHOLD = 3   # consecutive timeouts before backoff
 _CIRCUIT_WINDOW_SECONDS = 120    # window in which timeouts are counted
 _CIRCUIT_BACKOFF_SECONDS = 600   # backoff duration (10 min) once threshold reached
 
+# Scrapers that query by IMDb/TMDB id: the search title never reaches their
+# request, so calling them once per alias in a multi-title search just sends
+# the same request N times — enough of a burst to trip their rate limits and
+# this circuit breaker.
+ID_BASED_SCRAPER_TYPES = {'Torrentio', 'MediaFusion', 'AIOStreams', 'AIOStreams-API'}
+
 
 def _circuit_record_timeout(instance: str) -> None:
     """Record a timeout for a scraper instance and apply backoff if threshold hit."""
@@ -106,7 +112,8 @@ class ScraperManager:
         episode_formats: Optional[Dict[str, str]] = None,
         tmdb_id: Optional[str] = None,
         is_translated_search: bool = False,
-        is_anime: bool = False
+        is_anime: bool = False,
+        skip_id_based: bool = False
     ) -> List[Dict[str, Any]]:
         """
         Scrape all configured sources for content, enrich with specific metadata, and log detailed results.
@@ -451,6 +458,11 @@ class ScraperManager:
 
             # Skip anime scrapers if we already tried them above
             if is_anime and is_episode and scraper_type in ['Nyaa', 'OldNyaa']:
+                continue
+
+            # Alias searches only vary the title; id-based scrapers would just
+            # repeat the identical request they already got for the first title.
+            if skip_id_based and scraper_type in ID_BASED_SCRAPER_TYPES:
                 continue
 
             # Circuit-breaker: skip scrapers that are in backoff due to repeated timeouts
