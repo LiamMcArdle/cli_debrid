@@ -1178,7 +1178,24 @@ def filter_results(
                                 is_likely_anime_pack = has_pack_keywords or (large_size and no_explicit_episodes)
                                 
                                 if is_likely_anime_pack:
-                                    logging.info(f"Anime pack heuristic: Treating '{original_title}' as season pack (keywords={has_pack_keywords}, large_size={large_size}GB, no_episodes={no_explicit_episodes})")
+                                    # NOTE: the stamp below is an UNVERIFIED claim. A bare title says
+                                    # nothing about which seasons the release holds, and because the
+                                    # multi-season guard further down only re-reads what is written here,
+                                    # that guard can never fire for a heuristic-promoted pack. Measured
+                                    # 2026-08-18 against /mnt/debrid listings: of 268 bare-titled TV packs
+                                    # this heuristic would accept, 49 (18%) actually span several seasons.
+                                    # Gating on the show's season count was tested and rejected — it traded
+                                    # 41 correct rejections for 32 genuine packs lost, and no pre-download
+                                    # signal (title or size) separates the two cases. Logging it instead so
+                                    # the real firing population can be measured: it fired 0 times in the
+                                    # 260MB of logs retained on 2026-08-18, so this path is currently dormant.
+                                    _known_seasons = len(season_episode_counts) if season_episode_counts else 0
+                                    logging.warning(
+                                        f"PACK HEURISTIC FIRED (season UNVERIFIED): '{original_title}' "
+                                        f"stamped as S{season if season else 1}; show has {_known_seasons} known season(s); "
+                                        f"keywords={has_pack_keywords}, large_size={large_size}, no_episodes={no_explicit_episodes}, "
+                                        f"size={result_size:.1f}GB"
+                                    )
                                     # Override the season_episode_info to mark as season pack
                                     season_episode_info['season_pack'] = f'S{season}' if season else 'S1'
                                     season_episode_info['seasons'] = [season] if season else [1]
