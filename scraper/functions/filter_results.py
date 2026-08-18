@@ -72,6 +72,19 @@ def extract_year_from_title(title: str) -> Optional[int]:
     
     return None
 
+def _is_multi_season_pack(parsed_info: Dict[str, Any]) -> bool:
+    """True when a release spans more than one season.
+
+    A pack covering several seasons cannot carry a year that matches any single
+    season's air date - "One Piece (Episodes 001-837) Seasons 01-19" parses as
+    2018 while season 2 aired in 2002 - so applying the per-season year check to
+    one rejects it on every scrape, forever.
+    """
+    season_episode_info = (parsed_info or {}).get('season_episode_info') or {}
+    seasons = season_episode_info.get('seasons') or []
+    return len(seasons) > 1
+
+
 def filter_results(
     results: List[Dict[str, Any]], tmdb_id: str, title: str, year: int, content_type: str,
     season: int, episode: int, multi: bool, version_settings: Dict[str, Any],
@@ -946,7 +959,9 @@ def filter_results(
                             parsed_year = extracted_year
                             logging.info(f"PTT didn't parse year, extracted {extracted_year} from title: '{original_title}'")
                     
-                    if parsed_year and year is not None:
+                    if _is_multi_season_pack(parsed_info):
+                        logging.info(f"Skipping year check for multi-season pack: '{original_title}'")
+                    elif parsed_year and year is not None:
                         # For TV shows, we should compare against the season's air date, not the original show premiere
                         # Get the season-specific year if available, otherwise fall back to the original year
                         target_year = year  # Default to original year
@@ -1061,15 +1076,6 @@ def filter_results(
                             # Many torrents incorrectly use the original show year instead of the season air date
                             year_difference = abs(parsed_year_int - target_year)
                             
-                            # DEBUG: Add detailed logging for Frasier-like cases
-                            if "frasier" in original_title.lower() or "1993" in original_title or "2004" in original_title:
-                                logging.info(f"DEBUG FRASIER: '{original_title}'")
-                                logging.info(f"  - parsed_year: {parsed_year} (int: {parsed_year_int})")
-                                logging.info(f"  - original show year: {year}")
-                                logging.info(f"  - target_year (season/fallback): {target_year}")
-                                logging.info(f"  - year_difference: {year_difference}")
-                                logging.info(f"  - parsed_year_int == year: {parsed_year_int == year}")
-                                logging.info(f"  - target_year != year: {target_year != year}")
                             
                             # If the torrent year matches the original show year exactly, be more lenient
                             if parsed_year_int == year and target_year != year:
