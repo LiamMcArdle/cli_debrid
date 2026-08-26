@@ -443,7 +443,8 @@ def add_wanted_items(media_items_batch: List[Dict[str, Any]], versions_input, un
                         db_item_id = _get_existing_item_id_any_state(conn, imdb_id, tmdb_id, item_type, item)
                         if db_item_id:
                             conn.execute(
-                                "UPDATE media_items SET state='Wanted', blacklisted_date=NULL, sleep_cycles=0 WHERE id=?",
+                                "UPDATE media_items SET state='Wanted', blacklisted_date=NULL, "
+                                "sleep_cycles=0, next_retry_at=NULL WHERE id=?",
                                 (db_item_id,)
                             )
                             conn.commit()

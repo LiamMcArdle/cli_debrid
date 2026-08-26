@@ -979,61 +979,33 @@ class AddingQueue:
             # When all NZBs failed due to ARTICLE_NOT_FOUND (expired usenet), the content
             # may become available again via re-posts. Sleeping lets it retry later.
             if 'missing segments' in error or item.get('_nzb_all_missing_segments'):
+                from queues.retry_ladder import build_failure_record
                 logging.warning(
                     f"[AddingQueue] All NZBs had missing segments for {item_identifier} — "
-                    f"moving to Sleeping (will retry, not blacklisting)"
+                    f"advancing the retry ladder (will retry, not blacklisting)"
                 )
-                queue_manager.move_to_sleeping(item, "Adding")
+                queue_manager.advance_retry_ladder(
+                    item, "Adding",
+                    failure_record=build_failure_record(
+                        stage='add_missing_segments', error=error
+                    )
+                )
                 return
 
-            # --- Blacklisting logic for old items (Keep existing) ---
-            release_date_str = item.get('release_date')
-            if release_date_str and release_date_str != 'Unknown':
-                try:
-                    release_date = datetime.strptime(release_date_str, '%Y-%m-%d')
-                    if release_date < datetime.now() - timedelta(days=get_setting('Queue', 'adding_failure_blacklist_days', 30)):
-                        logging.warning(f"Blacklisting old item {item_identifier} due to adding failure: {error}")
-                        queue_manager.move_to_blacklisted(item, "Adding")
+            # REMOVED: the adding_failure_blacklist_days block that blacklisted the
+            # item and then streamed the ENTIRE media_items table to blacklist every
+            # episode sharing series_title + season + version, with no age test on
+            # the related rows at all. It was disabled only by a config value of
+            # 36500 days; the in-code default was 30, so any config reset re-armed it.
 
-                        # Blacklist related items (keep existing logic)
-                        if item_id and item.get('type') == 'episode':
-                            series_title = item.get('series_title', '') or item.get('title', '')
-                            season = item.get('season') or item.get('season_number')
-                            version = item.get('version')
-
-                            # Stream items from DB to avoid loading entire table into memory
-                            from database import stream_all_media_items  # Local import
-
-                            for candidate in stream_all_media_items(state=None, media_type='episode'):
-                                try:
-                                    if candidate.get('id') == item_id:
-                                        continue
-                                    if ((candidate.get('series_title', '') or candidate.get('title', '')) != series_title):
-                                        continue
-                                    if (candidate.get('season') or candidate.get('season_number')) != season:
-                                        continue
-                                    if candidate.get('version') != version:
-                                        continue
-                                    if candidate.get('state') in ('Blacklisted', 'Collected'):
-                                        continue
-
-                                    related_item_state = candidate.get('state', 'Unknown')
-                                    logging.info(f"Blacklisting related episode ID: {candidate.get('id')} ({candidate.get('title')}) from state {related_item_state} due to primary item failure.")
-                                    queue_manager.move_to_blacklisted(candidate, related_item_state)
-                                except Exception as iter_err:
-                                    logging.error(f"Error while streaming candidate items for blacklist related: {iter_err}")
-
-                        # move_to_blacklisted handles removal from self.items
-                        return
-                except ValueError:
-                    logging.error(f"Invalid release date format '{release_date_str}' for {item_identifier} during failure handling")
-                except Exception as e:
-                    logging.error(f"Error during blacklist check for {item_identifier}: {e}", exc_info=True)
-
-            # --- Default: Move to Sleeping ---
-            logging.warning(f"Moving item to Sleeping state due to adding failure: {item_identifier} - {error}")
-            queue_manager.move_to_sleeping(item, "Adding")
-            # move_to_sleeping handles removal from self.items
+            # --- Default: advance the retry ladder ---
+            from queues.retry_ladder import build_failure_record
+            logging.warning(f"Advancing retry ladder due to adding failure: {item_identifier} - {error}")
+            queue_manager.advance_retry_ladder(
+                item, "Adding",
+                failure_record=build_failure_record(stage='add_failed', error=error)
+            )
+            # advance_retry_ladder handles removal from self.items
 
         except Exception as e:
             logging.error(f"Critical error in _handle_failed_item for {item.get('id', 'Unknown ID')}: {str(e)}", exc_info=True)

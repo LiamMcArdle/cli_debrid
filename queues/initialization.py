@@ -103,7 +103,11 @@ def format_item_log(item):
 def reset_queued_item_status():
     update_initialization_step("Reset Items", "Identifying items in processing states", is_substep=True)
     logging.info("Resetting queued item status...")
-    states_to_reset = ['Sleeping']
+    # 'Sleeping' was removed from this list. The retry ladder's wake deadline now
+    # lives in media_items.next_retry_at, so a Sleeping row is durable across
+    # restarts by design -- flushing it to Wanted here would discard a rung that
+    # may be up to 7 days long and re-scrape immediately.
+    states_to_reset = []
     total_reset = 0
     
     from database import update_media_item_state, get_all_media_items

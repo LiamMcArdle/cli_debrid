@@ -459,9 +459,9 @@ class ScrapingQueue:
                                 ep for ep in all_items_for_show
                                 if ep.get('type') == 'episode' # Ensure it's an episode
                                 and ep.get('id') != item_to_process['id'] # Exclude the current item
-                                and ep.get('state') in ["Wanted", "Scraping"]
+                                and ep.get('state') in ["Wanted", "Scraping", "Sleeping", "Dormant"]
                             ]
-                            logging.info(f"Found {len(other_pending_episodes)} other pending episodes for this show in Wanted/Scraping state.")
+                            logging.info(f"Found {len(other_pending_episodes)} other pending episodes for this show in Wanted/Scraping/Sleeping/Dormant state.")
 
 
                         if show_metadata and 'seasons' in show_metadata:
@@ -719,6 +719,10 @@ class ScrapingQueue:
                     # Ensure both results and filtered_out_results are lists
                     results = results if results is not None else []
                     filtered_out_results = filtered_out_results if filtered_out_results is not None else []
+                    # Pre-filter result count. This is the one number that tells a
+                    # future operator whether the scrapers returned nothing at all
+                    # (dead coordinate / rate limit) or returned results we rejected.
+                    raw_result_count = len(results) + len(filtered_out_results)
 
                     # Filter and process results from the first attempt
                     filtered_results = []
@@ -831,7 +835,9 @@ class ScrapingQueue:
                         )
                         
                         fallback_results = fallback_results if fallback_results is not None else []
-                        # fallback_filtered_out = fallback_filtered_out if fallback_filtered_out is not None else [] # Not used directly
+                        fallback_filtered_out = fallback_filtered_out if fallback_filtered_out is not None else []
+                        filtered_out_results = filtered_out_results + fallback_filtered_out
+                        raw_result_count += len(fallback_results) + len(fallback_filtered_out)
 
                         if fallback_results: # Only filter if there are raw results from fallback
                             current_filtered_fallback_results = []
@@ -887,7 +893,11 @@ class ScrapingQueue:
                     # After all scraping attempts, check if we have any filtered_results
                     if not filtered_results:
                         logging.warning(f"No suitable results found for {item_identifier} after all scraping attempts.")
-                        self.handle_no_results(item_to_process, queue_manager)
+                        self.handle_no_results(
+                            item_to_process, queue_manager,
+                            filtered_out_results=filtered_out_results,
+                            raw_result_count=raw_result_count
+                        )
                         processed_successfully_or_moved = True
                         processed_count += 1
                     else:
@@ -979,9 +989,18 @@ class ScrapingQueue:
             except Exception as e:
                 logging.error(f"Error processing item {item_identifier}: {str(e)}", exc_info=True)
                 try:
-                    # Attempt to move to sleeping on error
-                    queue_manager.move_to_sleeping(item_to_process, "Scraping")
-                    processed_successfully_or_moved = True # Mark as handled (moved to sleeping)
+                    # Transient processing error. Walk the ladder rather than
+                    # retrying immediately -- and never blacklist. A scrape that
+                    # raised is 'unknown', not 'no results'.
+                    from queues.retry_ladder import build_failure_record
+                    queue_manager.advance_retry_ladder(
+                        item_to_process, "Scraping",
+                        failure_record=build_failure_record(
+                            stage='scrape_error', raw_count=0, passed_count=0,
+                            error=str(e)
+                        )
+                    )
+                    processed_successfully_or_moved = True # Mark as handled
                 except Exception as move_err:
                     logging.error(f"Failed to move item {item_identifier} to sleeping after error: {move_err}")
                     # If move fails, processed_successfully_or_moved remains False
@@ -1515,7 +1534,9 @@ class ScrapingQueue:
 
         return individual_results, individual_filtered_out
      
-    def handle_no_results(self, item: Dict[str, Any], queue_manager):
+    def handle_no_results(self, item: Dict[str, Any], queue_manager,
+                          filtered_out_results: List[Dict[str, Any]] = None,
+                          raw_result_count: int = 0):
         item_identifier = queue_manager.generate_identifier(item)
         is_upgrade = item.get('upgrading') or item.get('upgrading_from') is not None
 
@@ -1607,66 +1628,82 @@ class ScrapingQueue:
                     self.remove_item(item)
             return # Stop processing for this item (it's either handled or logged as critically failed)
 
-        # --- Original Logic for Non-Upgrade Items ---
-        if self.is_item_old(item):
-            item_title_for_check = (item.get('title', '') or item.get('series_title', '')).lower()
-            is_formula_1_item = "formula 1" in item_title_for_check
-            is_ufc_item = "ufc" in item_title_for_check
+        # --- Non-Upgrade Items: escalating retry ladder, never a blacklist ---
+        # A failed scrape NEVER blacklists. The item walks the escalating ladder
+        # (30m -> 6h -> 1d -> 3d -> 7d) and, once that is exhausted, lands in
+        # Dormant, which is re-checked forever.
+        #
+        # REMOVED: the old is_item_old() branch here blacklisted the item
+        # outright, and for episodes called blacklist_old_season_items(), whose
+        # query matched imdb_id + season_number + version with NO state
+        # predicate -- so one dead scrape coordinate took out every sibling row
+        # in Wanted, Scraping, Adding, Sleeping and Unreleased in a single pass.
+        # REMOVED: the max_wake_count / wake_limit branch. max_wake_count existed
+        # in no schema and no config, so it always fell through to the global.
+        from queues.retry_ladder import build_failure_record
+        from scraper.scrape_status import get_unavailable
 
-            if item['type'] == 'episode':
-                if is_formula_1_item or is_ufc_item:
-                    content_type = "Formula 1" if is_formula_1_item else "UFC"
-                    logging.info(f"No results found for old {content_type} item {item_identifier}. Blacklisting this specific item.")
-                    queue_manager.move_to_blacklisted(item, "Scraping") # Blacklist only this F1/UFC item
-                else:
-                    logging.info(f"No results found for old episode {item_identifier}. Blacklisting item and related season items.")
-                    queue_manager.queues["Blacklisted"].blacklist_old_season_items(item, queue_manager)
-                
-                self.reset_not_wanted_check(item['id'])
-                self.remove_item(item) # Remove from current queue
-            elif item['type'] == 'movie': # Movies (including F1 if ever classified as such) are blacklisted individually
-                logging.info(f"No results found for old movie {item_identifier}. Blacklisting item.")
-                queue_manager.move_to_blacklisted(item, "Scraping") # Direct blacklist
-                self.reset_not_wanted_check(item['id'])
-                self.remove_item(item) # Remove from current queue
-            else: # Unknown types
-                logging.warning(f"Unknown item type {item['type']} for {item_identifier}. Blacklisting item.")
-                queue_manager.move_to_blacklisted(item, "Scraping") # Direct blacklist
-                self.reset_not_wanted_check(item['id'])
-                self.remove_item(item) # Remove from current queue
-        else: # Item is NOT old, check wake limits
-            logging.warning(f"No results found for {item_identifier}. Checking wake count limits before moving to Sleeping or Final_Check/Blacklisted.")
-            # Get wake count settings for this item's version
-            version_settings = get_setting('Scraping', 'versions', {}).get(item.get('version', ''), {})
-            # Fetch the global default wake limit, using 5 as an ultimate fallback
-            global_default_wake_limit = int(get_setting("Queue", "wake_limit", default=5))
-            # Use the version-specific limit if available, otherwise use the global default
-            max_wake_count = version_settings.get('max_wake_count', global_default_wake_limit)
+        filtered_out_results = filtered_out_results or []
+        unavailable = sorted(get_unavailable())
 
-            # Get current wake count from DB
-            from database import get_wake_count
-            current_wake_count = get_wake_count(item['id'])
+        # is_item_old survives only as an input to the ladder's STARTING rung:
+        # back-catalogue content does not reappear in 30 minutes, so an old item
+        # starts further up the ladder. It no longer routes anywhere near a
+        # blacklist, and an unknown release date is now a latency choice rather
+        # than the instant blacklist it used to be.
+        is_old = self.is_item_old(item)
 
-            moved = False # Flag to track if moved
-            if max_wake_count <= 0:
-                logging.info(f"Item {item_identifier} version '{item.get('version')}' has max_wake_count <= 0 ({max_wake_count}). Initiating final check or blacklist.")
-                queue_manager.initiate_final_check_or_blacklist(item, "Scraping") 
-                moved = True
-            elif current_wake_count >= max_wake_count:
-                logging.info(f"Item {item_identifier} reached max wake count ({current_wake_count}/{max_wake_count}). Initiating final check or blacklist.")
-                queue_manager.initiate_final_check_or_blacklist(item, "Scraping") 
-                moved = True
-            else:
-                logging.info(f"Item {item_identifier} (Wake count: {current_wake_count}/{max_wake_count}) moving to Sleeping queue.")
-                queue_manager.move_to_sleeping(item, "Scraping")
-                moved = True
+        # A scrape that never completed must not consume a retry rung. Only
+        # treat it as unavailable when nothing at all came back -- if some
+        # scraper did answer with results we simply rejected, the filters are
+        # the story and the ladder should advance normally.
+        scrape_incomplete = bool(unavailable) and raw_result_count == 0
 
-            self.reset_not_wanted_check(item['id'])
-            if moved and self.contains_item_id(item.get('id')) and max_wake_count > 0 and current_wake_count < max_wake_count:
-                 self.remove_item(item)
+        failure_record = build_failure_record(
+            stage='scrape_unavailable' if scrape_incomplete else 'scrape',
+            raw_count=raw_result_count,
+            passed_count=0,
+            filtered_out=filtered_out_results,
+            unavailable_scrapers=unavailable,
+        )
+
+        if scrape_incomplete:
+            logging.warning(
+                f"No results for {item_identifier}: scraper(s) {', '.join(unavailable)} were "
+                f"unavailable (rate limited or unreachable). Holding the retry ladder rung."
+            )
+        elif raw_result_count == 0:
+            logging.warning(
+                f"No results for {item_identifier}: the scrapers returned nothing at all "
+                f"(dead season/episode coordinate, or genuinely unavailable)."
+            )
+        else:
+            logging.warning(
+                f"No suitable results for {item_identifier}: {raw_result_count} raw result(s) "
+                f"returned, all rejected by the filters."
+            )
+
+        queue_manager.advance_retry_ladder(
+            item, "Scraping", failure_record=failure_record, is_old=is_old,
+            hold_rung=scrape_incomplete
+        )
+
+        self.reset_not_wanted_check(item['id'])
+        # advance_retry_ladder -> _move_item_to_queue already removes the item
+        # from the Scraping queue; this is a belt-and-braces guard for the case
+        # where the move was blocked (ghostlisted).
+        if self.contains_item_id(item.get('id')):
+            self.remove_item(item)
 
     def is_item_old(self, item: Dict[str, Any]) -> bool:
-        # If early release flag is set, it's never considered old for the purpose of immediate blacklisting
+        """Whether an item is far enough past release to skip the short ladder rungs.
+
+        This NO LONGER routes to blacklisting in any way. Its only remaining
+        caller is handle_no_results, which passes the result to
+        advance_retry_ladder as ``is_old`` to pick the STARTING rung. A True
+        here costs the item the short rungs and nothing else.
+        """
+        # An early release is never treated as old, so it always starts at rung 0.
         if item.get('early_release', False):
             return False
             

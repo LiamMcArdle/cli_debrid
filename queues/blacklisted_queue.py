@@ -234,7 +234,8 @@ class BlacklistedQueue:
                 # Define states that indicate the fallback version is already actively managed or collected
                 target_states_for_fallback_check = [
                     'Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping', 
-                    'Unreleased', 'Pending Uncached', 'Upgrading', 'Collected', 'Final_Check'
+                    'Unreleased', 'Pending Uncached', 'Upgrading', 'Collected', 'Final_Check',
+                    'Dormant'
                 ]
 
                 logging.debug(
@@ -347,103 +348,6 @@ class BlacklistedQueue:
             logging.warning(f"Skipped standard blacklist notification for {item_identifier} (ID: {item_id}) because item details after state update were not available.")
         # --- End Notification Trigger ---
         return # End of standard blacklisting path
-
-    def blacklist_old_season_items(self, item: Dict[str, Any], queue_manager):
-        item_identifier = queue_manager.generate_identifier(item)
-        logging.info(f"Blacklisting item {item_identifier} and related old season items with the same version")
-
-        if queue_manager.get_item_queue(item) != 'Checking':
-            self.blacklist_item(item, queue_manager)
-        else:
-            logging.info(f"Skipping blacklisting of {item_identifier} as it's already in Checking queue")
-
-        related_items = self.find_related_season_items(item, queue_manager)
-        for related_item in related_items:
-            related_identifier = queue_manager.generate_identifier(related_item)
-            if self.is_item_old(related_item) and related_item['version'] == item['version']:
-                if queue_manager.get_item_queue(related_item) != 'Checking':
-                    self.blacklist_item(related_item, queue_manager)
-                else:
-                    logging.info(f"Skipping blacklisting of {related_identifier} as it's already in Checking queue")
-            else:
-                logging.debug(f"Not blacklisting {related_identifier} as it's either not old enough or has a different version")
-
-    def find_related_season_items(self, item: Dict[str, Any], queue_manager) -> List[Dict[str, Any]]:
-        """
-        Find related season items for a given episode item directly from the database,
-        matching imdb_id, season_number, and version, excluding the item itself.
-        """
-        related_items = []
-        if item.get('type') != 'episode' or not item.get('imdb_id') or item.get('season_number') is None or not item.get('version'):
-            logging.warning(f"Cannot find related items for {queue_manager.generate_identifier(item)}: Missing required fields (type, imdb_id, season_number, version).")
-            return []
-
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            query = """
-                SELECT * FROM media_items
-                WHERE type = 'episode'
-                  AND imdb_id = ?
-                  AND season_number = ?
-                  AND version = ?
-                  AND id != ?
-            """
-            params = (
-                item['imdb_id'],
-                item['season_number'],
-                item['version'],
-                item['id']
-            )
-            cursor.execute(query, params)
-            related_rows = cursor.fetchall()
-            related_items = [dict(row) for row in related_rows]
-            logging.debug(f"Found {len(related_items)} related season items in DB for {queue_manager.generate_identifier(item)} (IMDb: {item['imdb_id']}, S{item['season_number']}, V: {item['version']})")
-
-        except Exception as e:
-            logging.error(f"Error querying database for related season items for ID {item.get('id')}: {e}", exc_info=True)
-            # Return empty list on error to avoid unintended side effects
-            return []
-        finally:
-            if conn:
-                conn.close()
-
-        return related_items
-
-    def is_item_old(self, item: Dict[str, Any]) -> bool:
-        if item.get('early_release', False):
-            return False
-            
-        if 'release_date' not in item or item['release_date'] is None or item['release_date'] == 'Unknown':
-            logging.info(f"Item {self.generate_identifier(item)} has no release date, None, or unknown release date. Considering it as old.")
-            return True
-        try:
-            release_date = datetime.strptime(item['release_date'], '%Y-%m-%d').date()
-            days_since_release = (datetime.now().date() - release_date).days
-            
-            movie_threshold = 7
-            episode_threshold = 7
-            
-            if item['type'] == 'movie':
-                return days_since_release > movie_threshold
-            elif item['type'] == 'episode':
-                return days_since_release > episode_threshold
-            else:
-                logging.warning(f"Unknown item type: {item['type']}. Considering it as old.")
-                return True
-        except ValueError as e:
-            logging.error(f"Error parsing release date for item {self.generate_identifier(item)}: {str(e)}")
-            return True
-
-    @staticmethod
-    def generate_identifier(item: Dict[str, Any]) -> str:
-        if item['type'] == 'movie':
-            return f"movie_{item['title']}_{item['imdb_id']}_{item['version']}"
-        elif item['type'] == 'episode':
-            return f"episode_{item['title']}_{item['imdb_id']}_S{item['season_number']:02d}E{item['episode_number']:02d}_{item['version']}"
-        else:
-            raise ValueError(f"Unknown item type: {item['type']}")
 
     def contains_item_id(self, item_id):
         conn = None

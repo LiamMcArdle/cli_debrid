@@ -1,54 +1,71 @@
 import logging
 from typing import Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from utilities.settings import get_setting
-from queues.config_manager import load_config
+from database.core import get_db_connection
+from queues.retry_ladder import parse_deadline
 
-def _get_int_setting(section: str, key: str, default: int) -> int:
-    """Helper function to safely get an integer setting."""
-    value = get_setting(section, key, default=default)
-    if isinstance(value, str) and not value.strip(): # Handle empty string
-        logging.warning(
-            f"Setting '{key}' in section '{section}' is empty. "
-            f"Using default value: {default}."
-        )
-        return default
-    try:
-        return int(value)
-    except (ValueError, TypeError): # Added TypeError for good measure
-        logging.warning(
-            f"Invalid value '{value}' for setting '{key}' in section '{section}'. "
-            f"Expected an integer. Using default value: {default}."
-        )
-        return default
 
 class SleepingQueue:
+    """Holds items waiting out a rung of the escalating retry ladder.
+
+    This queue holds NO timing state of its own. The wake deadline is
+    ``media_items.next_retry_at`` and the ladder position is
+    ``media_items.sleep_cycles``, both written by
+    ``QueueManager.advance_retry_ladder``. That is what makes a 7-day rung
+    survive a container restart or a settings save -- the old in-memory
+    ``sleeping_queue_times`` dict survived neither, and it was re-stamped with
+    ``datetime.now()`` on every ``update()`` and on every
+    ``QueueManager.reinitialize()``.
+
+    It also no longer decides anything: it does not count wakes, it does not
+    read ``wake_limit``, and it cannot blacklist. Ladder exhaustion is decided
+    once, at ladder-advance time, and produces Dormant.
+
+    ``process()`` selects due rows straight from the database rather than
+    filtering ``self.items``. ``self.items`` is only a display cache populated
+    by the separate 30s queue-view task, so relying on it would (a) strand every
+    Sleeping row if that task were disabled and (b) wake items whose state had
+    changed underneath the snapshot, yanking an in-flight download back to
+    Wanted and losing its torrent association.
+    """
+
     def __init__(self):
         self.items = []
-        self.sleeping_queue_times = {}
 
     def update(self):
-        from database import get_all_media_items, get_media_item_by_id, get_wake_count, increment_wake_count
+        from database import get_all_media_items
+        # get_all_media_items does SELECT *, so wake_count / sleep_cycles /
+        # next_retry_at are already on the row. The old per-item get_wake_count()
+        # loop opened and closed a DB connection for every row, which was free
+        # when one item was asleep and is not once Sleeping is the dominant state.
         self.items = [dict(row) for row in get_all_media_items(state="Sleeping")]
-        # Initialize sleeping times for new items and fetch wake count from DB
         for item in self.items:
-            if item['id'] not in self.sleeping_queue_times:
-                self.sleeping_queue_times[item['id']] = datetime.now()
-            # Get wake_count from the database, default to 0 if not present (should exist now)
-            item['wake_count'] = get_wake_count(item['id']) 
+            if item.get('wake_count') is None:
+                item['wake_count'] = 0
 
     def get_contents(self):
         return self.items
 
     def add_item(self, item: Dict[str, Any]):
-        # Fetch wake count from DB when adding
-        from database import get_wake_count
-        item['wake_count'] = get_wake_count(item['id'])
+        # Idempotent, mirroring FinalCheckQueue.add_item. The old unconditional
+        # append produced a duplicate entry and a second 'sleeping' notification
+        # on every sleep, because QueueManager.move_to_sleeping added the item a
+        # second time after _move_item_to_queue had already added it.
+        item_id = item.get('id')
+        if item_id is not None and any(i.get('id') == item_id for i in self.items):
+            return
+
+        if item.get('wake_count') is None:
+            from database import get_wake_count
+            item['wake_count'] = get_wake_count(item['id'])
         self.items.append(item)
-        self.sleeping_queue_times[item['id']] = datetime.now()
-        logging.debug(f"Added item to Sleeping queue: {item['id']} (Wake count: {item['wake_count']})")
-                
+        logging.debug(
+            f"Added item to Sleeping queue: {item_id} "
+            f"(ladder rung {item.get('sleep_cycles')}, wake at {item.get('next_retry_at')})"
+        )
+
         from routes.notifications import send_notifications
         from routes.settings_routes import get_enabled_notifications, get_enabled_notifications_for_category
         from routes.extensions import app
@@ -78,112 +95,63 @@ class SleepingQueue:
 
     def remove_item(self, item: Dict[str, Any]):
         self.items = [i for i in self.items if i['id'] != item['id']]
-        if item['id'] in self.sleeping_queue_times:
-            del self.sleeping_queue_times[item['id']]
         logging.debug(f"Removed item from Sleeping queue: {item['id']}")
 
     def process(self, queue_manager):
-        #logging.debug("Processing sleeping queue")
-        current_time = datetime.now()
-        default_wake_limit = _get_int_setting("Queue", "wake_limit", default=24)
-        # Read sleep duration from settings, default to 30 minutes
-        sleep_duration_minutes = _get_int_setting("Queue", "sleep_duration_minutes", default=30)
-        # Ensure a minimum duration to prevent potential issues with very small values
-        if sleep_duration_minutes < 10:
-            sleep_duration_minutes = 10
-            logging.warning("Sleep duration setting was less than 10 minutes, using 10 minutes instead.")
-        sleep_duration = timedelta(minutes=sleep_duration_minutes) # Use the setting
+        """Wake every item whose persisted retry deadline has passed.
 
-        items_to_wake = []
-        items_to_blacklist = []
-        config = load_config()
+        The deadline parameter is a datetime OBJECT, not an ISO string -- see
+        the note in queues/retry_ladder.py about the space separator the sqlite3
+        adapter writes.
+        """
+        try:
+            batch_size = int(get_setting("Queue", "sleeping_batch_size", 250))
+        except (TypeError, ValueError):
+            batch_size = 250
+        if batch_size <= 0:
+            batch_size = 250
 
-        for item in self.items:
-            item_id = item['id']
-            item_identifier = queue_manager.generate_identifier(item)
-            #logging.debug(f"Processing sleeping item: {item_identifier}")
+        now = datetime.now()
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.execute("""
+                SELECT * FROM media_items
+                WHERE state = 'Sleeping'
+                  AND (ghostlisted IS NULL OR ghostlisted = 0)
+                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                ORDER BY next_retry_at ASC
+                LIMIT ?
+            """, (now, batch_size))
+            items_to_wake = [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logging.error(f"Error querying Sleeping items due to wake: {e}", exc_info=True)
+            return
+        finally:
+            if conn:
+                conn.close()
 
-            # Get version-specific wake limit if it exists
-            version = item.get('version', 'Default')
-            version_settings = config.get('Scraping', {}).get('versions', {}).get(version, {})
-            version_wake_count = version_settings.get('wake_count')
-            # Use version wake count if it's a positive number, -1 means never sleep
-            if version_wake_count == -1:
-                # Move directly to blacklist if wake_count is -1 (never sleep)
-                items_to_blacklist.append(item)
-                continue
-            # Otherwise use version wake count if positive, or default
-            wake_limit = version_wake_count if version_wake_count and version_wake_count > 0 else default_wake_limit
-
-            time_asleep = current_time - self.sleeping_queue_times[item_id]
-            # Fetch current wake count from DB
-            from database import get_wake_count
-            wake_count = get_wake_count(item_id) 
-            logging.debug(f"Item {item_identifier} has been asleep for {time_asleep}. Current wake count: {wake_count}/{wake_limit}")
-
-            if time_asleep >= sleep_duration:
-                if wake_count < wake_limit:
-                    items_to_wake.append(item)
-                else:
-                    items_to_blacklist.append(item)
-
-        self.wake_items(queue_manager, items_to_wake)
-        self.blacklist_items(queue_manager, items_to_blacklist)
+        if items_to_wake:
+            self.wake_items(queue_manager, items_to_wake)
 
     def wake_items(self, queue_manager, items):
         logging.debug(f"Attempting to wake {len(items)} items")
+        from database import increment_wake_count
         for item in items:
             item_id = item['id']
             item_identifier = queue_manager.generate_identifier(item)
-            # Get old count from DB for logging
-            from database import get_wake_count, increment_wake_count
-            old_wake_count = get_wake_count(item_id) 
-            logging.debug(f"Waking item: {item_identifier} (Current wake count: {old_wake_count})")
+            old_wake_count = item.get('wake_count') or 0
 
-            # Increment wake count in DB
-            new_wake_count = increment_wake_count(item_id) 
+            # Informational lifetime counter only -- nothing gates on it any more.
+            new_wake_count = increment_wake_count(item_id)
             queue_manager.move_to_wanted(item, "Sleeping")
-            # self.remove_item(item) # remove_item is called within move_to_wanted
-            logging.info(f"Moved item {item_identifier} from Sleeping to Wanted queue (Wake count: {old_wake_count} -> {new_wake_count})")
+            logging.info(
+                f"Moved item {item_identifier} from Sleeping to Wanted queue "
+                f"(ladder rung {item.get('sleep_cycles')}, lifetime wakes: "
+                f"{old_wake_count} -> {new_wake_count})"
+            )
 
         logging.debug(f"Woke up {len(items)} items")
-
-    def blacklist_items(self, queue_manager, items):
-        for item in items:
-            item_id = item['id']
-            item_identifier = queue_manager.generate_identifier(item)
-
-            # Call the new method in queue_manager
-            queue_manager.initiate_final_check_or_blacklist(item, "Sleeping")
-
-            # REMOVE ITEM IS NO LONGER NEEDED HERE - initiate_final_check_or_blacklist handles removal via _move_item_to_queue or move_to_blacklisted
-
-            logging.info(f"Initiated final check or blacklist process for item {item_identifier} from Sleeping queue")
-
-        logging.debug(f"Finished processing final check/blacklist attempts for {len(items)} items from Sleeping queue")
-
-    def clean_up_sleeping_data(self):
-        # Remove sleeping times for items no longer in the queue
-        for item_id in list(self.sleeping_queue_times.keys()):
-            if item_id not in [item['id'] for item in self.items]:
-                del self.sleeping_queue_times[item_id]
-        
-        # No need to manage wake counts here anymore, it's in the DB
-        # We can log the counts from the DB if needed for debugging
-        # for item_id, wake_count in wake_count_manager.wake_counts.items():
-        #     if item_id not in [item['id'] for item in self.items]:
-        #         logging.debug(f"Preserving wake count for item ID: {item_id}. Current wake count: {wake_count}")
-
-    def is_item_old(self, item):
-        if 'release_date' not in item or item['release_date'] == 'Unknown':
-            logging.info(f"Item {self.generate_identifier(item)} has no release date or unknown release date. Considering it as old.")
-            return True
-        try:
-            release_date = datetime.strptime(item['release_date'], '%Y-%m-%d').date()
-            return (datetime.now().date() - release_date).days > 7
-        except ValueError as e:
-            logging.error(f"Error parsing release date for item {self.generate_identifier(item)}: {str(e)}")
-            return True  # Consider items with unparseable dates as old
 
     def contains_item_id(self, item_id):
         """Check if the queue contains an item with the given ID"""

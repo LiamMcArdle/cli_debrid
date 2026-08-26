@@ -64,12 +64,12 @@ class FinalCheckQueue(BaseQueue):
         if delay_hours <= 0:
             # If setting disabled while items are here, move them directly to blacklist
             if self.items:
-                logging.warning(f"Final scrape delay is disabled, moving {len(self.items)} items from Final_Check directly to Blacklisted/Fallback.")
+                logging.warning(f"Final scrape delay is disabled, advancing {len(self.items)} items from Final_Check onto the retry ladder.")
                 items_to_process = list(self.items) # Process a copy
                 for item in items_to_process:
                     item_identifier = queue_manager.generate_identifier(item)
-                    logging.info(f"Moving {item_identifier} from Final_Check to Blacklisted (delay disabled).")
-                    queue_manager.move_to_blacklisted(item, "Final_Check") # Apply fallback logic
+                    logging.info(f"Moving {item_identifier} out of Final_Check (delay disabled).")
+                    queue_manager.advance_retry_ladder(item, "Final_Check")
             return
 
         processed_count = 0
@@ -155,18 +155,27 @@ class FinalCheckQueue(BaseQueue):
                             # --- Move to Adding ---
                             queue_manager.move_to_adding(item, "Final_Check", best_result['title'], filtered_results)
                         else:
-                            logging.warning(f"Final scrape failed for {item_identifier}. No results found. Moving to Blacklisted/Fallback.")
+                            logging.warning(f"Final scrape failed for {item_identifier}. No results found. Advancing the retry ladder.")
                             # --- Record exit from Final_Check ---
                             self._record_item_exited(queue_manager, item)
-                            # --- Move to Blacklisted (applies fallback) ---
-                            queue_manager.move_to_blacklisted(item, "Final_Check")
+                            from queues.retry_ladder import build_failure_record
+                            queue_manager.advance_retry_ladder(
+                                item, "Final_Check",
+                                failure_record=build_failure_record(stage='final_check')
+                            )
 
                     except Exception as scrape_err:
                         logging.error(f"Error during final scrape for {item_identifier}: {scrape_err}", exc_info=True)
-                        # If scrape fails, move to Blacklisted/Fallback
-                        logging.warning(f"Moving {item_identifier} to Blacklisted/Fallback due to scrape error.")
+                        # A scrape that raised must never be a terminal outcome.
+                        logging.warning(f"Advancing the retry ladder for {item_identifier} after a scrape error.")
                         self._record_item_exited(queue_manager, item)
-                        queue_manager.move_to_blacklisted(item, "Final_Check")
+                        from queues.retry_ladder import build_failure_record
+                        queue_manager.advance_retry_ladder(
+                            item, "Final_Check",
+                            failure_record=build_failure_record(
+                                stage='final_check_error', error=str(scrape_err)
+                            )
+                        )
                 else:
                     logging.info(f"Final scrape delay not yet passed for {item_identifier}. Leaving in queue. Time elapsed: {time_elapsed}")
                 # else: Delay not yet passed, leave item in queue
