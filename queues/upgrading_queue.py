@@ -20,6 +20,18 @@ import re
 from scraper.functions.ptt_parser import parse_with_ptt
 from scraper.functions.similarity_checks import title_verdict
 
+# Ceiling on how many items one process() call may actually SCRAPE. The pass still
+# walks the whole queue -- the DB state check and the timeout check are cheap and
+# must run for every item, or an item that never reaches the front never ages out
+# -- but each scrape costs 20-30s of wall clock and holds one of only three queue
+# worker threads (Queue.queue_pool_workers, hard-capped at 3 in run_program) for
+# the duration of the entire call. Measured 2026-08-26: ~25s/item over 7,764 items
+# is ~54 hours with that thread unavailable throughout, and every hourly trigger in
+# between coalesced away. 25 bounds a pass at roughly ten minutes against the hourly
+# cadence. Compare SCRAPING_BATCH_SIZE = 5 per tick in QueueManager.process_scraping.
+UPGRADE_SCRAPES_PER_PASS = 25
+
+
 class UpgradingQueue:
     def __init__(self):
         self.items = []
@@ -393,6 +405,7 @@ class UpgradingQueue:
 
     def process(self, queue_manager=None):
         current_time = datetime.now()
+        scrapes_remaining = UPGRADE_SCRAPES_PER_PASS
         # Run delayed upgrade scrape once per day based on setting Scraping.delayed_upgrade_scrape_days
         try:
             days_setting = get_setting('Scraping', 'delayed_upgrade_scrape_days', '0')
@@ -479,9 +492,10 @@ class UpgradingQueue:
                         pass
 
                     # Process immediately if hub magnet is ready; otherwise respect hourly timer
-                    if _has_hub_magnet:
+                    if _has_hub_magnet and scrapes_remaining > 0:
                         logging.info(f"Item {item_id} has hub magnet ready — processing immediately (bypassing scrape timer).")
                         self.hourly_scrape(item, queue_manager)
+                        scrapes_remaining -= 1
                         self.last_scrape_times[item_id] = now
                         if not any(i['id'] == item_id for i in self.items):
                             logging.info(f"Item {item_id} was removed during hub-magnet processing (likely upgraded).")
@@ -496,9 +510,10 @@ class UpgradingQueue:
                         self.remove_item(item)
                         from database import update_media_item_state
                         update_media_item_state(item_id, state="Collected")
-                    elif self.should_perform_hourly_scrape(item_id, now):
+                    elif scrapes_remaining > 0 and self.should_perform_hourly_scrape(item_id, now):
                         logging.info(f"Performing hourly scrape for item {item_id} which has been in queue for {time_in_queue}.")
                         self.hourly_scrape(item, queue_manager) # This might remove the item if upgraded
+                        scrapes_remaining -= 1
                         self.last_scrape_times[item_id] = now
 
                         # Nested Check: After scrape, check if item still exists AND has timed out
