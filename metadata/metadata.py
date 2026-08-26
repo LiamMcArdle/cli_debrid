@@ -862,6 +862,11 @@ def process_metadata(media_items: List[Dict[str, Any]]) -> Dict[str, List[Dict[s
                                     bulk_show_metadata[imdb_id] = refreshed_metadata
                             except Exception as e_refresh:
                                 logging.warning(f"Force-refresh failed for {imdb_id} during season validation: {e_refresh}")
+                        if 0 in valid_requested and not _source_allows_specials(item_from_input_list):
+                            logging.info(
+                                f"Dropping requested season 0 for {imdb_id}: source "
+                                f"'{item_from_input_list.get('content_source')}' does not allow specials.")
+                            valid_requested = {s for s in valid_requested if s != 0}
                         seasons_to_process_for_this_item_instance = valid_requested
                     else:
                         content_source_id = item_from_input_list.get('content_source')
@@ -921,6 +926,8 @@ def process_metadata(media_items: List[Dict[str, Any]]) -> Dict[str, List[Dict[s
                                                 valid_requested = {s_num for s_num in requested_specific_seasons if s_num in all_season_numbers_in_metadata}
                                                 if len(valid_requested) != len(requested_specific_seasons):
                                                     logging.warning(f"Item for {imdb_id} requested seasons {requested_specific_seasons}, but refreshed metadata only contains {all_season_numbers_in_metadata}. Processing valid: {valid_requested}")
+                                                if 0 in valid_requested and not _source_allows_specials(item_from_input_list):
+                                                    valid_requested = {s for s in valid_requested if s != 0}
                                                 seasons_to_process_for_this_item_instance = valid_requested
                                             else:
                                                 content_source_id = item_from_input_list.get('content_source')
@@ -1592,6 +1599,29 @@ def get_runtime(imdb_id: str, media_type: str) -> Optional[int]:
             logging.warning(f"Invalid runtime value for {imdb_id}: {runtime}")
     
     return None
+
+def _source_allows_specials(item_from_input_list) -> bool:
+    """Whether the content source this item came from may create Season 0 rows.
+
+    Defaults to False for an unknown or missing source, matching the schema
+    default. Callers must apply this to a requested-seasons list too: a season
+    request naming season 0 (Overseerr and the webhook, UI and AI request paths
+    all can) previously bypassed the setting entirely, because the filter only
+    ran on the branch that derives seasons from metadata.
+    """
+    content_source_id = (item_from_input_list or {}).get('content_source')
+    if not content_source_id:
+        return False
+    try:
+        from queues.config_manager import load_config
+        cs_config = load_config().get('Content Sources', {}).get(content_source_id, {})
+        if isinstance(cs_config, dict):
+            return bool(cs_config.get('allow_specials', False))
+    except Exception as e:
+        logging.warning(f"Could not read allow_specials for '{content_source_id}': {e}. "
+                        f"Assuming specials are not allowed.")
+    return False
+
 
 def get_media_country_code(imdb_id: str, media_type: str) -> Optional[str]:
     """
