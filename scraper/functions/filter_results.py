@@ -139,7 +139,15 @@ def filter_results(
 
     filter_in_patterns = _normalize_filter_list(filter_in)
     filter_out_patterns = _normalize_filter_list(filter_out)
-    adult_pattern = re.compile('|'.join(adult_terms), re.IGNORECASE) if disable_adult else None
+    # Word-anchored and escaped: a bare alternation matched ordinary English
+    # substrings ('kink' inside "Tekkonkinkreet", 'fling' inside "Shuffling
+    # Along", 'vivid', 'blacked'), making those titles permanently unobtainable.
+    # Every real term in the list is a whole word, so anchoring loses no true
+    # positives.
+    adult_pattern = (
+        re.compile(r'\b(?:' + '|'.join(map(re.escape, adult_terms)) + r')\b', re.IGNORECASE)
+        if disable_adult else None
+    )
     
     # Determine content type specific settings
     is_movie = content_type.lower() == 'movie'
@@ -170,15 +178,28 @@ def filter_results(
     # If it's not anime, apply dynamic threshold for short titles.
     similarity_threshold = base_similarity_threshold
     query_title_len = len(normalized_query_title)
+    # Ceiling on the short-title escalation below. The scoring path cannot
+    # produce 1.0 for a short title: a torrent title longer than 3x the query
+    # takes a 0.9 penalty on the token-set component, which is then blended
+    # 0.3/0.7, capping the achievable score at 0.97 — so a threshold of 1.0
+    # rejected 100% of results with no possible remedy. The acronym rescue is
+    # itself capped at 0.95, which makes 0.95 the highest defensible value.
+    SHORT_TITLE_THRESHOLD_CEILING = 0.95
     if not is_anime: # Only apply dynamic scaling if not anime (UFC check is per-result)
-        if query_title_len < 5:
-            similarity_threshold = 1.0
+        if query_title_len == 0:
+            # Length 0 means normalization destroyed the title (a wholly
+            # non-Latin name), not that the title is short. Escalating here
+            # would guarantee zero results.
+            pass
         elif query_title_len < 6:
             similarity_threshold = 0.95
         elif query_title_len < 8:
             similarity_threshold = 0.90
         elif query_title_len < 10:
             similarity_threshold = 0.85
+        # Never escalate above what the scorer can actually reach.
+        similarity_threshold = min(similarity_threshold, SHORT_TITLE_THRESHOLD_CEILING) \
+            if similarity_threshold > base_similarity_threshold else similarity_threshold
         # If query_title_len >= 10, it uses the base_similarity_threshold (e.g., 0.8)
         # or the anime threshold if is_anime was true.
 
@@ -1573,11 +1594,14 @@ def filter_results(
                     logging.debug(f"Performing pack wantedness check for '{original_title}' (IMDb: {imdb_id}, Pack Type: {season_pack_type_from_parse}, Target Version: {current_scrape_target_version})")
                     pack_is_fully_wanted = True # Assume true initially
 
-                    # Get items from DB in Wanted or Scraping state for this IMDb ID and Target Version
+                    # Get still-wanted items from DB for this IMDb ID and Target Version.
+                    # Sleeping and Dormant count as wanted: they are episodes waiting
+                    # out a retry-ladder rung, and excluding them would make every
+                    # season pack unacceptable for the one episode still in Wanted.
                     pending_db_items_for_show_raw = get_all_media_items(imdb_id=imdb_id)
                     pending_db_episodes = [
                         item for item in pending_db_items_for_show_raw
-                        if item.get('state') in ["Wanted", "Scraping"] and \
+                        if item.get('state') in ["Wanted", "Scraping", "Sleeping", "Dormant"] and \
                            item.get('type') == 'episode' and \
                            (item.get('version') or "").strip('*') == (current_scrape_target_version or "").strip('*')
                     ]
