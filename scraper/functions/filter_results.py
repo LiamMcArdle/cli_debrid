@@ -421,22 +421,28 @@ def filter_results(
             alias_similarities = []
             if normalized_aliases:
                 for alias in normalized_aliases:
-                    # Compare parsed title against alias when available, otherwise query against alias
+                    # Compare parsed title against alias when available, otherwise result against alias
                     if normalized_parsed_title:
                         alias_sim_set = fuzz.token_set_ratio(normalized_parsed_title, alias) / 100.0
                         alias_sim_sort = fuzz.token_sort_ratio(normalized_parsed_title, alias) / 100.0
                         alias_sim = (alias_sim_set + alias_sim_sort) / 2.0
                     else:
-                        alias_sim_set = fuzz.token_set_ratio(normalized_query_title, alias) / 100.0
+                        alias_sim_set = fuzz.token_set_ratio(normalized_result_title, alias) / 100.0
                         alias_sim = alias_sim_set
 
                     # Apply same acronym handling for aliases
                     if alias_sim < 0.8:
                         simple_alias = re.sub(r'[^a-z0-9]', '', alias)
-                        # Compare query vs alias for acronym handling, not result vs alias
-                        simple_sim_result = fuzz.ratio(simple_query, simple_alias) / 100.0
+                        # Compare the RESULT to the alias. Comparing the query to the alias scored
+                        # the show against its own name -- a value with no dependency on the result
+                        # being judged -- so any show carrying a punctuation variant of its own
+                        # title ('Dr.STONE' for 'Dr. Stone') scored min(1.00, 0.95) = 0.95 on every
+                        # result it was ever shown, and the similarity floor below could not reject
+                        # anything. Both branches also computed the identical expression, making the
+                        # max() a no-op. See the translated-title block below for the correct shape.
+                        simple_sim_result = fuzz.ratio(simple_result, simple_alias) / 100.0
                         if simple_parsed:
-                            simple_sim_parsed = fuzz.ratio(simple_query, simple_alias) / 100.0
+                            simple_sim_parsed = fuzz.ratio(simple_parsed, simple_alias) / 100.0
                             simple_sim = max(simple_sim_result, simple_sim_parsed)
                         else:
                             simple_sim = simple_sim_result
@@ -617,22 +623,24 @@ def filter_results(
             for alias_list in item_aliases.values():
                 for alias in alias_list:
                     normalized_api_alias = normalize_title(alias).lower()
-                    # Compare parsed title against API alias when available, otherwise query against API alias
+                    # Compare parsed title against API alias when available, otherwise result against API alias
                     if normalized_parsed_title:
                         alias_sim_set = fuzz.token_set_ratio(normalized_parsed_title, normalized_api_alias) / 100.0
                         alias_sim_sort = fuzz.token_sort_ratio(normalized_parsed_title, normalized_api_alias) / 100.0
                         final_alias_sim = (alias_sim_set + alias_sim_sort) / 2.0
                     else:
-                        alias_sim_set = fuzz.token_set_ratio(normalized_query_title, normalized_api_alias) / 100.0
+                        alias_sim_set = fuzz.token_set_ratio(normalized_result_title, normalized_api_alias) / 100.0
                         final_alias_sim = alias_sim_set
 
                     # Apply same acronym handling for API aliases
                     if final_alias_sim < 0.8:
                         simple_api_alias = re.sub(r'[^a-z0-9]', '', normalized_api_alias)
-                        # Compare query vs API alias for acronym handling, not result vs API alias
-                        simple_sim_result = fuzz.ratio(simple_query, simple_api_alias) / 100.0
+                        # Compare the RESULT to the API alias, for the same reason as the
+                        # matching_aliases block above: comparing the query made this term a
+                        # property of the show rather than of the release being judged.
+                        simple_sim_result = fuzz.ratio(simple_result, simple_api_alias) / 100.0
                         if simple_parsed:
-                            simple_sim_parsed = fuzz.ratio(simple_query, simple_api_alias) / 100.0
+                            simple_sim_parsed = fuzz.ratio(simple_parsed, simple_api_alias) / 100.0
                             simple_sim = max(simple_sim_result, simple_sim_parsed)
                         else:
                             simple_sim = simple_sim_result

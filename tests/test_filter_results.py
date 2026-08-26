@@ -786,6 +786,127 @@ class TestFilterResultsAnimeXEM(unittest.TestCase):
         # The third result is for a different season/episode combination
         self.assertEqual(len(filtered_results), 2, "Should accept multiple anime formats in mixed result set")
 
+    def test_rejects_result_naming_a_different_show(self):
+        """A release for an entirely different show must be rejected, even when
+        the item carries aliases.
+
+        Regression test for the alias-similarity bug fixed 2026-08-26. The alias
+        term compared the QUERY to the alias instead of the RESULT to the alias,
+        so it measured the show against its own name and was independent of the
+        release being judged. Any show whose alias list held a punctuation
+        variant of its own title scored 0.95 on every result, pinning best_sim
+        above the floor and making the similarity gate unable to reject
+        anything. Live consequence: a file named
+        'House of the Dragon S01E03 ...' was symlinked into a Dr. Stone entry.
+
+        Note the existing similarity test passes matching_aliases=[], which is
+        why the suite did not catch this -- the bug only appears when the item
+        HAS aliases.
+        """
+        results = [
+            self.create_mock_result(
+                "House.of.the.Dragon.S02E05.1080p.WEB-DL.AAC.H.264-d3g",
+                size_gb=1.5,
+                parsed_info={
+                    'title': 'House of the Dragon',
+                    'original_title': "House.of.the.Dragon.S02E05.1080p.WEB-DL.AAC.H.264-d3g",
+                    'year': 2020,
+                    'resolution': '1080p',
+                    'source': 'WEB-DL',
+                    'audio': 'AAC',
+                    'codec': 'H.264',
+                    'group': 'd3g',
+                    'seasons': [2],
+                    'episodes': [5],
+                    'season_episode_info': {
+                        'season_pack': 'N/A',
+                        'seasons': [2],
+                        'episodes': [5]
+                    }
+                }
+            )
+        ]
+
+        # 'Test.Anime' is the punctuation variant that made alias_sim a constant.
+        aliases = ["Test Anime", "Test.Anime", "Test Anime TV"]
+
+        filtered_results, _ = filter_results(
+            results=results,
+            tmdb_id=self.tmdb_id,
+            title=self.title,
+            year=self.year,
+            content_type=self.content_type,
+            season=self.season,
+            episode=self.episode,
+            multi=self.multi,
+            version_settings=self.version_settings,
+            runtime=self.runtime,
+            episode_count=self.episode_count,
+            season_episode_counts=self.season_episode_counts,
+            genres=self.genres,
+            matching_aliases=aliases,
+            imdb_id=self.imdb_id,
+            direct_api=self.mock_direct_api
+        )
+
+        self.assertEqual(
+            len(filtered_results), 0,
+            "A release naming a different show must not survive filtering. Got: "
+            + repr([r.get('title') for r in filtered_results]))
+
+    def test_keeps_alternate_title_for_the_same_show(self):
+        """The counterpart to the test above: an alias-named release is kept.
+
+        Guards the fix from being 'corrected' by tightening the threshold, which
+        would silently make shows whose releases use a romaji or scene name
+        uncollectable.
+        """
+        results = [
+            self.create_mock_result(
+                "Test.Anime.TV.S02E05.1080p.WEB-DL.AAC.H.264-SubsPlease",
+                size_gb=1.5,
+                parsed_info={
+                    'title': 'Test Anime TV',
+                    'original_title': "Test.Anime.TV.S02E05.1080p.WEB-DL.AAC.H.264-SubsPlease",
+                    'year': 2020,
+                    'resolution': '1080p',
+                    'source': 'WEB-DL',
+                    'audio': 'AAC',
+                    'codec': 'H.264',
+                    'group': 'SubsPlease',
+                    'seasons': [2],
+                    'episodes': [5],
+                    'season_episode_info': {
+                        'season_pack': 'N/A',
+                        'seasons': [2],
+                        'episodes': [5]
+                    }
+                }
+            )
+        ]
+
+        filtered_results, _ = filter_results(
+            results=results,
+            tmdb_id=self.tmdb_id,
+            title=self.title,
+            year=self.year,
+            content_type=self.content_type,
+            season=self.season,
+            episode=self.episode,
+            multi=self.multi,
+            version_settings=self.version_settings,
+            runtime=self.runtime,
+            episode_count=self.episode_count,
+            season_episode_counts=self.season_episode_counts,
+            genres=self.genres,
+            matching_aliases=["Test Anime", "Test.Anime", "Test Anime TV"],
+            imdb_id=self.imdb_id,
+            direct_api=self.mock_direct_api
+        )
+
+        self.assertEqual(len(filtered_results), 1,
+                         "A release using a known alias of the show must be kept")
+
 
 if __name__ == '__main__':
     unittest.main()
