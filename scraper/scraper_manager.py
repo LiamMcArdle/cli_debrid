@@ -117,7 +117,8 @@ class ScraperManager:
         is_anime: bool = False,
         skip_id_based: bool = False,
         id_season: Optional[int] = None,
-        id_episode: Optional[int] = None
+        id_episode: Optional[int] = None,
+        unavailable_scope: Optional[set] = None
     ) -> List[Dict[str, Any]]:
         """
         Scrape all configured sources for content, enrich with specific metadata, and log detailed results.
@@ -337,7 +338,7 @@ class ScraperManager:
                 logging.warning(
                     f"Scraper {instance} ({scraper_type}) unavailable after {scraper_call_duration:.2f}s: {e}"
                 )
-                record_unavailable(instance)
+                record_unavailable(instance, unavailable_scope)
                 _circuit_record_timeout(instance)
                 return instance, scraper_type, []
             except Exception as e:
@@ -561,6 +562,16 @@ class ScraperManager:
         finally:
             # Shutdown the executor without waiting for running threads to finish
             executor.shutdown(wait=False, cancel_futures=True)
+
+        # Surface unreachable scrapers in the report the same way a timeout is.
+        # They return an empty list like any other miss, so without this they
+        # read as "upstream had nothing".
+        if unavailable_scope:
+            task_types = {inst: stype for inst, stype, _ in scraper_tasks}
+            for inst in sorted(unavailable_scope):
+                if inst not in instance_summary:
+                    instance_summary[inst] = {'type': task_types.get(inst, 'Unknown'),
+                                              'count': 'Unavailable'}
 
         # Log the final report
         self._log_scraper_report(title, year, instance_summary)

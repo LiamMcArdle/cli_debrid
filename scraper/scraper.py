@@ -317,9 +317,12 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
     logging.debug(f"[scrape_main] Initializing for '{title}' ({year}).")
 
     # Clear the per-thread record of unreachable scrapers so that what the
-    # Scraping queue reads afterwards describes THIS scrape only.
+    # Scraping queue reads afterwards describes THIS scrape only. Keep the set
+    # itself: the scrapers that record into it run two thread pools below here
+    # and cannot reach this thread's thread-local, so it is threaded down to
+    # them by hand.
     from scraper.scrape_status import reset_unavailable
-    reset_unavailable()
+    unavailable_scope = reset_unavailable()
 
     # Store original season/episode and initialize scene numbers
     original_season = season
@@ -1058,7 +1061,8 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             original_episode: Optional[int] = None,
             original_season: Optional[int] = None,
             id_season_map: Optional[int] = None,
-            id_episode_map: Optional[int] = None
+            id_episode_map: Optional[int] = None,
+            unavailable_scope: Optional[set] = None
         ) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]], Dict[str, float]]:
             start_time = time.time()
             task_timings = {}
@@ -1126,7 +1130,8 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 is_translated_search=is_translated, # Pass the flag here
                 is_anime=is_anime, # Pass the is_anime flag
                 id_season=id_season_map,
-                id_episode=id_episode_map
+                id_episode=id_episode_map,
+                unavailable_scope=unavailable_scope
             )
             task_timings['scraping'] = time.time() - task_start
             logging.debug(f"[_do_scrape] scraper_manager.scrape_all for '{search_title}' returned: {len(all_results)} raw items.")
@@ -1474,7 +1479,8 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                     original_episode=original_episode,
                     original_season=original_season,  # Pass original TVDB season before any XEM remapping
                     id_season_map=id_season,      # Resolved coordinate for ID-based scrapers only
-                    id_episode_map=id_episode
+                    id_episode_map=id_episode,
+                    unavailable_scope=unavailable_scope
                 )
                 logging.debug(f"[scrape_main] _do_scrape for '{search_title}' returned: passed={len(filtered_results)}, filtered_out={len(filtered_out_results if filtered_out_results else [])}")
                 
