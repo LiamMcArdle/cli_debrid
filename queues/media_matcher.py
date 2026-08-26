@@ -14,7 +14,12 @@ from scraper.functions.anime_utils import detect_absolute_numbering
 from scraper.functions.season_resolution import (
     season_verdict, container_season_from_path, log_verdict,
     episode_title_verdict, episode_title_is_usable)
-from scraper.functions.similarity_checks import title_verdict
+from scraper.functions.similarity_checks import title_verdict, MIN_TITLE_MATCH
+
+# Titles that name a film rather than an episode. Gekijouban is the Japanese
+# equivalent and appears on anime film releases that sit in series packs.
+_MOVIE_TITLE_RE = re.compile(r'\b(the movie|movie\s*\d+|gekijouban|gekijou-ban)\b', re.IGNORECASE)
+
 
 class MediaMatcher:
     """Handles media content matching and validation"""
@@ -435,6 +440,21 @@ class MediaMatcher:
 
         ptt_result = parsed_file_info['parsed_info'] # Get the PTT result stored earlier
 
+        # A film inside a series pack must not fill a numbered episode. Anime
+        # collections routinely ship "<Show> The Movie 03" alongside the episodes,
+        # and PTT reads that trailing number as episode 3, so the movie lands in
+        # the episode-only index and matches on the number alone - measured
+        # 2026-08-26, Naruto S1E3 and S1E4 were filled with Shippuden films.
+        # Season 0 is exempt: specials are where films legitimately belong, and
+        # that is the only place they appear across 28,893 collected episodes.
+        _target_season_for_movie_check = item.get('season') or item.get('season_number')
+        if _MOVIE_TITLE_RE.search(ptt_result.get('title') or '') and _target_season_for_movie_check not in (0, '0'):
+            logging.debug(
+                f"Rejecting '{ptt_result.get('original_filename', '')}' for "
+                f"{item.get('title')} S{_target_season_for_movie_check}"
+                f"E{item.get('episode_number')}: its title names a film, not an episode.")
+            return False
+
         # A file whose name states a DIFFERENT show is not this episode, however
         # well its numbers line up. Nothing below this point compares titles at
         # all: on 2026-08-26 a file named 'House of the Dragon S01E03 ...' was
@@ -732,6 +752,36 @@ class MediaMatcher:
 
             if not video_files:
                 return None
+
+            # Largest-file is the right heuristic for a single-film torrent, where
+            # the extras are smaller, but it is wrong for a collection: a "Harry
+            # Potter (2001-2011) 4K Collection" contains eight films and the
+            # largest is whichever encoded biggest. Measured 2026-08-26, that
+            # filled Philosopher's Stone with Chamber of Secrets.
+            #
+            # So when more than one file could be a feature, prefer the one whose
+            # own name matches this item, and fall back to size only if nothing
+            # names it - a file that asserts no title is still better than a file
+            # that asserts a different one.
+            if len(video_files) > 1:
+                named = []
+                for pf in video_files:
+                    cand = (pf.get('parsed_info') or {}).get('title') or ''
+                    ok, score, _ = title_verdict(cand, self._official_titles_cached(item) or [item.get('title')])
+                    if ok and score >= MIN_TITLE_MATCH:
+                        named.append((score, pf.get('bytes', 0), pf))
+                if named:
+                    named.sort(key=lambda t: (t[0], t[1]), reverse=True)
+                    best = named[0]
+                    if len(named) < len(video_files):
+                        logging.info(
+                            f"Movie pack: {len(video_files)} video files, {len(named)} name "
+                            f"'{item.get('title')}'; taking "
+                            f"'{os.path.basename(best[2]['path'])}' (title {best[0]:.2f})")
+                    return (os.path.basename(best[2]['path']), item)
+                logging.warning(
+                    f"Movie pack: none of {len(video_files)} files name "
+                    f"'{item.get('title')}'; falling back to the largest.")
 
             # Sort by size descending and take the largest
             largest_file_info = max(video_files, key=lambda x: x.get('bytes', 0))
