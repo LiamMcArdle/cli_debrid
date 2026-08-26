@@ -1,7 +1,7 @@
 import html
 import logging
 import re
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 from difflib import SequenceMatcher
 from fuzzywuzzy import fuzz
 from PTT import parse_title
@@ -167,3 +167,74 @@ def normalize_title(title: str) -> str:
     normalized = ''.join(chars).strip('.').lower()
     
     return normalized
+
+
+# Floor for the two gates that run OUTSIDE filter_results: the Upgrade Hub
+# branch of the upgrading queue, which builds its candidate from a stored magnet
+# and never calls filter_results at all, and MediaMatcher, which confirms a file
+# on a season/episode coordinate without ever comparing titles.
+#
+# Calibrated 2026-08-26 against the wrong-show releases that actually reached the
+# library. The worst of those scored 0.53 ('Rooster' against 'Dr. Stone' and its
+# aliases), while every verified-legitimate alternate title scored 1.00 --
+# 'Kage no Jitsuryokusha ni Naritakute' for 'The Eminence in Shadow', 'Sousou no
+# Frieren' for 'Frieren', romaji and scene variants generally -- because the
+# alias list carries the release's own name. The gap is wide; 0.60 sits in it.
+#
+# Deliberately well below the 0.80 / 0.60 thresholds filter_results applies.
+# These gates answer "is this even the same show", not "is this release good
+# enough". Raising this is the wrong repair for a wrong-show acceptance: a show
+# whose romaji name is missing from its alias record scores ~0.30 against its
+# English title and would become permanently, silently uncollectable.
+MIN_TITLE_MATCH = 0.60
+
+
+def title_verdict(candidate_title: str, official_titles: List[str],
+                  threshold: float = MIN_TITLE_MATCH) -> Tuple[bool, float, str]:
+    """Does `candidate_title` name one of `official_titles`?
+
+    Returns (matches, best_score, reason).
+
+    Fails OPEN -- (True, 1.0, reason) -- whenever the candidate carries no usable
+    title, or there is nothing comparable to judge it against. A missing name is
+    not evidence of a wrong one, and a false rejection here is permanent: the
+    item simply never fills, and the only symptom is a log line repeating
+    forever.
+
+    Deliberately does NOT reimplement the scoring in filter_results. That block
+    blends parsed and full titles, applies length and extension penalties and
+    consults the API alias pool, and remains the place where release-quality
+    judgements are made. This is a much blunter question asked in two places
+    that cannot reach filter_results at all.
+
+    KNOWN MISS, measured and accepted: a candidate that is a superset of an
+    official title is not decidable here. 'Monogatari Series Second Season' (the
+    same show) and 'Saiunkoku Monogatari' (a different one) both score 0.85
+    against 'Monogatari'; 'Bleach Sennen Kessen-hen' scores 0.40 against a
+    'Bleach' alias list that lacks the arc name. No threshold on any fuzz metric
+    separates those classes -- tightening enough to reject Saiunkoku also
+    rejects Bleach, and a false rejection is permanent while a false acceptance
+    is caught downstream. The mean of token_set and token_sort is used precisely
+    because it fails open on supersets. Wrong-show releases that merely share a
+    trailing noun are filter_results' job: its extension penalty scores the
+    tokens a candidate adds, which is the information this function lacks.
+    """
+    normalized_candidate = normalize_title(candidate_title or '')
+    # Fewer than four letters is a bare number or a tag ('03', 'v2', 'ep'), which
+    # asserts nothing about which show a file belongs to. Files inside season
+    # packs are routinely named that way.
+    if len(re.sub(r'[^a-z]', '', normalized_candidate)) < 4:
+        return True, 1.0, 'no title asserted'
+
+    names = [n for n in (normalize_title(t) for t in official_titles if t) if n]
+    if not names:
+        # Wholly non-Latin titles normalize to the empty string. Judging against
+        # an empty set would reject every release for such a show.
+        return True, 1.0, 'no comparable official title'
+
+    best = max((fuzz.token_set_ratio(normalized_candidate, n)
+                + fuzz.token_sort_ratio(normalized_candidate, n)) / 200.0
+               for n in names)
+    if best >= threshold:
+        return True, best, 'matches an official title (%.2f)' % best
+    return False, best, 'names a different show (best %.2f < %.2f)' % (best, threshold)

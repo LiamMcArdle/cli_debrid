@@ -18,6 +18,7 @@ from database.torrent_tracking import record_torrent_addition, update_torrent_tr
 from PTT import parse_title
 import re
 from scraper.functions.ptt_parser import parse_with_ptt
+from scraper.functions.similarity_checks import title_verdict
 
 class UpgradingQueue:
     def __init__(self):
@@ -834,17 +835,14 @@ class UpgradingQueue:
 
             # --- Start Filtering ---
 
-            # Get similarity threshold from settings, default to 95%
-            similarity_threshold = 0.95 # Default, consider making configurable if not already indirectly
+            # Ceiling for the dedupe guard further down, which drops candidates
+            # that are near-identical to the file already on disk. It is a
+            # MAXIMUM, not a floor: it answers "is this the same release we
+            # already have", and 0.95 on raw torrent titles needs near-identical
+            # strings, so a different group or codec tag falls under it. The
+            # wrong-show floor is a separate check above it.
+            similarity_threshold = 0.95
             try:
-                # Note: This threshold seems high (0.95), maybe meant to be lower?
-                # Re-using upgrading_percentage_threshold name, but it's for title similarity here.
-                # Let's clarify the setting name or use a different one if needed.
-                # Assuming 'upgrading_percentage_threshold' IS for score diff, and 0.95 is hardcoded/intended for title similarity.
-                # If 0.95 is meant for score diff, the logic below needs adjustment.
-                # If 'upgrading_percentage_threshold' is for title similarity, rename setting variable.
-                # --> Let's assume similarity_threshold = 0.95 is for TITLE similarity <--
-
                 # Get SCORE percentage threshold
                 threshold_value = get_setting('Scraping', 'upgrading_percentage_threshold', '0.1')
                 if isinstance(threshold_value, str):
@@ -867,6 +865,37 @@ class UpgradingQueue:
             failed_upgrades = self.failed_upgrades.get(item['id'], [])
             failed_magnets = {fu['magnet'] for fu in failed_upgrades}
 
+            # Names this item may legitimately appear under, from the same source
+            # filter_results uses, so the scrape gate and the gate below cannot
+            # disagree about what counts as an alternate title. An empty list
+            # disables the wrong-show check rather than rejecting everything.
+            official_titles = [item.get('title'), item.get('series_title')]
+            _alias_count = 0
+            try:
+                from cli_battery.app.direct_api import DirectAPI
+                if (item.get('type') or '').lower() == 'movie':
+                    _aliases, _ = DirectAPI.get_movie_aliases(item.get('imdb_id'))
+                else:
+                    _aliases, _ = DirectAPI.get_show_aliases(item.get('imdb_id'))
+                for _country_aliases in (_aliases or {}).values():
+                    for _a in (_country_aliases or []):
+                        official_titles.append(_a)
+                        _alias_count += 1
+            except Exception as _alias_err:
+                logging.warning(f"[{item_identifier}] Alias lookup failed ({_alias_err}); "
+                                f"skipping the wrong-show check this pass.")
+                official_titles = []
+            _genres = item.get('genres') or []
+            if isinstance(_genres, str):
+                _genres = [_genres]
+            if _alias_count == 0 and any('anime' in str(_g).lower() for _g in _genres):
+                # Anime with no alias record: its releases very likely carry a
+                # romaji name the stored title does not contain, so judging them
+                # against that title alone would reject the only releases that
+                # exist. No verdict is safer than a wrong one here.
+                official_titles = []
+            official_titles = [t for t in official_titles if t]
+
             for result in results:
                 # 1. Check Not Wanted (unless disabled or hub pre-seeded — user explicitly chose it)
                 if not item.get('disable_not_wanted_check') and not _skip_not_wanted:
@@ -883,8 +912,29 @@ class UpgradingQueue:
                      logging.info(f"Result '{result.get('title', 'N/A')}' filtered out as a previously failed upgrade attempt.")
                      continue
 
-                # 3. Check Title Similarity (if we have a title to compare against)
-                # This prevents replacing with something that has the same name but might be slightly different release/encoding if scores are close
+                # 3. Reject candidates that are not this show at all.
+                # filter_results is the primary gate, but the Upgrade Hub branch
+                # above builds `results` from a stored magnet and never calls it.
+                # An upgrade has no notion of a "correct" candidate either - the
+                # highest score wins whatever it is named - and in rank_results
+                # one resolution rank is worth 750 points against a 30-point
+                # similarity ceiling, so a 2160p release of the wrong show beats
+                # a 1080p release of the right one every time. Compare against
+                # the ITEM's names; step 4 below compares against the file on
+                # disk and answers a different question.
+                if official_titles:
+                    _ok, _score, _reason = title_verdict(
+                        result.get('parsed_title') or result.get('title', ''),
+                        official_titles)
+                    if not _ok:
+                        logging.warning(
+                            f"[{item_identifier}] Rejected upgrade candidate "
+                            f"'{result.get('title', 'N/A')}': {_reason}")
+                        continue
+
+                # 4. Drop a candidate that is effectively the file we already have.
+                # This is a MAXIMUM-similarity dedupe against the current file, not
+                # a correctness check - see step 3 for that.
                 if current_title_for_similarity:
                     similarity = SequenceMatcher(None, current_title_for_similarity.lower(), result.get('title', '').lower()).ratio()
                     if similarity >= similarity_threshold:
