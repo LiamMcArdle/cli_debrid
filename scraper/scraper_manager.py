@@ -33,6 +33,8 @@ _CIRCUIT_BACKOFF_SECONDS = 600   # backoff duration (10 min) once threshold reac
 # this circuit breaker.
 ID_BASED_SCRAPER_TYPES = {'Torrentio', 'MediaFusion', 'AIOStreams', 'AIOStreams-API'}
 
+from scraper.scrape_status import ScraperUnavailable, record_unavailable
+
 
 def _circuit_record_timeout(instance: str) -> None:
     """Record a timeout for a scraper instance and apply backoff if threshold hit."""
@@ -113,7 +115,9 @@ class ScraperManager:
         tmdb_id: Optional[str] = None,
         is_translated_search: bool = False,
         is_anime: bool = False,
-        skip_id_based: bool = False
+        skip_id_based: bool = False,
+        id_season: Optional[int] = None,
+        id_episode: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Scrape all configured sources for content, enrich with specific metadata, and log detailed results.
@@ -284,6 +288,20 @@ class ScraperManager:
                         "season": season, "episode": episode, "multi": multi
                         # tmdb_id will be added specifically below if needed by the scraper type
                     }
+
+                    # ID-based scrapers are keyed on an upstream index whose
+                    # season/episode numbering can differ from ours (Trakt stores
+                    # many shows, most anime, as one absolute-numbered season).
+                    # Substitute the resolved coordinate for those scrapers ONLY:
+                    # title-based scrapers match on the release name and need the
+                    # stored/absolute numbering that episode_formats carries.
+                    if scraper_type in ID_BASED_SCRAPER_TYPES and id_season is not None:
+                        logging.debug(
+                            f"{instance} ({scraper_type}): querying resolved coordinate "
+                            f"S{id_season}E{id_episode} instead of stored S{season}E{episode}"
+                        )
+                        common_args["season"] = id_season
+                        common_args["episode"] = id_episode
                     # Add specific args only if the scraper accepts them
                     if scraper_type == 'Jackett':
                          common_args["genres"] = genres
@@ -309,6 +327,19 @@ class ScraperManager:
                 scraper_call_duration = time.time() - scraper_call_start_time
                 logging.info(f"Scraper {instance} ({scraper_type}) call took {scraper_call_duration:.2f}s, found {len(results)} results.")
                 return instance, scraper_type, results
+            except ScraperUnavailable as e:
+                # The scrape never completed (rate limit, timeout, unreachable).
+                # Record it so the retry ladder can tell this apart from an
+                # upstream that genuinely has nothing, and count it against the
+                # circuit breaker the same way a timeout is counted.
+                if scraper_call_start_time > 0:
+                    scraper_call_duration = time.time() - scraper_call_start_time
+                logging.warning(
+                    f"Scraper {instance} ({scraper_type}) unavailable after {scraper_call_duration:.2f}s: {e}"
+                )
+                record_unavailable(instance)
+                _circuit_record_timeout(instance)
+                return instance, scraper_type, []
             except Exception as e:
                 if scraper_call_start_time > 0: # Check if timing started
                     scraper_call_duration = time.time() - scraper_call_start_time
@@ -565,6 +596,10 @@ class ScraperManager:
                 continue
 
             scraper_type = instance_to_type.get(instance_name)
+            # Whether this result came from a scraper queried by ID rather than
+            # by title. Consumers use it to decide whether a resolved scene
+            # coordinate applies to the result.
+            result['id_based_scraper'] = scraper_type in ID_BASED_SCRAPER_TYPES
             parsed_info = result.get('parsed_info', {}) # Get parsed_info once
 
             # Add scraper priority to result (using instance_name to get the settings)

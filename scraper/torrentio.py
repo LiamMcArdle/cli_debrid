@@ -9,7 +9,20 @@ import time
 import random
 from http.client import RemoteDisconnected
 
-DEFAULT_OPTS = "sort=qualitysize|qualityfilter=480p,scr,cam"
+from scraper.scrape_status import ScraperUnavailable
+
+# qualityfilter=480p strips sub-1080p releases AT SOURCE, before any local
+# filter can see them — which silently removes ~24% of back-catalog results and
+# neutralises a permissive resolution setting. sort= is inert: Torrentio caps at
+# 50 streams and returns the same 50 under every sort mode, and results are
+# re-ranked locally anyway.
+DEFAULT_OPTS = "qualityfilter=scr,cam"
+
+# Connect/read timeout. Must stay comfortably under the scraper batch timeout
+# (Scraping.scraper_timeout, default 15s) so a hung socket fails inside its own
+# budget instead of leaking the worker thread — executor.shutdown(cancel_futures)
+# cannot cancel a future that has already started running.
+REQUEST_TIMEOUT = (5, 10)
 TORRENTIO_BASE_URL = "https://torrentio.strem.fun"
 
 def scrape_torrentio_instance(instance: str, settings: Dict[str, Any], imdb_id: str, title: str, year: int, content_type: str, season: int = None, episode: int = None, multi: bool = False) -> List[Dict[str, Any]]:
@@ -44,6 +57,10 @@ def scrape_torrentio_instance(instance: str, settings: Dict[str, Any], imdb_id: 
                 
         logging.debug(f"Found {len(unique_results)} unique results after checking {len(imdb_ids)} IMDB IDs")
         return unique_results
+    except ScraperUnavailable:
+        # Propagate: the retry ladder must be able to tell 'we never got an
+        # answer' apart from 'upstream returned nothing'.
+        raise
     except Exception as e:
         logging.error(f"Error in scrape_torrentio_instance for {instance}: {str(e)}", exc_info=True)
         return []
@@ -64,45 +81,81 @@ def construct_url(imdb_id: str, content_type: str, season: int = None, episode: 
         return ""
 
 def fetch_data(url: str) -> Dict:
+    """Fetch a Torrentio stream listing.
+
+    Raises ScraperUnavailable when the request could not be completed (rate
+    limit, timeout, connection failure). An empty dict is returned ONLY for a
+    completed request that carried no usable payload, so callers can tell
+    'upstream has nothing' apart from 'we never got an answer'.
+    """
     max_retries = 4
     base_backoff_seconds = 0.5
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        for attempt in range(max_retries):
-            try:
-                response = api.get(url, headers=headers)
-                if response.status_code == 200:
-                    data = response.json()
-                    return data
-                # Retry on server errors (5xx)
-                if 500 <= response.status_code < 600:
-                    if attempt < max_retries - 1:
-                        sleep_seconds = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.25)
-                        logging.warning(
-                            f"Server error {response.status_code} while fetching {url} (attempt {attempt + 1}/{max_retries}). "
-                            f"Retrying in {sleep_seconds:.2f}s"
-                        )
-                        time.sleep(sleep_seconds)
-                        continue
-                # Non-retriable status codes
-                logging.warning(f"Non-200 status ({response.status_code}) for URL {url}")
-                return {}
-            except (api.exceptions.RequestException, RemoteDisconnected) as e:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = api.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                return response.json()
+            # Non-200 that did not raise: treat rate limits as unavailable,
+            # anything else as a completed request with no payload.
+            if response.status_code == 429:
+                last_error = f"HTTP 429 rate limited"
+                sleep_seconds = _rate_limit_backoff(response, attempt, base_backoff_seconds)
                 if attempt < max_retries - 1:
-                    sleep_seconds = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.25)
                     logging.warning(
-                        f"Error fetching data: {e} (attempt {attempt + 1}/{max_retries}) for {url}. "
-                        f"Retrying in {sleep_seconds:.2f}s"
+                        f"Torrentio rate limited (429) for {url} "
+                        f"(attempt {attempt + 1}/{max_retries}). Retrying in {sleep_seconds:.2f}s"
                     )
                     time.sleep(sleep_seconds)
                     continue
-                logging.error(f"Error fetching data: {str(e)}")
-                return {}
-    except Exception as e:
-        logging.error(f"Unexpected error in fetch_data: {str(e)}", exc_info=True)
-    return {}
+                break
+            logging.warning(f"Non-200 status ({response.status_code}) for URL {url}")
+            return {}
+        except (api.exceptions.RequestException, RemoteDisconnected) as e:
+            last_error = str(e)
+            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+            if attempt < max_retries - 1:
+                if status_code == 429:
+                    sleep_seconds = _rate_limit_backoff(getattr(e, 'response', None), attempt, base_backoff_seconds)
+                else:
+                    sleep_seconds = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.25)
+                logging.warning(
+                    f"Error fetching data: {e} (attempt {attempt + 1}/{max_retries}) for {url}. "
+                    f"Retrying in {sleep_seconds:.2f}s"
+                )
+                time.sleep(sleep_seconds)
+                continue
+            break
+        except Exception as e:
+            logging.error(f"Unexpected error in fetch_data: {str(e)}", exc_info=True)
+            raise ScraperUnavailable(f"torrentio request failed for {url}: {e}")
+
+    raise ScraperUnavailable(
+        f"torrentio exhausted {max_retries} attempts for {url}: {last_error}"
+    )
+
+
+def _rate_limit_backoff(response, attempt: int, base_backoff_seconds: float) -> float:
+    """Backoff for a 429, honouring Retry-After but bounded by the batch timeout.
+
+    Total backoff across all attempts stays around 8s. Anything longer would
+    exceed Scraping.scraper_timeout and the whole batch — including every result
+    the other scrapers already returned — would be cancelled and discarded.
+    """
+    retry_after = 0
+    try:
+        if response is not None:
+            retry_after = int(response.headers.get('Retry-After', 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        retry_after = 0
+    retry_after = min(max(retry_after, 0), 4)
+    if retry_after:
+        return float(retry_after)
+    return min(base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.3), 4.0)
+
 
 def parse_results(streams: List[Dict[str, Any]], instance: str) -> List[Dict[str, Any]]:
     results = []

@@ -299,7 +299,9 @@ def _search_nyaa_with_session(query: str, category: int, subcategory: int, filte
         logging.info("Nyaa using direct connection (no proxy)")
     
     # Use our session to make the request
-    http_response = session.get(search_uri)
+    # Connect/read timeout, kept under the scraper batch timeout so a hung
+    # socket fails inside its own budget instead of leaking the worker thread.
+    http_response = session.get(search_uri, timeout=(5, 10))
     http_response.raise_for_status()
     
     # Parse the response using the same logic as Nyaa
