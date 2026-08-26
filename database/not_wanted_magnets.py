@@ -3,6 +3,7 @@ import os
 import re
 import logging
 import tempfile
+import threading
 from contextlib import contextmanager
 from utilities.settings import get_setting
 from utilities.file_lock import FileLock
@@ -85,6 +86,42 @@ def _read_pickle(target_path):
 def _load_store(target_path):
     data, _ = _read_pickle(target_path)
     return data
+
+
+# Normalised-set cache, keyed on the file's identity rather than a TTL.
+#
+# is_magnet_not_wanted unpickled ~3MB and rebuilt a 47k-element set through
+# get_base_filename's regexes on every single call — ~37ms, called twice per
+# candidate result and ~50 results per scrape. Over a backlog run that is hours
+# of pure overhead, and it grows as the list does.
+#
+# Keying on (mtime_ns, size) means a write through _save_store or _add_to_store
+# invalidates it for free, including writes from another process.
+_NORMALISED_CACHE = {}
+_NORMALISED_CACHE_LOCK = threading.Lock()
+
+
+def _load_normalised_store(target_path):
+    """Return the store as a set of base filenames, cached until the file changes."""
+    try:
+        st = os.stat(target_path)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        stamp = None
+    except OSError:
+        # Cannot identify the file, so cannot safely cache against it.
+        return {get_base_filename(v) for v in _load_store(target_path) if v is not None}
+
+    with _NORMALISED_CACHE_LOCK:
+        entry = _NORMALISED_CACHE.get(target_path)
+        if entry is not None and entry[0] == stamp:
+            return entry[1]
+
+    normalised = {get_base_filename(v) for v in _load_store(target_path) if v is not None}
+
+    with _NORMALISED_CACHE_LOCK:
+        _NORMALISED_CACHE[target_path] = (stamp, normalised)
+    return normalised
 
 
 def _save_store(target_path, values):
@@ -298,15 +335,13 @@ def is_magnet_not_wanted(magnet):
         logging.debug("Received None value for magnet in is_magnet_not_wanted — skipping check")
         return False
         
-    not_wanted = load_not_wanted_magnets()
-    
     # Extract hash from magnet link
     magnet_hash = get_base_filename(magnet)
     if magnet_hash is None:
         return False
-        
+
     # Check if the hash exists in not_wanted
-    is_not_wanted = magnet_hash in {get_base_filename(nw) for nw in not_wanted if nw is not None}
+    is_not_wanted = magnet_hash in _load_normalised_store(NOT_WANTED_MAGNETS_FILE)
     if is_not_wanted:
         logging.info(f"Filtering out magnet {magnet[:60]}... as it is in not_wanted_magnets list")
     return is_not_wanted
@@ -327,13 +362,11 @@ def is_url_not_wanted(url):
     if get_setting('Debug','disable_not_wanted_check', False):
         logging.debug(f"Not wanted check is disabled, allowing URL: {url}")
         return False
-    not_wanted = load_not_wanted_urls()
-    
     # Get base filename of the URL
     url_filename = get_base_filename(url)
-    
+
     # Check if the filename exists in not_wanted
-    is_not_wanted = url_filename in {get_base_filename(nw) for nw in not_wanted if nw is not None}
+    is_not_wanted = url_filename in _load_normalised_store(NOT_WANTED_URLS_FILE)
     if is_not_wanted:
         logging.info(f"Filtering out URL {url} as it is in not_wanted_urls list")
     return is_not_wanted
