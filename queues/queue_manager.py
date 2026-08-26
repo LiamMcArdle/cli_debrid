@@ -19,6 +19,7 @@ from queues.checking_queue import CheckingQueue
 from queues.sleeping_queue import SleepingQueue
 from queues.unreleased_queue import UnreleasedQueue
 from queues.blacklisted_queue import BlacklistedQueue
+from queues.dormant_queue import DormantQueue
 from queues.pending_uncached_queue import PendingUncachedQueue
 from queues.upgrading_queue import UpgradingQueue
 from queues.final_check_queue import FinalCheckQueue
@@ -37,7 +38,7 @@ class QueueTimer:
         self.queue_stats = {
             queue_name: {'count': 0, 'total_time': 0, 'min_time': float('inf'), 'max_time': 0}
             for queue_name in ['Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping', 
-                             'Unreleased', 'Blacklisted', 'Pending Uncached', 'Upgrading', 'Pre_release']
+                             'Unreleased', 'Blacklisted', 'Dormant', 'Pending Uncached', 'Upgrading', 'Pre_release']
         }
         
         # Initialize queue times
@@ -264,6 +265,7 @@ class QueueManager:
             "Sleeping": SleepingQueue(),
             "Unreleased": UnreleasedQueue(),
             "Blacklisted": BlacklistedQueue(),
+            "Dormant": DormantQueue(),
             "Pending Uncached": PendingUncachedQueue(),
             "Upgrading": UpgradingQueue(),
             "Final_Check": FinalCheckQueue(),
@@ -308,7 +310,7 @@ class QueueManager:
                 after_count = len(queue.get_contents())
                 if before_count != after_count:
                      logging.debug(f"Queue {queue_name} updated: {before_count} -> {after_count} items")
-            elif queue_name in ["Wanted", "Unreleased", "Blacklisted"]:
+            elif queue_name in ["Wanted", "Unreleased", "Blacklisted", "Dormant"]:
                  # For DB-based queues, update is a no-op or handles internal logic
                  # Logging count changes for these would require DB queries before/after, which is less efficient here.
                  # We rely on their process() methods or direct DB access for counts elsewhere.
@@ -477,6 +479,9 @@ class QueueManager:
     def process_blacklisted(self):
         self._process_queue_safely("Blacklisted")
 
+    def process_dormant(self):
+        self._process_queue_safely("Dormant")
+
     def process_pending_uncached(self):
         self._process_queue_safely("Pending Uncached")
 
@@ -495,10 +500,6 @@ class QueueManager:
 
     def blacklist_item(self, item: Dict[str, Any], from_queue: str):
         self.queues["Blacklisted"].blacklist_item(item, self)
-        self.queues[from_queue].remove_item(item)
-
-    def blacklist_old_season_items(self, item: Dict[str, Any], from_queue: str):
-        self.queues["Blacklisted"].blacklist_old_season_items(item, self)
         self.queues[from_queue].remove_item(item)
 
     def move_to_wanted(self, item: Dict[str, Any], from_queue: str, new_version: str = None):
@@ -762,7 +763,9 @@ class QueueManager:
             updated_item['downloading'] = item['downloading']
             self.queues["Checking"].add_item(updated_item)  # Re-add with updated flag
 
-    def move_to_sleeping(self, item: Dict[str, Any], from_queue: str):
+    def move_to_sleeping(self, item: Dict[str, Any], from_queue: str,
+                         rung: int = None, next_retry_at: datetime = None,
+                         failure_record: str = None):
         item_identifier = self.generate_identifier(item)
 
         # GHOSTLIST CHECK: Prevent ghostlisted/blacklisted items from being moved to Sleeping
@@ -774,17 +777,158 @@ class QueueManager:
             logging.warning(f"⛔ BLOCKED: Attempted to move {'ghostlisted' if is_ghostlisted else 'blacklisted'} item {item_identifier} to Sleeping from {from_queue} - operation blocked")
             return  # Block the move to Sleeping
 
-        logging.debug(f"Moving item {item_identifier} to Sleeping queue")
+        # Callers that do not walk the ladder themselves still get one rung, so
+        # every Sleeping row always carries a deadline. A Sleeping row with no
+        # deadline is treated as due immediately by SleepingQueue.
+        if rung is None or next_retry_at is None:
+            from queues.retry_ladder import get_ladder, next_rung, deadline_for_rung
+            ladder = get_ladder(item.get('version'))
+            rung = next_rung(item)
+            next_retry_at = deadline_for_rung(rung, ladder) or (
+                datetime.now() + timedelta(minutes=(ladder[-1] if ladder else 30))
+            )
 
-        from database import get_wake_count
-        wake_count = get_wake_count(item['id'])
-        logging.debug(f"Wake count before moving to Sleeping: {wake_count}")
+        logging.debug(
+            f"Moving item {item_identifier} to Sleeping queue "
+            f"(rung {rung}, wake at {next_retry_at})"
+        )
 
-        updated_item = self._move_item_to_queue(item, from_queue, "Sleeping", "Sleeping")
+        extra = {'sleep_cycles': rung, 'next_retry_at': next_retry_at}
+        if failure_record is not None:
+            extra['last_scrape_failure'] = failure_record
 
-        if updated_item:
-            updated_item['wake_count'] = wake_count
-            self.queues["Sleeping"].add_item(updated_item)  # Re-add with wake count
+        # _move_item_to_queue already adds the item to the Sleeping queue. The
+        # old second add_item() call here produced a duplicate in-memory entry
+        # and a second 'sleeping' notification on every single sleep.
+        self._move_item_to_queue(item, from_queue, "Sleeping", "Sleeping", **extra)
+
+    def move_to_dormant(self, item: Dict[str, Any], from_queue: str,
+                        failure_record: str = None):
+        """Move an item to the terminal Dormant state.
+
+        Dormant is NOT the blacklist. The item keeps its row and its version and
+        is re-scraped every ``Queue.dormant_recheck_days``, forever. After this
+        change state='Blacklisted' is reachable only from manual_blacklist.json
+        enforcement (WantedQueue.move_blacklisted_items), the UI
+        delete/blacklist routes, and the out-of-repo slop_cleanup script.
+        """
+        from queues.retry_ladder import get_dormant_interval
+
+        item_identifier = self.generate_identifier(item)
+
+        # GHOSTLIST CHECK: Prevent ghostlisted/blacklisted items from being moved to Dormant
+        item_state = item.get('state', '')
+        is_ghostlisted = item.get('ghostlisted') == 1
+        is_blacklisted = item_state == 'Blacklisted'
+
+        if is_ghostlisted or is_blacklisted:
+            logging.warning(f"⛔ BLOCKED: Attempted to move {'ghostlisted' if is_ghostlisted else 'blacklisted'} item {item_identifier} to Dormant from {from_queue} - operation blocked")
+            return  # Block the move to Dormant
+
+        next_retry_at = datetime.now() + get_dormant_interval()
+        logging.info(
+            f"Moving item {item_identifier} to Dormant from {from_queue} "
+            f"(next re-check {next_retry_at.isoformat(timespec='seconds')})"
+        )
+
+        # sleep_cycles is left at its terminal value on purpose: a Dormant item
+        # that wakes and fails again returns straight here instead of replaying
+        # the whole ladder.
+        #
+        # filled_by_* are cleared because a Dormant item has no accepted result.
+        # Leaving a stale filled_by_file on a long-lived row makes it collide
+        # with a genuinely Collected row in the reconcile_queues duplicate sweep.
+        extra = {
+            'next_retry_at': next_retry_at,
+            'filled_by_title': None,
+            'filled_by_magnet': None,
+            'filled_by_torrent_id': None,
+            'filled_by_file': None,
+            'debrid_folder_name': None,
+        }
+        if failure_record is not None:
+            extra['last_scrape_failure'] = failure_record
+
+        self._move_item_to_queue(item, from_queue, "Dormant", "Dormant", **extra)
+
+    def advance_retry_ladder(self, item: Dict[str, Any], from_queue: str,
+                             failure_record: str = None, is_old: bool = False,
+                             hold_rung: bool = False):
+        """Advance an item one rung up the escalating retry ladder.
+
+        This is the single terminus for every automatic failure: a scrape that
+        returned nothing, a scrape that raised, or an add that could not be
+        completed. It can only produce Sleeping or Dormant -- it NEVER
+        blacklists, and it never touches any row but this one.
+
+        Replaces initiate_final_check_or_blacklist, which read
+        Queue.blacklist_final_scrape_delay_hours (live value 0) and therefore
+        always fell through to move_to_blacklisted with no grace period at all.
+
+        ``hold_rung`` re-queues at the CURRENT rung with a short fixed delay
+        instead of escalating. It is used when the scrape did not actually
+        complete -- a rate-limited or unreachable scraper is 'unknown', not
+        'nothing found', and must not consume the item's retry budget.
+        """
+        from queues.retry_ladder import get_ladder, next_rung, deadline_for_rung
+
+        item_identifier = self.generate_identifier(item)
+
+        # COLLECTED-ON-DISK GUARD: never walk an item that already has a file on
+        # disk into the retry ladder. blacklist_item had an equivalent guard;
+        # without it here a Collected row whose upgrade flags were lost would
+        # leave the library while its symlink stayed behind.
+        if not (item.get('upgrading') or item.get('upgrading_from')):
+            if item.get('collected_at') or item.get('location_on_disk'):
+                logging.warning(
+                    f"⛔ BLOCKED: {item_identifier} has a collected file on disk "
+                    f"(collected_at={item.get('collected_at')}, "
+                    f"location_on_disk={item.get('location_on_disk')}) but reached the retry "
+                    f"ladder from {from_queue}. Restoring it to Collected instead."
+                )
+                self._move_item_to_queue(item, from_queue, "Collected", "Collected")
+                return
+
+        if hold_rung:
+            try:
+                hold_minutes = int(get_setting("Queue", "retry_unavailable_hold_minutes", 30))
+            except (TypeError, ValueError):
+                hold_minutes = 30
+            if hold_minutes <= 0:
+                hold_minutes = 30
+            try:
+                current_rung = int(item.get('sleep_cycles') or 0)
+            except (TypeError, ValueError):
+                current_rung = 0
+            deadline = datetime.now() + timedelta(minutes=hold_minutes)
+            logging.info(
+                f"Item {item_identifier} could not be scraped (scraper unavailable) in "
+                f"{from_queue}. Holding at rung {current_rung}, retrying at "
+                f"{deadline.isoformat(timespec='seconds')}."
+            )
+            self.move_to_sleeping(item, from_queue, rung=current_rung, next_retry_at=deadline,
+                                  failure_record=failure_record)
+            return
+
+        ladder = get_ladder(item.get('version'))
+        rung = next_rung(item, is_old=is_old)
+        deadline = deadline_for_rung(rung, ladder)
+
+        if deadline is None:
+            logging.info(
+                f"Item {item_identifier} exhausted the retry ladder "
+                f"(rung {rung} of {len(ladder)}) in {from_queue}. Moving to Dormant."
+            )
+            self.move_to_dormant(item, from_queue, failure_record=failure_record)
+            return
+
+        logging.info(
+            f"Item {item_identifier} failed in {from_queue}. Retry ladder rung "
+            f"{rung} of {len(ladder)} -- sleeping until "
+            f"{deadline.isoformat(timespec='seconds')}."
+        )
+        self.move_to_sleeping(item, from_queue, rung=rung, next_retry_at=deadline,
+                              failure_record=failure_record)
 
     def move_to_unreleased(self, item: Dict[str, Any], from_queue: str):
         item_identifier = self.generate_identifier(item)
@@ -1175,23 +1319,6 @@ class QueueManager:
             return self.queue_timer.get_current_queue_items()
         return {}
 
-    def initiate_final_check_or_blacklist(self, item: Dict[str, Any], from_queue: str):
-        """
-        Checks the delay setting and moves item to Final_Check or directly
-        calls move_to_blacklisted (which includes fallback logic).
-        """
-        item_identifier = self.generate_identifier(item)
-        delay_hours = get_setting("Queue", "blacklist_final_scrape_delay_hours", 0)
-
-        if delay_hours > 0:
-            logging.info(f"Item {item_identifier} reached blacklist condition in {from_queue}. Moving to Final_Check queue for {delay_hours} hours.")
-            # Use internal move method - no need to record exit/entry again here as _move does it
-            self._move_item_to_queue(item, from_queue, "Final_Check", "Final_Check")
-        else:
-            logging.info(f"Item {item_identifier} reached blacklist condition in {from_queue}. Final check delay is 0, proceeding to blacklist/fallback.")
-            # Call the original method that handles fallback etc.
-            self.move_to_blacklisted(item, from_queue)
-
     def log_queue_summary(self):
         """Logs a summary of the number of items in each queue."""
         summary = ["Queue Summary:"]
@@ -1200,7 +1327,7 @@ class QueueManager:
             count = 0
             try:
                  # Get count from DB for refactored queues
-                if queue_name in ["Wanted", "Unreleased", "Blacklisted"]:
+                if queue_name in ["Wanted", "Unreleased", "Blacklisted", "Dormant"]:
                     count = get_item_count_by_state(queue_name)
                 # Get count from memory for others
                 else:
