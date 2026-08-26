@@ -36,6 +36,19 @@ except ImportError:
 # Initialize DirectAPI at module level
 direct_api = DirectAPI()
 
+# Any Latin letter. Aliases are used for two different jobs and only one of them
+# wants every script: see where query_aliases is built in scrape().
+_LATIN_RE = re.compile(r'[A-Za-z]')
+
+# Ceiling on how many aliases may become scrape QUERIES for one item. Each alias
+# costs a full round trip per episode format across every enabled scraper, so an
+# uncapped list turns one item into minutes of scrape budget.
+MAX_QUERY_ALIASES = 6
+
+# Of those, how many may be native-script names. Only Nyaa answers in them, and
+# only for raws, so they get a tail rather than a share of the budget.
+MAX_NATIVE_QUERY_ALIASES = 2
+
 # Trakt keys its alias map by country, while a version's `language_code` setting
 # is a language. Only the countries a language is actually titled in belong here
 # -- widening this makes the title filter more permissive, which is the direction
@@ -369,6 +382,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             logging.info("Alias usage is temporarily disabled")
             preferred_alias = None
             matching_aliases = []
+            query_aliases = []
         else:
             # Get preferred alias first
             preferred_alias = get_preferred_alias(tmdb_id, imdb_id, content_type, season)
@@ -376,6 +390,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 logging.info(f"Found preferred alias: {preferred_alias}")
 
             # Get all available aliases
+            query_aliases = []
             item_aliases = {}
             if content_type.lower() == 'movie':
                 item_aliases, _ = direct_api.get_movie_aliases(imdb_id)
@@ -411,6 +426,52 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 matching_aliases = list(dict.fromkeys(matching_aliases))
                 logging.info(f"Found {len(matching_aliases)} matching aliases across "
                              f"{len(item_aliases)} countries (origin: {media_country_code})")
+
+                # MATCHING wants every country -- that is what lets a '[us] JoJo's
+                # Bizarre Adventure' release match a show whose stored title is
+                # Japanese. QUERYING does not: release groups title their files in
+                # Latin script, or in the show's own native script on Nyaa, and
+                # nothing is ever published under the Korean, Russian, Arabic,
+                # Hindi, Thai or Hebrew name. Measured 2026-08-26, widening
+                # matching_aliases sent 43.8% of all scrape queries out in scripts
+                # no indexer answers in -- a single JoJo item fired queries for
+                # '죠죠의 기묘한 모험', 'Невероятные приключения ДжоДжо' and
+                # 'Aventuras Bizarras de JoJo', three formats each, and 0 of 67
+                # non-Latin queries produced an accepted result.
+                #
+                # So keep the two lists separate: Latin script for the scrapers
+                # everyone publishes to, plus the origin country's own names for
+                # Nyaa's raws, capped so one item cannot spend a minute of scrape
+                # budget on aliases.
+                origin_names = set()
+                if media_country_code and media_country_code in item_aliases:
+                    origin_names = {a for a in (item_aliases.get(media_country_code) or []) if a}
+
+                # Latin first, native script as a small tail. Ordering origin
+                # country first -- correct for MATCHING, where its romaji names
+                # are the point -- spends the whole cap on native script for a
+                # show with many of them: Monogatari's six slots went to five
+                # Japanese names and one Latin, cutting exactly the romaji names
+                # releases are titled with. Releases are Latin by convention, so
+                # Latin gets the budget and the native names get enough slots to
+                # still reach Nyaa's raws.
+                latin = [a for a in matching_aliases if _LATIN_RE.search(a)]
+                native = [a for a in matching_aliases
+                          if not _LATIN_RE.search(a) and a in origin_names]
+                native_budget = min(len(native), MAX_NATIVE_QUERY_ALIASES)
+                query_aliases = (latin[:MAX_QUERY_ALIASES - native_budget]
+                                 + native[:native_budget])
+                if len(query_aliases) < MAX_QUERY_ALIASES:
+                    # One side came up short -- do not waste the leftover slots.
+                    for a in latin + native:
+                        if len(query_aliases) >= MAX_QUERY_ALIASES:
+                            break
+                        if a not in query_aliases:
+                            query_aliases.append(a)
+                if len(query_aliases) < len(matching_aliases):
+                    logging.info(f"Using {len(query_aliases)} of {len(matching_aliases)} aliases as "
+                                 f"scrape queries (dropped non-Latin, non-origin names and capped "
+                                 f"at {MAX_QUERY_ALIASES})")
 
         # Initialize anime-specific variables
         genres = filter_genres(genres)
@@ -1432,9 +1493,10 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             titles_to_try.append(('preferred_alias', preferred_alias))
             tried_titles_lower.add(preferred_alias.lower())
 
-        # 5. Add all other matching country aliases
-        if not aliases_disabled and matching_aliases:
-            for alias in matching_aliases:
+        # 5. Add all other matching country aliases (query subset -- see where
+        # query_aliases is built for why this is not the full matching list)
+        if not aliases_disabled and query_aliases:
+            for alias in query_aliases:
                 if alias.lower() not in tried_titles_lower:
                     logging.info(f"Adding country alias: {alias}")
                     titles_to_try.append(('country_alias', alias))
