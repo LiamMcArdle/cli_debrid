@@ -7,6 +7,7 @@ Auth: POST /login with {"apikey": "..."} → bearer token (valid ~28 days).
 Rate limiting: No preemptive tracking; 429s handled with exponential backoff.
 """
 
+import re
 import json
 import time
 import logging
@@ -25,6 +26,10 @@ from .database import (
 )
 
 TVDB_BASE_URL = "https://api4.thetvdb.com/v4"
+
+# Any Latin letter. Used to decide whether a TVDB primary name is usable as a
+# matching title at all — see _build_show_dict.
+_LATIN_RE = re.compile(r'[A-Za-z]')
 REQUEST_TIMEOUT = 15
 
 # Module-level token state (same thread-safety pattern as trakt_client)
@@ -744,7 +749,26 @@ def _build_show_dict(raw: dict, imdb_id: str, tvdb_id: int) -> dict:
     # entry is sometimes a marketing AKA (e.g. "Gangs of Manila" for "Batang Quiapo")
     # rather than a true localization, so it must not override the primary name here —
     # it's still captured separately via _extract_aliases() for search matching.
+    #
+    # The exception is a primary name carrying no Latin characters at all. Release
+    # names are overwhelmingly Latin, and every downstream comparison — the
+    # similarity floor in filter_results, title_verdict, the symlink path — is
+    # built on them, so storing 呪術廻戦 or 诡秘之主 as the title makes the show
+    # permanently unmatchable: measured 2026-08-26, 477 rows across 12 shows scored
+    # ~0.29 against every candidate and several were blacklisted outright. In that
+    # case an English translation, marketing AKA or not, is strictly better than a
+    # title nothing can match. The native name survives as an alias either way.
     title = raw.get('name', '')
+    if title and not _LATIN_RE.search(title):
+        english = ''
+        for t in (raw.get('translations', {}).get('nameTranslations') or []):
+            if t.get('language') in ('eng', 'en') and t.get('name'):
+                english = t['name']
+                break
+        if english and _LATIN_RE.search(english):
+            logger.info(f"TVDB title {title!r} has no Latin characters; using English "
+                        f"translation {english!r} so releases can be matched against it.")
+            title = english
 
     # Airs info
     airs = {}
