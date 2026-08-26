@@ -98,7 +98,9 @@ def filter_results(
     check_pack_wantedness: bool = False,
     current_scrape_target_version: Optional[str] = None,
     original_episode: Optional[int] = None,
-    original_season: Optional[int] = None  # Original TVDB season before XEM remapping
+    original_season: Optional[int] = None,  # Original TVDB season before XEM remapping
+    id_season: Optional[int] = None,        # Coordinate ID-based scrapers were queried at
+    id_episode: Optional[int] = None
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
 
     # --- START Logging for season_episode_counts ---
@@ -212,9 +214,28 @@ def filter_results(
     
     # --- Cache for API fallback results within this filter_results call ---
     _fetched_detailed_seasons_data_cache = None
-    
+
+    # season/episode are rebound per result below, so hold the stored pair.
+    stored_season, stored_episode = season, episode
+
     for result in results:
         try:
+            # Every season/episode comparison below tests ONE coordinate, and which
+            # one is correct depends on where the result came from. ID-based
+            # scrapers (scraper_manager.ID_BASED_SCRAPER_TYPES) were queried at the
+            # resolved coordinate and name their results in that numbering;
+            # title-based scrapers were queried at, and answer in, the stored one,
+            # because back-catalogue anime is numbered absolutely in release names.
+            # Handing the whole batch the resolved pair compared every title-based
+            # result against the wrong episode - it rejected absolute-numbered
+            # releases and, via the season-pack branch, whole-season packs too.
+            # A result with no parseable source has no id_based_scraper key, and
+            # .get() then yields None, which routes it to the stored coordinate.
+            if id_season is not None and result.get('id_based_scraper'):
+                season, episode = id_season, id_episode
+            else:
+                season, episode = stored_season, stored_episode
+
             result['filter_reason'] = "Passed all filters"
             original_title = result.get('original_title', result.get('title', ''))
             parsed_info = result.get('parsed_info', {})

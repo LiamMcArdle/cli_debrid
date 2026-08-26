@@ -1256,16 +1256,16 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                     logging.warning(f"Failed to fetch alternative title aliases for {imdb_id_for_fallback}: {_alt_err}")
 
             # --- Pass imdb_id_for_fallback and direct_api_instance ---
-            # When an ID-based scraper was queried at a corrected coordinate its
-            # results carry that numbering, so the filter has to accept it as
-            # well as the stored one. filter_results already treats
-            # season/episode and original_season/original_episode as two valid
-            # numberings; this feeds the corrected pair into the first slot.
-            filter_season = id_season_map if id_season_map is not None else season
-            filter_episode = id_episode_map if id_episode_map is not None else episode
+            # ID-based scrapers were queried at the resolved coordinate and name
+            # their results in that numbering; title-based scrapers were queried
+            # at, and answer in, the stored one. filter_results cannot be handed a
+            # single coordinate for the whole batch because it filters ALL of them,
+            # so it is given both and picks per result. Feeding the resolved pair
+            # into the primary slot, as this did, compared every title-based
+            # result against the wrong episode number.
             filtered_results, pre_size_filtered_results = filter_results(
                 normalized_results, tmdb_id, original_media_title, year, content_type,
-                filter_season, filter_episode, multi, version_settings, runtime, episode_count,
+                season, episode, multi, version_settings, runtime, episode_count,
                 season_episode_counts, genres, effective_matching_aliases,
                 imdb_id=imdb_id_for_fallback,
                 direct_api=direct_api_instance,
@@ -1275,7 +1275,9 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 check_pack_wantedness=check_pack_wantedness,
                 current_scrape_target_version=version,
                 original_episode=original_episode,
-                original_season=original_season  # Pass original TVDB season so filter accepts both scene and TVDB-numbered torrents
+                original_season=original_season,  # Pass original TVDB season so filter accepts both scene and TVDB-numbered torrents
+                id_season=id_season_map,
+                id_episode=id_episode_map
             )
             filtered_out_results = [result for result in normalized_results if result not in filtered_results]
             task_timings['filtering'] = time.time() - task_start

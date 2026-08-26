@@ -907,6 +907,97 @@ class TestFilterResultsAnimeXEM(unittest.TestCase):
         self.assertEqual(len(filtered_results), 1,
                          "A release using a known alias of the show must be kept")
 
+    def _coord_result(self, title, seasons, episodes, id_based):
+        r = self.create_mock_result(
+            title, size_gb=1.5,
+            parsed_info={
+                'title': 'Test Anime',
+                'original_title': title,
+                'year': 2020,
+                'resolution': '1080p',
+                'source': 'WEB-DL',
+                'audio': 'AAC',
+                'codec': 'H.264',
+                'group': 'SubsPlease',
+                'seasons': seasons,
+                'episodes': episodes,
+                'season_episode_info': {
+                    'season_pack': 'N/A',
+                    'seasons': seasons,
+                    'episodes': episodes
+                }
+            })
+        r['id_based_scraper'] = id_based
+        return r
+
+    def _filter_with_coords(self, results, stored, resolved):
+        """Filter at the stored coordinate, with the resolved pair supplied for
+        ID-based results only."""
+        return filter_results(
+            results=results,
+            tmdb_id=self.tmdb_id,
+            title=self.title,
+            year=self.year,
+            content_type=self.content_type,
+            season=stored[0],
+            episode=stored[1],
+            multi=False,
+            version_settings=self.version_settings,
+            runtime=self.runtime,
+            episode_count=self.episode_count,
+            season_episode_counts=self.season_episode_counts,
+            genres=self.genres,
+            matching_aliases=self.matching_aliases,
+            imdb_id=self.imdb_id,
+            direct_api=self.mock_direct_api,
+            id_season=resolved[0],
+            id_episode=resolved[1]
+        )[0]
+
+    def test_coordinate_applies_per_result_not_per_batch(self):
+        """Each result is judged at the coordinate its own scraper answers in.
+
+        Regression test for the leak introduced 2026-08-26 in db6d7b99 and fixed
+        the same day. resolve_scene_coordinate corrects the stored coordinate to
+        the one ID-based indexes use (JJK: stored S1E25 -> upstream S2E1), but the
+        corrected pair was handed to filter_results, which filters ALL results.
+        Title-based scrapers answer in the stored numbering, so every one of their
+        results was compared against the wrong episode.
+        """
+        stored, resolved = (1, 25), (2, 1)
+
+        title_based = self._coord_result(
+            "Test.Anime.S01E25.1080p.WEB-DL.AAC.H.264-SubsPlease", [1], [25], id_based=False)
+        id_based = self._coord_result(
+            "Test.Anime.S02E01.1080p.WEB-DL.AAC.H.264-SubsPlease", [2], [1], id_based=True)
+
+        kept = self._filter_with_coords([title_based, id_based], stored, resolved)
+        kept_titles = [r.get('title') for r in kept]
+
+        self.assertEqual(
+            len(kept), 2,
+            "Both numberings must survive: the title-based result at the stored "
+            "coordinate and the ID-based result at the resolved one. Kept: "
+            + repr(kept_titles))
+
+    def test_title_based_result_not_judged_at_resolved_coordinate(self):
+        """A title-based result named at the RESOLVED coordinate is not accepted.
+
+        The mirror of the test above: without per-result selection, supplying a
+        resolved pair made the resolved numbering valid for every scraper. It must
+        only be valid for the scrapers actually queried at it.
+        """
+        stored, resolved = (1, 25), (2, 1)
+
+        # Named S02E01 but from a title-based scraper, which was queried at S01E25.
+        mismatched = self._coord_result(
+            "Test.Anime.S02E01.1080p.WEB-DL.AAC.H.264-SubsPlease", [2], [1], id_based=False)
+
+        kept = self._filter_with_coords([mismatched], stored, resolved)
+        self.assertEqual(
+            len(kept), 0,
+            "A title-based result must be judged at the stored coordinate only")
+
 
 if __name__ == '__main__':
     unittest.main()
