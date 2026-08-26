@@ -3,7 +3,6 @@ from typing import Dict, Any
 from datetime import datetime
 
 from utilities.settings import get_setting
-from database.core import get_db_connection
 from queues.retry_ladder import parse_deadline
 
 
@@ -110,6 +109,8 @@ class SleepingQueue:
             batch_size = 250
         if batch_size <= 0:
             batch_size = 250
+
+        from database.core import get_db_connection
 
         now = datetime.now()
         conn = None

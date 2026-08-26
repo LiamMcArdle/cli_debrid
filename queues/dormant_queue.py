@@ -3,7 +3,6 @@ from datetime import datetime
 from typing import Any, Dict
 
 from utilities.settings import get_setting
-from database.core import get_db_connection
 
 
 class DormantQueue:
@@ -36,6 +35,7 @@ class DormantQueue:
         logging.debug(f"DormantQueue.remove_item called for ID {item.get('id', 'N/A')} - item state managed in DB.")
 
     def contains_item_id(self, item_id):
+        from database.core import get_db_connection
         conn = None
         try:
             conn = get_db_connection()
@@ -71,6 +71,8 @@ class DormantQueue:
         if batch_size <= 0:
             logging.debug("Dormant batch size is zero or negative, skipping re-check sweep.")
             return
+
+        from database.core import get_db_connection
 
         now = datetime.now()
         conn = None
