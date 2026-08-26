@@ -233,3 +233,31 @@ def add_library_covering_index():
         conn.rollback()
     finally:
         conn.close()
+
+def add_retry_ladder_index():
+    """Add the index backing the Sleeping/Dormant retry-ladder sweeps.
+
+    Both sweeps select on (state, next_retry_at). Dormant is expected to hold
+    tens of thousands of rows once the escalating retry ladder replaces
+    automatic blacklisting, so this partial index is what keeps the periodic
+    sweep off a full table scan.
+
+    The columns themselves are added by schema_management.migrate_schema(),
+    which runs first — this function only creates the index.
+    """
+    from database import get_db_connection
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_media_items_next_retry
+            ON media_items (state, next_retry_at)
+            WHERE state IN ('Sleeping', 'Dormant')
+        """)
+        conn.commit()
+        logging.info("Successfully added retry ladder index")
+    except Exception as e:
+        logging.error(f"Error adding retry ladder index: {str(e)}")
+        conn.rollback()
+    finally:
+        conn.close()

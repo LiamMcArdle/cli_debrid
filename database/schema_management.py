@@ -386,6 +386,25 @@ def migrate_schema():
             conn.execute('ALTER TABLE media_items ADD COLUMN original_filename TEXT')
             logging.info("Added original_filename column to media_items table.")
 
+        # --- Retry ladder / Dormant columns ---
+        # The Sleeping backoff clock used to live in an in-memory dict that was
+        # reset by every process restart AND by every settings save, so no rung
+        # longer than one process lifetime could ever survive. The escalating
+        # retry ladder therefore persists its position (sleep_cycles, an
+        # existing but previously unused column) and its absolute wake deadline
+        # (next_retry_at) in the database.
+        #
+        # last_scrape_failure records why the last attempt produced nothing. It
+        # cannot reuse scrape_results: that column only ever holds ACCEPTED
+        # candidates, is NULLed on every terminal transition, and is re-NULLed
+        # on every startup by the recurring cleanup further down this function.
+        if 'next_retry_at' not in columns:
+            conn.execute('ALTER TABLE media_items ADD COLUMN next_retry_at TIMESTAMP')
+            logging.info("Added next_retry_at column to media_items table.")
+        if 'last_scrape_failure' not in columns:
+            conn.execute('ALTER TABLE media_items ADD COLUMN last_scrape_failure TEXT')
+            logging.info("Added last_scrape_failure column to media_items table.")
+
         # Migrate data from legacy plex_* columns to ms_* columns (one-time migration)
         # Only runs when plex_rating_key data exists AND ms_item_id is completely unpopulated
         # (i.e. no rows have any ms_item_id at all yet). This prevents re-stamping Plex integer
@@ -828,7 +847,7 @@ def migrate_schema():
                 UPDATE media_items SET scrape_results = NULL
                 WHERE scrape_results IS NOT NULL
                   AND scrape_results != ''
-                  AND state IN ('Collected', 'Blacklisted', 'Ghostlisted', 'Unreleased')
+                  AND state IN ('Collected', 'Blacklisted', 'Ghostlisted', 'Unreleased', 'Dormant')
             """)
             if cur_sr.rowcount > 0:
                 conn.commit()
@@ -846,6 +865,33 @@ def migrate_schema():
         logging.error(f"Unexpected error during schema migration: {str(e)}", exc_info=True)
     finally:
         conn.close()
+
+def _verify_retry_ladder_columns():
+    """Fail startup loudly if the retry-ladder columns are missing.
+
+    migrate_schema() swallows its own exceptions so a partial migration would
+    otherwise leave the program running against a schema it cannot write.
+    """
+    from database import get_db_connection
+    required = ('next_retry_at', 'last_scrape_failure', 'sleep_cycles')
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(media_items)")
+        columns = {row[1] for row in cursor.fetchall()}
+    finally:
+        conn.close()
+
+    missing = [c for c in required if c not in columns]
+    if missing:
+        message = (
+            f"media_items is missing required retry ladder column(s): {', '.join(missing)}. "
+            "The schema migration did not complete. Refusing to start."
+        )
+        logging.critical(message)
+        raise RuntimeError(message)
+    logging.debug("Retry ladder columns verified present on media_items.")
+
 
 def verify_database():
     create_tables()
@@ -865,7 +911,19 @@ def verify_database():
         logging.error(f"Error ensuring overlay_removal_queue table: {e}")
     
     # Add statistics indexes
-    from .migrations import add_statistics_indexes, add_search_performance_indexes, add_statistics_composite_indexes, add_database_page_indexes, add_library_covering_index
+    from .migrations import add_statistics_indexes, add_search_performance_indexes, add_statistics_composite_indexes, add_database_page_indexes, add_library_covering_index, add_retry_ladder_index
+
+    # Retry ladder columns are added by migrate_schema() above. Verify they are
+    # actually present before anything can try to write them: a missing ladder
+    # column turns every update_media_item_state(..., next_retry_at=...) into an
+    # OperationalError that is re-raised straight through retry_on_db_lock,
+    # which would degrade the Scraping queue into a hot loop instead of failing
+    # loudly. This must stop startup, not be swallowed.
+    _verify_retry_ladder_columns()
+
+    # Retry ladder sweep index
+    add_retry_ladder_index()
+
     add_statistics_indexes()
     add_statistics_composite_indexes()
 
@@ -933,6 +991,8 @@ def create_tables():
                 metadata_updated TIMESTAMP,
                 wake_count INTEGER DEFAULT 0,
                 sleep_cycles INTEGER DEFAULT 0,
+                next_retry_at TIMESTAMP,
+                last_scrape_failure TEXT,
                 last_checked TIMESTAMP,
                 scrape_results TEXT,
                 version TEXT,
@@ -1091,8 +1151,8 @@ def purge_database(content_type=None, state=None):
             params.append(content_type)
 
         if state == 'working':
-            query += ' AND state NOT IN (?, ?, ?)'
-            params.extend(['Wanted', 'Collected', 'Blacklisted'])
+            query += ' AND state NOT IN (?, ?, ?, ?)'
+            params.extend(['Wanted', 'Collected', 'Blacklisted', 'Dormant'])
         elif state != 'all':
             query += ' AND state = ?'
             params.append(state)

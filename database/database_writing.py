@@ -192,6 +192,9 @@ def update_media_item_state(item_id, state, **kwargs):
             'upgrading_from',
             'debrid_folder_name',
             'original_filename',
+            'sleep_cycles',
+            'next_retry_at',
+            'last_scrape_failure',
         ]
         for field in optional_fields:
             if field in kwargs:
@@ -204,8 +207,18 @@ def update_media_item_state(item_id, state, **kwargs):
         # Always clear scrape_results when transitioning to a terminal state —
         # scrape_results is only needed while adding/checking and can grow to
         # hundreds of MB if left on collected/blacklisted items.
-        if state in ('Collected', 'Blacklisted', 'Ghostlisted', 'Unreleased') and 'scrape_results' not in kwargs:
+        if state in ('Collected', 'Blacklisted', 'Ghostlisted', 'Unreleased', 'Dormant') and 'scrape_results' not in kwargs:
             query += ", scrape_results = NULL"
+
+        # A successful add ends the current failure streak, so the retry ladder
+        # resets. 'Adding' is deliberately NOT in this list — an item whose adds
+        # keep failing must keep escalating rather than loop on the first rung.
+        # 'Checking' is the first state that means the torrent was accepted.
+        if state in ('Checking', 'Collected', 'Upgrading'):
+            if 'sleep_cycles' not in kwargs:
+                query += ", sleep_cycles = 0"
+            if 'next_retry_at' not in kwargs:
+                query += ", next_retry_at = NULL"
 
         # Complete the query
         query += " WHERE id = ?"
