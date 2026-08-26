@@ -33,10 +33,11 @@ export const STATE_PRIORITY = {
     'Final_Check': 3,
     'Wanted': 4,
     'Unreleased': 5,
-    'Error': 6,
-    'Blacklisted': 7,
-    'ghostlisted': 8,
-    'all_blacklisted': 9
+    'Dormant': 6,
+    'Error': 7,
+    'Blacklisted': 8,
+    'ghostlisted': 9,
+    'all_blacklisted': 10
 };
 
 // Deletion layer configuration (6-layer deletion system)

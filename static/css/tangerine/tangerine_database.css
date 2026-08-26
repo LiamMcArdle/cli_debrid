@@ -1682,6 +1682,7 @@
     body.tangerine-theme .db-pill-scraping   { background: rgba(59,130,246,.1); color: #60a5fa; border: 1px solid #1e3a5f; }
     body.tangerine-theme .db-pill-upgrading  { background: rgba(139,92,246,.1); color: #a78bfa; border: 1px solid #3b1e5f; }
     body.tangerine-theme .db-pill-blacklisted{ background: rgba(239,68,68,.1); color: #f87171; border: 1px solid #7f1d1d; }
+    body.tangerine-theme .db-pill-dormant    { background: rgba(120,113,108,.12); color: #a8a29e; border: 1px solid #44403c; }
     body.tangerine-theme .db-pill-checking   { background: rgba(20,184,166,.1); color: #2dd4bf; border: 1px solid #134e4a; }
     body.tangerine-theme .db-pill-sleeping   { background: rgba(107,114,128,.1); color: #9ca3af; border: 1px solid #374151; }
     body.tangerine-theme .db-pill-unreleased { background: rgba(251,146,60,.1); color: #fb923c; border: 1px solid #7c2d12; }

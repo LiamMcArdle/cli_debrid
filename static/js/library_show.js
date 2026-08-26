@@ -1059,8 +1059,9 @@ function createEpisodeRow(episodes, seasonNumber) {
         'Final_Scrape': 5,
         'Final_Check': 6,
         'Sleeping': 7,
-        'Blacklisted': 8,
-        'Unreleased': 9  // Unreleased placeholders have lowest priority
+        'Dormant': 8,
+        'Blacklisted': 9,
+        'Unreleased': 10  // Unreleased placeholders have lowest priority
     };
 
     const sortedEpisodes = [...episodes].sort((a, b) => {

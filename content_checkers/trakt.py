@@ -1789,7 +1789,7 @@ def check_trakt_early_releases():
     cache_misses = 0
 
     # Get all items with state sleeping, wanted, or unreleased
-    states_to_check = ('Sleeping', 'Wanted', 'Unreleased')
+    states_to_check = ('Sleeping', 'Wanted', 'Unreleased', 'Dormant')
     items_to_check = get_all_media_items(state=states_to_check)
 
     skipped_count = 0

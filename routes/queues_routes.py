@@ -120,7 +120,7 @@ def get_queue_contents_with_progressive_fallback(queue_manager, max_time=20):
             else:
                 # For database-backed queues, use a non-blocking read so a locked DB
                 # (e.g. add_collected_items holding BEGIN IMMEDIATE) never stalls the page load
-                if queue_name in ['Wanted', 'Blacklisted', 'Unreleased']:
+                if queue_name in ['Wanted', 'Blacklisted', 'Dormant', 'Unreleased']:
                     try:
                         import sqlite3 as _sqlite3, os as _os
                         _db_path = _os.path.join(_os.environ.get('USER_DB_CONTENT', '/user/db_content'), 'media_items.db')
@@ -161,7 +161,7 @@ def get_queue_contents_with_progressive_fallback(queue_manager, max_time=20):
 
         try:
             # Skip database-backed queues that are slow to load fully
-            if queue_name in ['Wanted', 'Blacklisted', 'Unreleased']:
+            if queue_name in ['Wanted', 'Blacklisted', 'Dormant', 'Unreleased']:
                 # For these queues, we'll load them separately or use counts only
                 quick_summary[queue_name]['loaded'] = 'partial'  # Mark as partial
                 continue
@@ -345,7 +345,8 @@ QUEUE_DISPLAY_COLUMNS = [
     'id', 'imdb_id', 'tmdb_id', 'title', 'year', 'type', 'state', 'version',
     'season_number', 'episode_number', 'release_date', 'physical_release_date',
     'airtime', 'content_source', 'content_source_detail', 'filled_by_file', 'filled_by_torrent_id',
-    'wake_count', 'collected_at', 'last_updated', 'final_check_add_timestamp',
+    'wake_count', 'sleep_cycles', 'next_retry_at', 'last_scrape_failure',
+    'collected_at', 'last_updated', 'final_check_add_timestamp',
     'force_priority', 'ghostlisted'
 ]
 
@@ -511,6 +512,16 @@ def index():
                     continue
                 if 'wake_count' not in item or item['wake_count'] is None:
                     item['wake_count'] = queue_manager.get_wake_count(item['id'])
+                # Retry ladder position and wake deadline
+                item['retry_rung'] = item.get('sleep_cycles') or 0
+                item['next_retry_display_time'] = item.get('next_retry_at') or 'Due now'
+        elif queue_name == 'Dormant':
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item['retry_rung'] = item.get('sleep_cycles') or 0
+                item['next_retry_display_time'] = item.get('next_retry_at') or 'Due now'
+                item['last_scrape_failure'] = item.get('last_scrape_failure') or ''
         elif queue_name == 'Pending Uncached':
             for item in items:
                 # Skip if item is not a dictionary
@@ -739,6 +750,16 @@ def api_queue_contents():
                     continue
                 if 'wake_count' not in item or item['wake_count'] is None:
                     item['wake_count'] = queue_manager.get_wake_count(item['id'])
+                # Retry ladder position and wake deadline
+                item['retry_rung'] = item.get('sleep_cycles') or 0
+                item['next_retry_display_time'] = item.get('next_retry_at') or 'Due now'
+        elif queue_name == 'Dormant':
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item['retry_rung'] = item.get('sleep_cycles') or 0
+                item['next_retry_display_time'] = item.get('next_retry_at') or 'Due now'
+                item['last_scrape_failure'] = item.get('last_scrape_failure') or ''
 
         # Pre-consolidate data for specific queues
         if queue_name == 'Blacklisted':
@@ -828,7 +849,7 @@ def process_item_for_response(item, queue_name, currently_processing_upgrade_id=
     
     try:
         # Efficiently add only the necessary 'require_physical_release' flag.
-        if queue_name in ['Wanted', 'Scraping', 'Adding', 'Upgrading', 'Blacklisted', 'Unreleased']:
+        if queue_name in ['Wanted', 'Scraping', 'Adding', 'Upgrading', 'Blacklisted', 'Dormant', 'Unreleased']:
             version = item.get('version')
             if version:
                 scraping_versions = get_cached_setting('Scraping', 'versions', {})
@@ -899,6 +920,12 @@ def process_item_for_response(item, queue_name, currently_processing_upgrade_id=
         elif queue_name == 'Sleeping':
             if 'wake_count' not in item or item['wake_count'] is None:
                 item['wake_count'] = queue_manager.get_wake_count(item['id'])
+            item['retry_rung'] = item.get('sleep_cycles') or 0
+            item['next_retry_display_time'] = item.get('next_retry_at') or 'Due now'
+        elif queue_name == 'Dormant':
+            item['retry_rung'] = item.get('sleep_cycles') or 0
+            item['next_retry_display_time'] = item.get('next_retry_at') or 'Due now'
+            item['last_scrape_failure'] = item.get('last_scrape_failure') or ''
         elif queue_name == 'Final_Check':
             display_timestamp = item.get('final_check_add_timestamp') or item.get('last_updated')
             item['final_check_display_time'] = display_timestamp
@@ -1124,7 +1151,7 @@ def queue_stream():
     # Special limit for Checking queue to improve performance
     CHECKING_QUEUE_LIMIT = 20
     DB_FETCH_QUEUES = {"Wanted", "Final_Check"}  # Removed Blacklisted and Unreleased
-    COUNT_ONLY_QUEUES = {"Blacklisted", "Unreleased", "Collected"}  # New set for count-only queues
+    COUNT_ONLY_QUEUES = {"Blacklisted", "Dormant", "Unreleased", "Collected"}  # New set for count-only queues
     
     # Performance optimization: Track last sent data to avoid redundant updates
     last_sent_hash = None

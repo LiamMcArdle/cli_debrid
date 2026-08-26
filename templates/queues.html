@@ -230,7 +230,7 @@
 
     function generateQueueContent(queueName, items) {
         // For count-only queues, return empty content since we only show the count
-        if (queueName === 'Blacklisted' || queueName === 'Unreleased' || queueName === 'Collected') {
+        if (queueName === 'Blacklisted' || queueName === 'Dormant' || queueName === 'Unreleased' || queueName === 'Collected') {
             return ''; // Return empty string for count-only queues
         } else {
             return generateRegularItems(queueName, items);
@@ -378,8 +378,12 @@
             itemContent += `<span class="item-separator"> - </span><span class="item-time"><span class="item-label">Time Added:</span> ${formattedTime}</span><span class="item-separator"> - </span><span class="item-magnet"><span class="item-label">Magnet Link:</span> ${item.filled_by_magnet || 'Unknown'}</span>`;
         }
 
-        if (queueName === 'Sleeping') {
-            itemContent += `<span class="item-separator"> - </span><span class="item-wake-count"><span class="item-label">Wake Count:</span> ${item.wake_count !== undefined ? item.wake_count : 'N/A'}</span>`;
+        if (queueName === 'Sleeping' || queueName === 'Dormant') {
+            let retryTime = item.next_retry_display_time && item.next_retry_display_time !== 'Due now'
+                ? formatDateTimeToYMD_HMS(item.next_retry_display_time, true)
+                : 'Due now';
+            itemContent += `<span class="item-separator"> - </span><span class="item-wake-count"><span class="item-label">Retry Rung:</span> ${item.retry_rung !== undefined ? item.retry_rung : 'N/A'}</span>`;
+            itemContent += `<span class="item-separator"> - </span><span class="item-time"><span class="item-label">Next Retry:</span> ${retryTime}</span>`;
         }
 
         if (queueName === 'Wanted' && item.formatted_scrape_time) {
@@ -691,7 +695,7 @@
             
             let hasContent = false;
             // Backend names; Order defines display sequence
-            let queueOrder = ['Upgrading', 'Wanted', 'Scraping', 'Adding', 'Checking', 'Pending Uncached', 'Final_Check', 'Pre_release', 'Sleeping', 'Collected', 'Unreleased', 'Blacklisted'];
+            let queueOrder = ['Upgrading', 'Wanted', 'Scraping', 'Adding', 'Checking', 'Pending Uncached', 'Final_Check', 'Pre_release', 'Sleeping', 'Dormant', 'Collected', 'Unreleased', 'Blacklisted'];
             // Mapping for display and tooltip IDs
             const queueDisplayMapping = {
                 "Final_Check": "Final Scrape",
@@ -748,7 +752,7 @@
                 // Check if queue has items OR if it's a count-only queue with a count > 0
                 const hasItems = data.contents && data.contents[backendQueueName] && data.contents[backendQueueName].length > 0;
                 const hasCount = data.queue_counts && data.queue_counts[backendQueueName] && data.queue_counts[backendQueueName] > 0;
-                                    const isCountOnlyQueue = backendQueueName === 'Blacklisted' || backendQueueName === 'Unreleased' || backendQueueName === 'Collected';
+                                    const isCountOnlyQueue = backendQueueName === 'Blacklisted' || backendQueueName === 'Dormant' || backendQueueName === 'Unreleased' || backendQueueName === 'Collected';
                 
                 if (hasItems || (isCountOnlyQueue && hasCount)) {
                     queueCount++;

@@ -26,11 +26,12 @@ This page provides a real-time view of the application's background task queues,
     *   **Cached:** Items found in the debrid cache, ready for immediate transfer/linking.
     *   **Downloading:** Items actively being downloaded by the debrid service. Shows a progress bar and the current download state. Multiple files from the same torrent may be grouped under a single progress bar.
     *   Filenames (toggleable) show the specific file being processed.
-*   **`Final Scrape`:** Items for which initial scraping attempts failed. These items wait for a configured delay (defined in settings) before one last search attempt is automatically triggered. Shows when the item entered this waiting period. If the final search is successful, the item moves to `Adding`. If it fails again, the item is typically moved to `Blacklisted`.
+*   **`Final Scrape`:** Legacy queue, no longer fed automatically. Items here are moved back onto the retry ladder.
 *   **`Pending Uncached`:** Items associated with uncached torrents that would take your account over its limit wait in the Pending Uncached queue until your download limit returns to normal.
-*   **`Sleeping`:** Items that cli_debrid failed to find. Shows a "Wake Count" indicating how many times the item has been retried.
+*   **`Sleeping`:** Items that cli_debrid failed to find, waiting out a rung of the escalating retry ladder (30m, 6h, 1d, 3d, 7d). Shows the current rung and the time of the next retry. The deadline is stored in the database, so it survives restarts and settings saves.
+*   **`Dormant`:** Items that exhausted the retry ladder. They are re-checked on a long cycle indefinitely and are never permanently discarded. Reaching Dormant is not final - only manual blacklisting removes an item for good.
 *   **`Unreleased`:** Items identified but waiting for their release date before processing continues. Displays the relevant release date(s). Items requiring a physical release will indicate this.
-*   **`Blacklisted`:** Items that have been explicitly marked to be ignored by the application.
+*   **`Blacklisted`:** Items that have been explicitly marked to be ignored by the application. A failed scrape never puts an item here - only a manual blacklist, a library delete, or a rating-threshold cleanup does.
 
 **Hidden Items Summary:**
 

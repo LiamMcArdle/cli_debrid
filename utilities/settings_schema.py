@@ -502,14 +502,49 @@ SETTINGS_SCHEMA = {
             "description": "Priority order for content sources in the scraping queue (comma-separated list). Content sources not listed will be processed last.",
             "default": ""
         },
+        "retry_ladder_minutes": {
+            "type": "string",
+            "description": "Escalating retry backoff for failed scrapes, in minutes, comma separated. After the last rung the item moves to Dormant and is re-checked periodically forever - it is never blacklisted. Leave empty for no retries (first failure goes straight to Dormant).",
+            "default": "30,360,1440,4320,10080"
+        },
+        "retry_ladder_old_item_start_rung": {
+            "type": "integer",
+            "description": "Rung an item that is already well past its release date starts on (0 = the first rung). Back catalogue content does not reappear in 30 minutes, so starting old items further up the ladder avoids re-scraping the whole library every half hour.",
+            "default": 2,
+            "min": 0
+        },
+        "retry_unavailable_hold_minutes": {
+            "type": "integer",
+            "description": "How long to wait before retrying when a scrape could not be completed at all (rate limited or unreachable). Such an attempt holds the current ladder rung instead of consuming one.",
+            "default": 30,
+            "min": 1
+        },
+        "dormant_recheck_days": {
+            "type": "number",
+            "description": "How often a Dormant item is re-scraped. Dormant items are re-checked forever and are never automatically blacklisted.",
+            "default": 7,
+            "min": 1
+        },
+        "dormant_batch_size": {
+            "type": "integer",
+            "description": "Maximum Dormant items woken per sweep. The sweep runs hourly, so this caps the scraper load the Dormant population can generate.",
+            "default": 150,
+            "min": 1
+        },
+        "sleeping_batch_size": {
+            "type": "integer",
+            "description": "Maximum Sleeping items woken per sweep.",
+            "default": 250,
+            "min": 1
+        },
         "wake_limit": {
             "type": "string",
-            "description": "Number of times to wake items before blacklisting",
+            "description": "DEPRECATED and no longer read. Superseded by Queue.retry_ladder_minutes.",
             "default": "24"
         },
         "sleep_duration_minutes": {
              "type": "integer",
-             "description": "Duration in minutes an item sleeps before the next wake attempt",
+             "description": "DEPRECATED and no longer read. The Sleeping queue now uses the per-item deadline written by the retry ladder.",
              "default": 30,
              "min": 1
          },
@@ -752,10 +787,15 @@ SETTINGS_SCHEMA = {
                     "type": "number",
                     "default": 3
                 },
+                "retry_ladder_minutes": {
+                    "type": "string",
+                    "description": "Override the global retry ladder for this version, in minutes, comma separated. Leave empty to inherit Queue.retry_ladder_minutes.",
+                    "default": ""
+                },
                 "wake_count": {
                     "type": "integer",
                     "default": None,
-                    "description": "Override global wake count limit. Leave empty to use global setting. Set to -1 to disable sleeping queue."
+                    "description": "DEPRECATED and no longer read. Superseded by retry_ladder_minutes. (The old sibling key max_wake_count never existed in any schema and has been removed from the code.)"
                 },
                 "fallback_version": {
                     "type": "string",

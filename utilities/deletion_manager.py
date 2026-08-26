@@ -30,10 +30,11 @@ STATE_PRIORITY = {
     'Final_Check': 3,     # Keep - almost done
     'Wanted': 4,          # Keep - actively seeking
     'Unreleased': 5,      # Keep - not yet available
-    'Error': 6,           # DELETE candidate
-    'Blacklisted': 7,     # DELETE candidate
-    'ghostlisted': 8,     # DELETE candidate
-    'all_blacklisted': 9  # DELETE candidate
+    'Dormant': 6,         # Keep - retry ladder exhausted but still re-checked
+    'Error': 7,           # DELETE candidate
+    'Blacklisted': 8,     # DELETE candidate
+    'ghostlisted': 9,     # DELETE candidate
+    'all_blacklisted': 10 # DELETE candidate
 }
 
 class DeletionManager:
@@ -2988,11 +2989,12 @@ class DeletionManager:
                             WHEN 'Final_Check' THEN 3
                             WHEN 'Wanted' THEN 4
                             WHEN 'Unreleased' THEN 5
-                            WHEN 'Error' THEN 6
-                            WHEN 'Blacklisted' THEN 7
-                            WHEN 'ghostlisted' THEN 8
-                            WHEN 'all_blacklisted' THEN 9
-                            ELSE 10
+                            WHEN 'Dormant' THEN 6
+                            WHEN 'Error' THEN 7
+                            WHEN 'Blacklisted' THEN 8
+                            WHEN 'ghostlisted' THEN 9
+                            WHEN 'all_blacklisted' THEN 10
+                            ELSE 11
                         END
                 """
                 items_cursor = conn.execute(items_query, (media_id, media_type))

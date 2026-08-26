@@ -742,7 +742,7 @@ def get_library_data():
                     COUNT(DISTINCT CASE WHEN state IN ('Collected', 'Upgrading') THEN season_number || '-' || episode_number END) as collected_episodes,
                     COUNT(DISTINCT CASE WHEN state = 'Blacklisted' THEN season_number || '-' || episode_number END) as blacklisted_episodes,
                     COUNT(DISTINCT CASE WHEN state = 'Unreleased' THEN season_number || '-' || episode_number END) as unreleased_episodes,
-                    COUNT(DISTINCT CASE WHEN state IN ('Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping') THEN season_number || '-' || episode_number END) as wanted_episodes,
+                    COUNT(DISTINCT CASE WHEN state IN ('Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping', 'Dormant', 'Pending Uncached') THEN season_number || '-' || episode_number END) as wanted_episodes,
                     SUM(CASE WHEN state IN ('Collected', 'Upgrading') THEN size ELSE 0 END) as total_size
                 FROM media_items
                 WHERE tmdb_id IN ({placeholders}) AND type = 'episode'
@@ -1646,8 +1646,7 @@ def move_missing_to_wanted():
             FROM media_items
             WHERE {id_field} = ?
             AND type = 'episode'
-            AND state IN ('Blacklisted', 'Error', 'Ghostlisted')
-            AND state != 'Unreleased'
+            AND state IN ('Blacklisted', 'Error', 'Ghostlisted', 'Dormant')
         """
 
         cursor.execute(query, (id_value,))

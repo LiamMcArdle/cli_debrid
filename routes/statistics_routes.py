@@ -436,7 +436,7 @@ def get_recently_aired_and_airing_soon(days_past: int = 2, days_future: int = 1,
                     # For airing soon, only show items that still need to be obtained
                     # Exclude states that are already handled or in-flight
                     _airing_soon_exclude = {
-                        'Sleeping', 'Collected', 'Upgrading', 'Upgraded',
+                        'Sleeping', 'Dormant', 'Collected', 'Upgrading', 'Upgraded',
                         'Scraping', 'Adding', 'Checking', 'Pending Uncached',
                         'Final Scrape', 'Missing'
                     }

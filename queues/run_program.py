@@ -216,7 +216,7 @@ class ProgramRunner:
         self.queue_manager = QueueManager()
         
         # Verify queue initialization
-        expected_queues = ['Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping', 'Unreleased', 'Blacklisted', 'Pending Uncached', 'Upgrading', 'Final_Check', 'Pre_release']
+        expected_queues = ['Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping', 'Unreleased', 'Blacklisted', 'Dormant', 'Pending Uncached', 'Upgrading', 'Final_Check', 'Pre_release']
         missing_queues = [q for q in expected_queues if q not in self.queue_manager.queues]
         if missing_queues:
             logging.error(f"Missing queues during initialization: {missing_queues}")
@@ -239,6 +239,7 @@ class ProgramRunner:
             'Sleeping': 'process_sleeping',
             'Unreleased': 'process_unreleased',
             'Blacklisted': 'process_blacklisted',
+            'Dormant': 'process_dormant',
             'Pending Uncached': 'process_pending_uncached',
             'Upgrading': 'process_upgrading',
             'final_check_queue': 'process_final_check', # Use lowercase key matching the task ID
@@ -276,6 +277,13 @@ class ProgramRunner:
             'Sleeping': 300,
             'Unreleased': 300,
             'Blacklisted': 7200,
+            # Dormant re-check is a POLLER, not the schedule itself: the per-item
+            # cadence lives in media_items.next_retry_at. Deliberately 3600 and
+            # not 86400/604800 — APScheduler's IntervalTrigger advances an overdue
+            # persisted start_date to the next whole interval boundary rather than
+            # firing immediately, so a long interval silently starves for a full
+            # period after every restart (and this deployment restarts on every boot).
+            'Dormant': 3600,
             'Pending Uncached': 3600,
             'Upgrading': 3600,
             'final_check_queue': 900, # Use lowercase key matching the task ID
@@ -471,7 +479,7 @@ class ProgramRunner:
         # --- START EDIT: Define constants for dynamic interval adjustment ---
         # Based on slowdown_candidates logic from task_adjust_intervals_for_load
         self.DYNAMIC_INTERVAL_TASKS = {
-            'Checking', 'Sleeping', 'Blacklisted', 'Pending Uncached', 'Upgrading',
+            'Checking', 'Sleeping', 'Blacklisted', 'Dormant', 'Pending Uncached', 'Upgrading',
             'task_refresh_release_dates', 'task_purge_not_wanted_magnets_file',
             'task_generate_airtime_report', 'task_sync_time', 'task_check_trakt_early_releases',
             'task_reconcile_queues', 'task_refresh_download_stats',
@@ -518,6 +526,7 @@ class ProgramRunner:
             'Sleeping',
             'Unreleased',
             'Blacklisted',
+            'Dormant',
             'Pending Uncached',
             'Upgrading',
             'final_check_queue', # Use lowercase key matching the task ID
@@ -824,6 +833,7 @@ class ProgramRunner:
             'Sleeping': 'process_sleeping',
             'Unreleased': 'process_unreleased',
             'Blacklisted': 'process_blacklisted',
+            'Dormant': 'process_dormant',
             'Pending Uncached': 'process_pending_uncached',
             'Upgrading': 'process_upgrading',
             'final_check_queue': 'process_final_check', # Use lowercase key matching the task ID
@@ -1115,7 +1125,7 @@ class ProgramRunner:
                         _QUEUE_TASKS = {
                             'Adding', 'Checking', 'Scraping', 'Wanted',
                             'Sleeping', 'Unreleased',
-                            'Blacklisted', 'Pending Uncached', 'Upgrading',
+                            'Blacklisted', 'Dormant', 'Pending Uncached', 'Upgrading',
                             'final_check_queue', 'Pre_release',
                             'task_check_plex_files', 'task_send_notifications',
                             'task_update_queue_views',
@@ -2849,7 +2859,7 @@ class ProgramRunner:
 
         # Define non-critical tasks (same logic as before)
         slowdown_candidates = {
-            'Checking', 'Sleeping', 'Blacklisted', 'Pending Uncached', 'Upgrading',
+            'Checking', 'Sleeping', 'Blacklisted', 'Dormant', 'Pending Uncached', 'Upgrading',
             'task_refresh_release_dates', 'task_purge_not_wanted_magnets_file',
             'task_generate_airtime_report', 'task_sync_time', 'task_check_trakt_early_releases',
             'task_reconcile_queues', 'task_refresh_download_stats',
@@ -3899,7 +3909,7 @@ class ProgramRunner:
                                             _wanted_e = _ec.execute(
                                                 "SELECT id FROM media_items "
                                                 "WHERE imdb_id=? AND season_number=? AND type='episode' "
-                                                "AND (state IN ('Wanted','Sleeping') OR (state='Adding' AND (filled_by_torrent_id IS NULL OR filled_by_torrent_id=''))) AND id!=? "
+                                                "AND (state IN ('Wanted','Sleeping','Dormant') OR (state='Adding' AND (filled_by_torrent_id IS NULL OR filled_by_torrent_id=''))) AND id!=? "
                                                 "AND collected_at IS NULL "
                                                 "AND episode_number NOT IN ("
                                                 "  SELECT episode_number FROM media_items "
@@ -4081,7 +4091,7 @@ class ProgramRunner:
                                     _wanted_sibs = _pconn.execute(
                                         "SELECT id FROM media_items "
                                         "WHERE imdb_id=? AND season_number=? AND type='episode' "
-                                        "AND (state IN ('Wanted','Sleeping') OR (state='Adding' AND (filled_by_torrent_id IS NULL OR filled_by_torrent_id=''))) AND id!=? "
+                                        "AND (state IN ('Wanted','Sleeping','Dormant') OR (state='Adding' AND (filled_by_torrent_id IS NULL OR filled_by_torrent_id=''))) AND id!=? "
                                         "AND collected_at IS NULL "
                                         "AND episode_number NOT IN ("
                                         "  SELECT episode_number FROM media_items "
@@ -4829,7 +4839,7 @@ class ProgramRunner:
                 JOIN media_items m ON c.filled_by_file = m.filled_by_file AND c.id != m.id
                 WHERE c.state = 'Checking'
                   AND c.filled_by_file IS NOT NULL
-                  AND m.state != 'Checking'
+                  AND m.state NOT IN ('Checking', 'Sleeping', 'Dormant')
                   AND (m.ghostlisted IS NULL OR m.ghostlisted = 0)
                   AND (c.ghostlisted IS NULL OR c.ghostlisted = 0)
             """)
@@ -5199,7 +5209,7 @@ class ProgramRunner:
             cursor.execute("""
                 SELECT id, imdb_id, season_number, episode_number, version, state, type, title
                 FROM media_items
-                WHERE state IN ('Wanted', 'Scraping', 'Unreleased')
+                WHERE state IN ('Wanted', 'Scraping', 'Unreleased', 'Dormant')
                   AND imdb_id IS NOT NULL
                   AND (ghostlisted IS NULL OR ghostlisted = 0)
                 ORDER BY imdb_id, type, season_number, episode_number, version, id
@@ -5225,7 +5235,7 @@ class ProgramRunner:
                     processed_groups[group_key] = []
                 processed_groups[group_key].append(item) # Store original item for logging/details
 
-            state_priority = {'Scraping': 0, 'Wanted': 1, 'Unreleased': 2}
+            state_priority = {'Scraping': 0, 'Wanted': 1, 'Unreleased': 2, 'Dormant': 3}
 
             for group_key, items_in_group in processed_groups.items():
                 if len(items_in_group) > 1:
@@ -5264,7 +5274,7 @@ class ProgramRunner:
             try:
                 cursor.execute("""
                     DELETE FROM media_items
-                    WHERE state IN ('Wanted', 'Scraping', 'Unreleased')
+                    WHERE state IN ('Wanted', 'Scraping', 'Unreleased', 'Dormant')
                       AND imdb_id IS NOT NULL
                       AND (ghostlisted IS NULL OR ghostlisted = 0)
                       AND EXISTS (
@@ -7314,7 +7324,7 @@ class ProgramRunner:
                     
                     _QUEUE_TASKS_MANUAL = {
                         'Adding', 'Checking', 'Sleeping', 'Unreleased',
-                        'Blacklisted', 'Pending Uncached', 'Upgrading',
+                        'Blacklisted', 'Dormant', 'Pending Uncached', 'Upgrading',
                         'final_check_queue', 'Pre_release',
                         'task_check_plex_files', 'task_send_notifications',
                         'task_update_queue_views',

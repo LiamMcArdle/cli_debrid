@@ -31,7 +31,8 @@
                         
                         C --> G[Sleeping<br/>30 min retry]
                         G --> B
-                        G --> H[Blacklisted<br/>after max retries]
+                        G --> H[Dormant<br/>ladder exhausted]
+                        H --> B
                         
                         style A fill:#2c2c2c,stroke:#ffc107,stroke-width:2px,color:#fff
                         style B fill:#2c2c2c,stroke:#e91e63,stroke-width:2px,color:#fff
@@ -47,10 +48,11 @@
                     <strong>Notes:</strong> <br>
                     <div style="margin-left: 20px; margin-top: 10px;">
                     <ul>
-                        <li>Default Sleeping attempts is 24 attempts over 12 hours (30 minutes each). If not found, move to Blacklisted.</li>
+                        <li>A failed scrape walks an escalating retry ladder (30m, 6h, 1d, 3d, 7d). It never blacklists.</li>
                         <li>If item not found in Checking state after default one hour, move back to Wanted.</li>
-                        <li>If item not found on first Scraping attempt and is old (released more than 7 days ago), move to Blacklisted.</li>
-                        <li>If "Enable Unblacklisting" is enabled, items will be unblacklisted after 30 days by default.</li>
+                        <li>Items already well past their release date start further up the ladder rather than at the 30 minute rung.</li>
+          <li>Once the ladder is exhausted the item moves to Dormant, which is re-scraped on a long cycle indefinitely.</li>
+                        <li>Blacklisted is now reserved for manual blacklisting, library deletes and rating-threshold cleanup.</li>
                     </ul></div>
                 </div>
             </div>
@@ -158,20 +160,21 @@
         <line x1="430" y1="80" x2="490" y2="128" stroke="#777" stroke-width="1.5" marker-end="url(#tngArr)"/>
         <rect x="492" y="128" width="120" height="54" rx="4" fill="none" stroke="#a855f7" stroke-width="1.5"/>
         <text x="552" y="150" text-anchor="middle" fill="#e0e0e0" font-size="12" font-family="Inter,sans-serif" font-weight="500">Sleeping</text>
-        <text x="552" y="168" text-anchor="middle" fill="#aaa" font-size="11" font-family="Inter,sans-serif">30 min retry</text>
+        <text x="552" y="168" text-anchor="middle" fill="#aaa" font-size="11" font-family="Inter,sans-serif">retry ladder</text>
         <line x1="612" y1="155" x2="646" y2="155" stroke="#777" stroke-width="1.5" marker-end="url(#tngArr)"/>
         <rect x="648" y="128" width="134" height="54" rx="4" fill="none" stroke="#ef4444" stroke-width="1.5"/>
-        <text x="715" y="150" text-anchor="middle" fill="#e0e0e0" font-size="12" font-family="Inter,sans-serif" font-weight="500">Blacklisted</text>
-        <text x="715" y="168" text-anchor="middle" fill="#aaa" font-size="11" font-family="Inter,sans-serif">after max retries</text>
+        <text x="715" y="150" text-anchor="middle" fill="#e0e0e0" font-size="12" font-family="Inter,sans-serif" font-weight="500">Dormant</text>
+        <text x="715" y="168" text-anchor="middle" fill="#aaa" font-size="11" font-family="Inter,sans-serif">ladder exhausted</text>
         <path d="M492,162 Q350,210 222,132" stroke="#777" stroke-width="1.5" fill="none" marker-end="url(#tngArr)"/>
       </svg>
       <div class="tng-flow-notes">
         <div class="tng-flow-notes-title">Notes:</div>
         <ul>
-          <li>Default Sleeping attempts is 24 attempts over 12 hours (30 minutes each). If not found, move to Blacklisted.</li>
+          <li>A failed scrape walks an escalating retry ladder (30m, 6h, 1d, 3d, 7d). It never blacklists.</li>
           <li>If item not found in Checking state after default one hour, move back to Wanted.</li>
-          <li>If item not found on first Scraping attempt and is old (released more than 7 days ago), move to Blacklisted.</li>
-          <li>If "Enable Unblacklisting" is enabled, items will be unblacklisted after 30 days by default.</li>
+          <li>Items already well past their release date start further up the ladder rather than at the 30 minute rung.</li>
+          <li>Once the ladder is exhausted the item moves to Dormant, which is re-scraped on a long cycle indefinitely.</li>
+          <li>Blacklisted is now reserved for manual blacklisting, library deletes and rating-threshold cleanup.</li>
         </ul>
       </div>
     </div>

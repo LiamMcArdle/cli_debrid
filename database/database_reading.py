@@ -1232,7 +1232,14 @@ def get_media_item_presence_overall(imdb_id: str | None = None, tmdb_id: str | N
         if 'Collected' in states:
             return 'Collected' if len(states) == 1 else 'Partial'
 
-        return next(iter(states))
+        if 'Dormant' in states and len(states) == 1:
+            return 'Dormant'
+
+        for preferred in ('Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping',
+                          'Dormant', 'Unreleased'):
+            if preferred in states:
+                return preferred
+        return sorted(states)[0]
     except Exception as e:
         logging.error(f"Error retrieving aggregated media item status: {e}")
         return 'Missing'
@@ -1276,7 +1283,8 @@ def get_media_items_presence_batch(tmdb_ids: list[int]) -> dict[int, str]:
         # Apply the same logic as get_media_item_presence_overall for each ID
         # "Partial" should ONLY mean: some episodes collected/blacklisted AND some actively wanted
         result = {}
-        wanted_states = {'Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping'}
+        wanted_states = {'Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping',
+                         'Dormant', 'Pending Uncached', 'Final_Check'}
 
         for tmdb_id in tmdb_ids:
             # Look up using string key since database returns tmdb_id as TEXT

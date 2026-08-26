@@ -460,12 +460,12 @@ def get_queue_contents():
         cursor.execute('''
             SELECT id, title, state, type, season_number, episode_number, year
             FROM media_items
-            WHERE state IN ('Adding', 'Blacklisted', 'Checking', 'Scraping', 'Sleeping', 'Unreleased', 'Wanted', 'Pending Uncached', 'Upgrading')
+            WHERE state IN ('Adding', 'Blacklisted', 'Dormant', 'Checking', 'Scraping', 'Sleeping', 'Unreleased', 'Wanted', 'Pending Uncached', 'Upgrading')
         ''')
         items = cursor.fetchall()
 
         queue_contents = {
-            'Adding': [], 'Blacklisted': [], 'Checking': [], 'Scraping': [],
+            'Adding': [], 'Blacklisted': [], 'Dormant': [], 'Checking': [], 'Scraping': [],
             'Sleeping': [], 'Unreleased': [], 'Wanted': [], 'Pending Uncached': [], 'Upgrading': []
         }
         
@@ -6851,7 +6851,7 @@ def cleanup_failed_upgrades():
         # Handle keep_collected_delete_stale — delete Wanted/Scraping/Adding/Checking/Upgrading
         # duplicates that exist alongside a Collected version
         if keep_action == 'keep_collected_delete_stale':
-            STALE_STATES = ('Wanted', 'Scraping', 'Adding', 'Checking', 'Unreleased', 'Final Scrape')
+            STALE_STATES = ('Wanted', 'Scraping', 'Adding', 'Checking', 'Unreleased', 'Final Scrape', 'Dormant')
             stale_in = ','.join(f"'{s}'" for s in STALE_STATES)
             if media_type == 'show':
                 cursor.execute(f"""

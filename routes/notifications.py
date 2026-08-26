@@ -146,7 +146,8 @@ def format_notification_content(notifications, notification_type, notification_c
         'adding': "➕",
         'sleeping': "😴",
         'unreleased': "📅",
-        'pending_uncached': "⏳"
+        'pending_uncached': "⏳",
+        'dormant': "🌙"
     }
 
     # Get content source display names mapping once for efficiency
@@ -248,6 +249,8 @@ def format_notification_content(notifications, notification_type, notification_c
             prefix = EMOJIS['unreleased']
         elif new_state == 'Pending Uncached':
             prefix = EMOJIS['pending_uncached']
+        elif new_state == 'Dormant':
+            prefix = EMOJIS['dormant']
         else:
             prefix = EMOJIS['show'] if media_type == 'episode' else EMOJIS['movie']
         
@@ -1201,7 +1204,8 @@ def send_email_notification(smtp_config, content, notification_category):
         'adding': "Adding Content",
         'sleeping': "Content Sleeping",
         'unreleased': "Content Unreleased",
-        'pending_uncached': "Pending Uncached"
+        'pending_uncached': "Pending Uncached",
+        'dormant': "Dormant"
     }
     # Default subject if category not in map or None
     subject = subject_map.get(notification_category, "Media Notification") # Keep default

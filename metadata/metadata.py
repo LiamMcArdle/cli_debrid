@@ -1166,6 +1166,7 @@ def refresh_release_dates():
     items_to_refresh = list(get_all_media_items(state="Unreleased")) \
                      + list(get_all_media_items(state="Wanted")) \
                      + list(get_all_media_items(state="Sleeping")) \
+                     + list(get_all_media_items(state="Dormant")) \
                      + list(get_all_media_items(state="Final_Check")) \
                      + list(get_all_media_items(state="Scraping"))
     logging.info(f"Found {len(items_to_refresh)} items to refresh")
