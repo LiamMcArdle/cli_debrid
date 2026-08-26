@@ -13,5 +13,13 @@ adult_terms = [
     'sweetheartvideo', 'girlsway', 'whiteghetto', 'devilsfilm', 'peternorth', 
     'roccocontent', 'julesjordan', 'manuelferrara', 'legalpornonetwork', 'vivid', 
     'wickedpictures', 'hustler', 'penthouse', 'playboy', 'playboyplus', 'adulttime', 
-    'brazzers', 'realitykings', 'mofos', 'digitalplayground', 'fakehub'
+    'brazzers', 'realitykings', 'mofos', 'digitalplayground', 'fakehub',
+    # Studios observed in live Prowlarr results 2026-08-26 that the list missed.
+    # 'legalpornonetwork' was present but the releases are tagged 'LegalPorno', and
+    # the pattern is word-anchored so the longer form never matched. Every term
+    # here is a distinctive compound word, so anchoring still costs no true
+    # positives - see the comment on adult_pattern in filter_results.
+    'legalporno', '21sextury', 'alsscan', 'atkgirlfriends', 'amkingdom', 'anilos',
+    'backroomcastingcouch', 'bangbus', 'brazzersexxtra', 'evolvedfights',
+    'hesgotrizz', 'sexart', 'nubiles', 'analvids', 'hookuphotshot',
 ]
