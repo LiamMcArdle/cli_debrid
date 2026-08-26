@@ -1,4 +1,5 @@
 from routes.api_tracker import api
+from scraper.scrape_status import ScraperUnavailable
 import hashlib
 import logging
 import threading
@@ -118,7 +119,11 @@ def scrape_prowlarr_instance(
 ) -> List[Dict[str, Any]]:
     logging.info(f"Scraping Prowlarr instance: {instance} for '{title}' ({year})")
     prowlarr_url = settings.get('url', '').rstrip('/')
-    prowlarr_api_key = settings.get('api_key', '')
+    # The settings schema calls this field 'api' (as does jackett.py), so an
+    # instance configured through the UI only ever has that key. Reading
+    # 'api_key' alone made every such instance log "missing API key" and return
+    # nothing, silently and forever.
+    prowlarr_api_key = settings.get('api') or settings.get('api_key', '')
 
     if not prowlarr_url or not prowlarr_api_key:
         logging.error(f"Prowlarr instance '{instance}' is missing URL or API key.")
@@ -153,23 +158,45 @@ def scrape_prowlarr_instance(
                         _cache_set(ck, results)
                     return results
                 logging.error(f"Prowlarr '{instance}' unexpected response type: {type(data)}")
+            elif response.status_code in (429, 502, 503, 504) or response.status_code >= 500:
+                raise ScraperUnavailable(
+                    f"prowlarr '{instance}' HTTP {response.status_code}"
+                )
             else:
                 logging.error(f"Prowlarr '{instance}' HTTP {response.status_code}: {response.text[:300]}")
+        except ScraperUnavailable:
+            raise
         except api.exceptions.Timeout:
             logging.error(f"Prowlarr '{instance}' timed out")
+            raise ScraperUnavailable(f"prowlarr '{instance}' timed out")
+        except api.exceptions.RequestException as e:
+            # Connection refused, DNS failure, TLS error: Prowlarr is down, not
+            # empty. Returning [] here would tell the retry ladder the indexers
+            # genuinely had nothing and cost the item a rung.
+            logging.error(f"Prowlarr '{instance}' unreachable: {e}")
+            raise ScraperUnavailable(f"prowlarr '{instance}' unreachable: {e}")
         except Exception as e:
             logging.error(f"Prowlarr '{instance}' error: {e}", exc_info=True)
         return []
 
-    # Run all queries in parallel
+    # Run all queries in parallel. Only report the instance as unavailable if
+    # EVERY query failed to complete — one query 503ing while the other returns
+    # results is a partial answer, not an outage, and discarding the good half
+    # would be worse than the bug this guards against.
     all_instance_results: List[Dict[str, Any]] = []
+    unavailable_errors: List[str] = []
     if len(params_list) == 1:
         all_instance_results = _fetch(params_list[0])
     else:
         with ThreadPoolExecutor(max_workers=2) as ex:
             futures = [ex.submit(_fetch, p) for p in params_list]
             for f in as_completed(futures):
-                all_instance_results.extend(f.result())
+                try:
+                    all_instance_results.extend(f.result())
+                except ScraperUnavailable as e:
+                    unavailable_errors.append(str(e))
+        if unavailable_errors and len(unavailable_errors) == len(params_list):
+            raise ScraperUnavailable('; '.join(unavailable_errors))
 
     seen_keys = set()
     unique_results = []
