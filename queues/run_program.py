@@ -9079,10 +9079,30 @@ class ProgramRunner:
                         continue  # unparseable date — exclude when recent-only is on
                 upgrade_item_ids.append(c['item_id'])
 
-            # Cap each side independently by max_per_run, then combine
+            # Cap each side independently by max_per_run ITEMS, then combine.
+            # max_per_run is a budget of items, not of slots. Each element of
+            # pack_slots is a LIST of episode ids, so slicing that list capped the
+            # number of PACKS and let every one contribute a whole season: live
+            # 2026-08-26, 250 upgrades + 202 packs = 4,050 items queued against a
+            # stated limit of 250.
             upgrade_slots = [([iid], 'upgrade') for iid in upgrade_item_ids][:max_per_run]
-            pack_slots_q  = [(ids, 'pack') for ids in pack_slots][:max_per_run]
-            all_slots     = upgrade_slots + pack_slots_q
+
+            # Packs get their own equal item budget, spent on whole packs only. A
+            # season pack queued for part of its season still adds the entire
+            # torrent and leaves the remaining episodes on their old files, so a
+            # pack that does not fit is skipped in favour of the next, smaller one
+            # rather than being truncated.
+            pack_slots_q = []
+            pack_budget = max_per_run
+            for ids in pack_slots:
+                if pack_budget < 1:
+                    break
+                if len(ids) > pack_budget:
+                    continue
+                pack_slots_q.append((ids, 'pack'))
+                pack_budget -= len(ids)
+
+            all_slots = upgrade_slots + pack_slots_q
 
             if not all_slots:
                 logging.info("[UPGRADE_HUB] Auto-queue: no candidates matching settings filters")
@@ -9101,7 +9121,7 @@ class ProgramRunner:
             queue_upgrade_candidates(flat_item_ids, triggered_by='scheduled')
             logging.info(
                 f"[UPGRADE_HUB] Auto-queued {n_upgrades} upgrade(s) + {n_packs} pack(s) "
-                f"= {len(flat_item_ids)} item(s) total (limit: {max_per_run} per side)"
+                f"= {len(flat_item_ids)} item(s) total (limit: {max_per_run} items per side)"
             )
         except Exception as e:
             logging.error(f"[UPGRADE_HUB] Auto-queue task failed: {e}", exc_info=True)

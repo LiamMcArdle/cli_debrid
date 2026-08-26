@@ -410,6 +410,16 @@ class UpgradingQueue:
             try:
                 item_id = item['id']
 
+                # datetime.now() per item, not once per pass. A pass over the whole
+                # queue takes hours to days, so a timestamp captured before the loop
+                # makes every age below it that much too small and the queue-duration
+                # timeout can never fire. Measured 2026-08-26: 25 consecutive items
+                # spanning 10m26s of wall clock all reported the identical age
+                # 0:12:43, and no item had ever left the queue by timeout.
+                # current_time is still the pass-level value and is used only for the
+                # daily delayed-scrape date check above.
+                now = datetime.now()
+
                 # Eject items that are no longer in Upgrading state in the DB
                 # (e.g. Blacklisted, Collected, or otherwise changed externally)
                 try:
@@ -428,13 +438,13 @@ class UpgradingQueue:
 
                 # upgrade_times is now persisted to disk, so a missing entry here means
                 # the pkl was lost or this is a brand-new item that somehow bypassed
-                # add_item/update. Use current_time as a safe fallback — the item gets
+                # add_item/update. Use now as a safe fallback — the item gets
                 # a fresh window which is acceptable for this rare edge case.
                 if not upgrade_info:
                     logging.warning(f"[UpgradingQueue] No upgrade_times entry for {item_id} — synthesizing with current time.")
                     self.upgrade_times[item_id] = {
-                        'start_time': current_time,
-                        'time_added': current_time.strftime('%Y-%m-%d %H:%M:%S')
+                        'start_time': now,
+                        'time_added': now.strftime('%Y-%m-%d %H:%M:%S')
                     }
                     self.save_upgrade_times()
                     upgrade_info = self.upgrade_times[item_id]
@@ -445,9 +455,9 @@ class UpgradingQueue:
                     # We intentionally do NOT re-read last_updated from the item here
                     # because update_media_item() resets last_updated on every hourly
                     # scrape, which would make time_in_queue never exceed the timeout.
-                    collected_at = upgrade_info.get('start_time', current_time)
+                    collected_at = upgrade_info.get('start_time', now)
 
-                    time_in_queue = current_time - collected_at
+                    time_in_queue = now - collected_at
 
                     logging.info(f"Item {item_id} has been in the Upgrading queue for {time_in_queue}.")
 
@@ -472,7 +482,7 @@ class UpgradingQueue:
                     if _has_hub_magnet:
                         logging.info(f"Item {item_id} has hub magnet ready — processing immediately (bypassing scrape timer).")
                         self.hourly_scrape(item, queue_manager)
-                        self.last_scrape_times[item_id] = current_time
+                        self.last_scrape_times[item_id] = now
                         if not any(i['id'] == item_id for i in self.items):
                             logging.info(f"Item {item_id} was removed during hub-magnet processing (likely upgraded).")
                         elif time_in_queue > max_duration:
@@ -486,10 +496,10 @@ class UpgradingQueue:
                         self.remove_item(item)
                         from database import update_media_item_state
                         update_media_item_state(item_id, state="Collected")
-                    elif self.should_perform_hourly_scrape(item_id, current_time):
+                    elif self.should_perform_hourly_scrape(item_id, now):
                         logging.info(f"Performing hourly scrape for item {item_id} which has been in queue for {time_in_queue}.")
                         self.hourly_scrape(item, queue_manager) # This might remove the item if upgraded
-                        self.last_scrape_times[item_id] = current_time
+                        self.last_scrape_times[item_id] = now
 
                         # Nested Check: After scrape, check if item still exists AND has timed out
                         if any(i['id'] == item_id for i in self.items):

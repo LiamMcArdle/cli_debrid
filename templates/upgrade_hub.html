@@ -337,10 +337,10 @@
                 <!-- Sub-card: Upgrades Per Run -->
                 <div class="uh-settings-section">
                     <div class="uh-settings-subsection-title">Upgrades Per Run</div>
-                    <p class="uh-settings-desc">Maximum items queued per side per auto-queue run. Applied independently to Upgrades and Season Packs (e.g. 3 = up to 3 upgrades + up to 3 packs).</p>
+                    <p class="uh-settings-desc">Maximum items queued per side per auto-queue run. Applied independently to Upgrades and Season Packs, and counted in items rather than packs (e.g. 10 = up to 10 individual upgrades, plus whole season packs until 10 episodes' worth are queued).</p>
                     <div class="uh-number-input-wrap">
                         <button class="uh-btn uh-numstep" onclick="stepUpgradesPerRun(-1)">−</button>
-                        <input type="number" id="settings-max-upgrades" min="1" max="100" value="10" class="uh-number-input">
+                        <input type="number" id="settings-max-upgrades" min="1" max="500" value="10" class="uh-number-input">
                         <button class="uh-btn uh-numstep" onclick="stepUpgradesPerRun(1)">+</button>
                     </div>
                 </div>
