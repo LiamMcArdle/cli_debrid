@@ -316,6 +316,11 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
     logging.info(f"Scraping with parameters: imdb_id={imdb_id}, tmdb_id={tmdb_id}, title={title}, year={year}, content_type={content_type}, version={version}, season={season}, episode={episode}, multi={multi}, genres={genres}, skip_cache_check={skip_cache_check}, check_pack_wantedness={check_pack_wantedness}")
     logging.debug(f"[scrape_main] Initializing for '{title}' ({year}).")
 
+    # Clear the per-thread record of unreachable scrapers so that what the
+    # Scraping queue reads afterwards describes THIS scrape only.
+    from scraper.scrape_status import reset_unavailable
+    reset_unavailable()
+
     # Store original season/episode and initialize scene numbers
     original_season = season
     original_episode = episode 
@@ -937,6 +942,34 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 season = original_season
                 episode = original_episode
 
+        # --- Resolve the coordinate ID-based scrapers actually answer to ---
+        # Placed AFTER the XEM block: both of its else-arms end with an
+        # unconditional `season = original_season; episode = original_episode`,
+        # so a correction computed earlier would simply be thrown away.
+        #
+        # This deliberately does NOT mutate season/episode/scene_season/
+        # scene_episode. Title-based scrapers (Nyaa, Zilean) match on the release
+        # name, where back-catalogue anime is numbered absolutely, so rewriting
+        # their coordinate loses results rather than gaining them. The resolved
+        # pair is threaded separately and applied only to ID-based scrapers.
+        id_season = None
+        id_episode = None
+        if content_type.lower() == 'episode' and not xem_applied \
+                and original_season is not None and original_episode is not None:
+            try:
+                true_season, true_episode = direct_api.resolve_scene_coordinate(
+                    imdb_id, original_season, original_episode
+                )
+                if true_season is not None:
+                    logging.info(
+                        f"Coordinate correction for {imdb_id}: stored "
+                        f"S{original_season}E{original_episode} -> upstream "
+                        f"S{true_season}E{true_episode} (ID-based scrapers only)"
+                    )
+                    id_season, id_episode = true_season, true_episode
+            except Exception as e:
+                logging.warning(f"Coordinate correction failed for {imdb_id}: {e}")
+
         # Initialize results lists
         all_filtered_results = []
         all_filtered_out_results = []
@@ -1023,7 +1056,9 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             scene_episode_map: Optional[int] = None,
             check_pack_wantedness: bool = False,
             original_episode: Optional[int] = None,
-            original_season: Optional[int] = None
+            original_season: Optional[int] = None,
+            id_season_map: Optional[int] = None,
+            id_episode_map: Optional[int] = None
         ) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]], Dict[str, float]]:
             start_time = time.time()
             task_timings = {}
@@ -1089,7 +1124,9 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 episode_formats=episode_formats,
                 tmdb_id=tmdb_id,
                 is_translated_search=is_translated, # Pass the flag here
-                is_anime=is_anime # Pass the is_anime flag
+                is_anime=is_anime, # Pass the is_anime flag
+                id_season=id_season_map,
+                id_episode=id_episode_map
             )
             task_timings['scraping'] = time.time() - task_start
             logging.debug(f"[_do_scrape] scraper_manager.scrape_all for '{search_title}' returned: {len(all_results)} raw items.")
@@ -1214,9 +1251,16 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                     logging.warning(f"Failed to fetch alternative title aliases for {imdb_id_for_fallback}: {_alt_err}")
 
             # --- Pass imdb_id_for_fallback and direct_api_instance ---
+            # When an ID-based scraper was queried at a corrected coordinate its
+            # results carry that numbering, so the filter has to accept it as
+            # well as the stored one. filter_results already treats
+            # season/episode and original_season/original_episode as two valid
+            # numberings; this feeds the corrected pair into the first slot.
+            filter_season = id_season_map if id_season_map is not None else season
+            filter_episode = id_episode_map if id_episode_map is not None else episode
             filtered_results, pre_size_filtered_results = filter_results(
                 normalized_results, tmdb_id, original_media_title, year, content_type,
-                season, episode, multi, version_settings, runtime, episode_count,
+                filter_season, filter_episode, multi, version_settings, runtime, episode_count,
                 season_episode_counts, genres, effective_matching_aliases,
                 imdb_id=imdb_id_for_fallback,
                 direct_api=direct_api_instance,
@@ -1240,6 +1284,19 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 logging.debug(f"Attaching scene mapping S{scene_season_map}E{scene_episode_map} to {len(filtered_results)} results.")
                 for result in filtered_results:
                     result['xem_scene_mapping'] = {'season': scene_season_map, 'episode': scene_episode_map}
+            elif id_season_map is not None and id_episode_map is not None:
+                # ID-based scrapers only: those results are named in the upstream
+                # numbering, so the matcher needs the mapping to find the file.
+                # Title-based results keep the stored/absolute numbering their
+                # release names actually use and must NOT be remapped.
+                id_based = [r for r in filtered_results if r.get('id_based_scraper')]
+                if id_based:
+                    logging.debug(
+                        f"Attaching resolved coordinate S{id_season_map}E{id_episode_map} "
+                        f"to {len(id_based)} ID-based result(s)."
+                    )
+                    for result in id_based:
+                        result['xem_scene_mapping'] = {'season': id_season_map, 'episode': id_episode_map}
             # --- End attaching scene mapping --- 
 
             return filtered_results, comprehensive_filtered_out_list, task_timings # Return the comprehensive list
@@ -1415,7 +1472,9 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                     scene_episode_map=scene_episode, # This is the XEM-mapped episode (or None)
                     check_pack_wantedness=check_pack_wantedness,
                     original_episode=original_episode,
-                    original_season=original_season  # Pass original TVDB season before any XEM remapping
+                    original_season=original_season,  # Pass original TVDB season before any XEM remapping
+                    id_season_map=id_season,      # Resolved coordinate for ID-based scrapers only
+                    id_episode_map=id_episode
                 )
                 logging.debug(f"[scrape_main] _do_scrape for '{search_title}' returned: passed={len(filtered_results)}, filtered_out={len(filtered_out_results if filtered_out_results else [])}")
                 

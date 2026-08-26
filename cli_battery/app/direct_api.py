@@ -10,7 +10,7 @@ import json
 import logging
 import concurrent.futures
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session as SqlAlchemySession, selectinload
@@ -27,6 +27,7 @@ from .database import (
     get_timezone_aware_now, normalize_imdb_id,
 )
 from . import trakt_client
+from .cinemeta_client import fetch_cinemeta_episode_map
 from . import tvdb_client
 from . import trakt_auth
 from .staleness import is_stale, should_recheck_null_airdate, is_tmdb_mapping_stale
@@ -611,16 +612,30 @@ def _build_show_metadata_dict(item: Item) -> dict:
 
 
 def _fetch_and_store_xem(item: Item, session: SqlAlchemySession, metadata_dict: dict):
-    """Fetch XEM mapping if missing and store it."""
+    """Fetch XEM mapping if missing (or stale-and-empty) and store it.
+
+    Two deliberate details:
+      * On failure the value stored is ``[]``, not ``{}``. scraper.py gates its
+        entire absolute-episode remap on ``isinstance(xem_mapping_list, list)``,
+        and ``isinstance({}, list)`` is False -- so the old coercion disarmed
+        XEM permanently for every show it touched.
+      * An empty result is re-fetched after a short TTL. The original code
+        returned early on mere key presence with no staleness check, so a single
+        upstream outage pinned a show at 'no mapping' forever.
+    """
     if 'xem_mapping' in metadata_dict:
-        return
+        existing_value = metadata_dict.get('xem_mapping')
+        if existing_value:
+            return
+        if not _xem_entry_is_stale(item, session):
+            return
     ids = metadata_dict.get('ids', {})
     tvdb_id = ids.get('tvdb') if isinstance(ids, dict) else None
     if not tvdb_id:
         return
     try:
         xem_data = fetch_xem_mapping(tvdb_id)
-        xem_value = xem_data if xem_data else {}
+        xem_value = xem_data if isinstance(xem_data, list) else []
         metadata_dict['xem_mapping'] = xem_value
         now = datetime.now(_get_local_tz())
         existing = session.query(Metadata).filter_by(item_id=item.id, key='xem_mapping').first()
@@ -638,6 +653,62 @@ def _fetch_and_store_xem(item: Item, session: SqlAlchemySession, metadata_dict: 
 
 # ─── DirectAPI ───────────────────────────────────────────────────────────────
 
+# Re-fetch an empty xem_mapping entry after this long. A populated entry is
+# treated as permanent, as it was before.
+_XEM_EMPTY_TTL = timedelta(hours=6)
+
+# Cinemeta episode maps: refresh a populated map weekly, retry an empty one
+# after a short delay. Never store a permanent negative.
+_CINEMETA_TTL = timedelta(days=7)
+_CINEMETA_EMPTY_TTL = timedelta(hours=6)
+_CINEMETA_KEY = 'cinemeta_map'
+
+
+def _metadata_age(item: Item, session: SqlAlchemySession, key: str) -> Optional[timedelta]:
+    """How long ago a metadata key was last written, or None if never."""
+    row = session.query(Metadata).filter_by(item_id=item.id, key=key).first()
+    if row is None or row.last_updated is None:
+        return None
+    last_updated = row.last_updated
+    if last_updated.tzinfo is None:
+        last_updated = last_updated.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - last_updated
+
+
+def _xem_entry_is_stale(item: Item, session: SqlAlchemySession) -> bool:
+    age = _metadata_age(item, session, 'xem_mapping')
+    return age is None or age > _XEM_EMPTY_TTL
+
+
+def _fetch_and_store_cinemeta_map(item: Item, session: SqlAlchemySession, metadata_dict: dict):
+    """Fetch and cache the Cinemeta tvdb_id -> (season, episode) map for a show."""
+    cached = metadata_dict.get(_CINEMETA_KEY)
+    if cached is not None:
+        age = _metadata_age(item, session, _CINEMETA_KEY)
+        ttl = _CINEMETA_TTL if cached else _CINEMETA_EMPTY_TTL
+        if age is not None and age <= ttl:
+            return
+
+    mapping = fetch_cinemeta_episode_map(item.imdb_id)
+    if mapping is None:
+        # Fetch failed. Leave whatever is cached alone rather than writing a
+        # negative that would outlive the outage.
+        return
+
+    value = {tvdb_id: [pair[0], pair[1]] for tvdb_id, pair in mapping.items()}
+    metadata_dict[_CINEMETA_KEY] = value
+    now = datetime.now(_get_local_tz())
+    existing = session.query(Metadata).filter_by(item_id=item.id, key=_CINEMETA_KEY).first()
+    if existing:
+        existing.value = json.dumps(value)
+        existing.last_updated = now
+    else:
+        session.add(Metadata(
+            item_id=item.id, key=_CINEMETA_KEY,
+            value=json.dumps(value), provider='cinemeta', last_updated=now,
+        ))
+
+
 class DirectAPI:
     def __init__(self):
         engine = init_db()
@@ -645,6 +716,68 @@ class DirectAPI:
             raise RuntimeError("Database engine failed to initialize.")
         logger.info("DirectAPI initialized, database engine ready.")
         _ensure_worker()
+
+    # ── Episode coordinate resolution ─────────────────────────────────────
+
+    @staticmethod
+    def resolve_scene_coordinate(imdb_id: str, season: int, episode: int):
+        """Map a stored (season, episode) to the coordinate upstream indexes use.
+
+        cli_battery's numbering comes from Trakt, which records many shows --
+        most anime -- as one absolute-numbered season. ID-based scrapers such as
+        Torrentio are keyed on Cinemeta, which splits those into real seasons,
+        so ``tt12343534:1:25`` returns nothing while ``tt12343534:2:1`` returns a
+        full result set.
+
+        Joins the stored episode's ``tvdb_id`` against Cinemeta's own
+        ``tvdb_id`` -> (season, episode) map. Returns ``(None, None)`` whenever
+        the answer is unknown, so every caller falls back to the stored
+        coordinate: this resolver must always fail open.
+        """
+        if not imdb_id or season is None or episode is None:
+            return (None, None)
+        try:
+            with managed_session() as session:
+                item = session.query(Item).filter_by(imdb_id=imdb_id, type='show').first()
+                if item is None:
+                    return (None, None)
+
+                episode_row = (
+                    session.query(Episode)
+                    .join(Season, Episode.season_id == Season.id)
+                    .filter(Season.item_id == item.id,
+                            Season.season_number == season,
+                            Episode.episode_number == episode)
+                    .first()
+                )
+                if episode_row is None or not episode_row.tvdb_id:
+                    return (None, None)
+                tvdb_id = str(episode_row.tvdb_id)
+
+                metadata_dict = {
+                    m.key: m.value
+                    for m in session.query(Metadata).filter_by(item_id=item.id, key=_CINEMETA_KEY)
+                }
+                for key, value in list(metadata_dict.items()):
+                    if isinstance(value, str):
+                        try:
+                            metadata_dict[key] = json.loads(value)
+                        except (TypeError, ValueError):
+                            metadata_dict[key] = None
+
+                _fetch_and_store_cinemeta_map(item, session, metadata_dict)
+                mapping = metadata_dict.get(_CINEMETA_KEY) or {}
+
+                pair = mapping.get(tvdb_id)
+                if not pair or len(pair) != 2:
+                    return (None, None)
+                true_season, true_episode = int(pair[0]), int(pair[1])
+                if (true_season, true_episode) == (season, episode):
+                    return (None, None)
+                return (true_season, true_episode)
+        except Exception as e:
+            logger.warning(f"Coordinate resolution failed for {imdb_id} S{season}E{episode}: {e}")
+            return (None, None)
 
     # ── Movies ────────────────────────────────────────────────────────────
 
