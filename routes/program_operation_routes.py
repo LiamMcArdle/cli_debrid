@@ -593,11 +593,46 @@ def check_service_connectivity():
 
     return services_reachable, failed_services_details
 
+# Re-auth is driven by task_check_service_connectivity, which runs every 60s
+# forever. Trakt answers a failed refresh with a 429 whose window is refreshed by
+# each new attempt, so retrying on that cadence converts a transient rate limit
+# into a permanent lockout - measured 2026-08-26, ~8-16 attempts per minute for
+# 24 days, during which no Trakt call of any kind could succeed and the whole
+# metadata layer sat frozen at 2026-07-30.
+#
+# Trakt tells us exactly how long to wait, so honour it rather than guessing:
+# trakt.errors.RateLimitException exposes .retry_after from the Retry-After
+# header, the same header cli_battery's own client already reads in
+# trakt_client._make_request. The constant below is only the fallback for
+# failures that carry no header (an expired refresh token, a push failure), and
+# for those a long wait is right because no amount of retrying will fix them.
+_TRAKT_REAUTH_FALLBACK_COOLDOWN_SECONDS = 3600
+_trakt_reauth_next_attempt = 0.0
+
+
+def _arm_trakt_cooldown(seconds, reason):
+    """Suppress re-auth attempts for `seconds`, and say why."""
+    global _trakt_reauth_next_attempt
+    import time as _time
+    seconds = max(1, int(seconds))
+    _trakt_reauth_next_attempt = _time.monotonic() + seconds
+    logging.warning("Trakt re-authentication backing off %d s (%s).", seconds, reason)
+
+
 def attempt_trakt_auto_reauth():
     """
     Attempt to automatically re-authenticate Trakt and push the new credentials to Metadata Battery.
     Returns True if successful, False otherwise.
     """
+    global _trakt_reauth_next_attempt
+    import time as _time
+    now = _time.monotonic()
+    if now < _trakt_reauth_next_attempt:
+        logging.debug(
+            "Skipping Trakt re-authentication: backing off for another %d s.",
+            int(_trakt_reauth_next_attempt - now))
+        return False
+
     try:
         logging.info("Attempting automatic Trakt re-authentication...")
         
@@ -608,10 +643,12 @@ def attempt_trakt_auto_reauth():
         if not access_token:
             # Check if the failure was due to expired refresh token
             if is_refresh_token_expired():
-                logging.warning("Refresh token has expired. Manual re-authentication is required.")
+                _arm_trakt_cooldown(_TRAKT_REAUTH_FALLBACK_COOLDOWN_SECONDS,
+                                    "refresh token expired - manual re-authentication required")
                 return False
             
-            logging.warning("Could not obtain valid Trakt access token during auto-reauth")
+            _arm_trakt_cooldown(_TRAKT_REAUTH_FALLBACK_COOLDOWN_SECONDS,
+                                "no valid access token obtained")
             return False
         
         # If we got a valid token, push it to the Metadata Battery
@@ -623,10 +660,25 @@ def attempt_trakt_auto_reauth():
             return True
         else:
             logging.error(f"Failed to push Trakt credentials to Metadata Battery: {message}")
+            _arm_trakt_cooldown(_TRAKT_REAUTH_FALLBACK_COOLDOWN_SECONDS,
+                                "could not push credentials to Metadata Battery")
             return False
             
     except Exception as e:
+        # RateLimitException carries Trakt's own Retry-After; anything else gets
+        # the fallback. Reading .retry_after is itself guarded, since it touches
+        # .response, which a malformed exception may not have.
+        wait = _TRAKT_REAUTH_FALLBACK_COOLDOWN_SECONDS
+        reason = f"{type(e).__name__}: {e}"
+        try:
+            from trakt.errors import RateLimitException
+            if isinstance(e, RateLimitException):
+                wait = e.retry_after
+                reason = f"Trakt asked us to wait (Retry-After: {wait}s)"
+        except Exception:
+            pass
         logging.error(f"Error during automatic Trakt re-authentication: {str(e)}", exc_info=True)
+        _arm_trakt_cooldown(wait, reason)
         return False
 
 # --- START EDIT: New internal function for program start logic ---
