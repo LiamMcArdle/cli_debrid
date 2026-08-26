@@ -1086,6 +1086,11 @@ SETTINGS_SCHEMA = {
             "default": 24,
             "min": 1
         },
+        "strict_season_zero_match": {
+            "type": "boolean",
+            "description": "Only fill a Season 0 (Specials) slot when the file positively identifies itself as that special - an explicit S00E##, the special's own title, or a special/OVA/movie keyword. A bare episode number is not enough. Measured 2026-08-26, 660 of 665 collected specials were regular episodes matched on the bare number alone, and because the slot then counted as filled the real OVA was never fetched.",
+            "default": True
+        },
         "enforce_file_title_match": {
             "type": "boolean",
             "description": "Reject a file inside a torrent when its name states a different show than the item being filled. Reports without rejecting when disabled. Off by default because PTT returns the EPISODE title for files inside season packs, so enable it only after confirming the reported rejections contain no legitimate pack members.",

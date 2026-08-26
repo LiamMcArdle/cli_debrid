@@ -16,6 +16,16 @@ from scraper.functions.season_resolution import (
     episode_title_verdict, episode_title_is_usable)
 from scraper.functions.similarity_checks import title_verdict, MIN_TITLE_MATCH
 
+# Words by which a release states it IS a special rather than a numbered
+# episode. Used only for season 0, where a bare number is not evidence.
+_SPECIAL_ASSERT_RE = re.compile(
+    r'\b(ova|oad|ona|special|specials|sp\d{1,2}|movie|film|gekijou-?ban|recap|'
+    r'picture[ ._-]?drama|omake|extra|bonus|blooper|preview|pv|cm|'
+    r'short|shorts|mini|episode[ ._-]?0)\b', re.IGNORECASE)
+
+# An explicit season-zero coordinate written by the release itself.
+_SEASON_ZERO_COORD_RE = re.compile(r'\bS00E\d{1,3}\b|\b0x\d{1,3}\b', re.IGNORECASE)
+
 # Titles that name a film rather than an episode. Gekijouban is the Japanese
 # equivalent and appears on anime film releases that sit in series packs.
 _MOVIE_TITLE_RE = re.compile(r'\b(the movie|movie\s*\d+|gekijouban|gekijou-ban)\b', re.IGNORECASE)
@@ -419,6 +429,52 @@ class MediaMatcher:
                else " (reporting only; set Debug.enforce_file_title_match to reject)"))
         return False
 
+    def _season_zero_asserts_special(self, ptt_result: Dict[str, Any], item: Dict[str, Any],
+                                     parsed_file_info: Dict[str, Any]) -> bool:
+        """True only when a file positively identifies itself as this special.
+
+        Season 0 is the one place where a bare episode number carries no
+        information: 'Show - 04.mkv' is episode 4 of the regular run, and the
+        index matching it to S00E04 is a coincidence of numbering, not a claim
+        about content. Measured 2026-08-26 across 665 collected specials, 660
+        were regular episodes filled this way -- and because the slot then read
+        as filled, the real OVA was never scraped for. The bad fills were not
+        merely junk, they were what prevented the specials being collected.
+
+        Positive evidence is any of: an explicit S00E##/0x## written by the
+        release, a special/OVA/movie keyword, or the special's own title from
+        metadata appearing in the filename.
+        """
+        filename = (parsed_file_info.get('path') or ptt_result.get('original_filename')
+                    or ptt_result.get('original_title') or '')
+        base = os.path.basename(filename) or filename
+        if not base:
+            return False
+
+        if 0 in (ptt_result.get('seasons') or []):
+            return True
+        if _SEASON_ZERO_COORD_RE.search(base) or _SPECIAL_ASSERT_RE.search(base):
+            return True
+
+        # The special's own title, compared with the show name removed from both
+        # sides -- otherwise the shared show name alone carries the score, which
+        # is how 'Sword Art Offline II 9' scored 86 against 'Sword Art Online II
+        # - 21' and looked like a match.
+        ep_title = item.get('episode_title') or ''
+        if len(ep_title) >= 4:
+            show = item.get('series_title') or item.get('title') or ''
+            show_tokens = set(re.sub(r'[^a-z0-9]+', ' ', show.lower()).split())
+
+            def residual(text):
+                return ' '.join(t for t in re.sub(r'[^a-z0-9]+', ' ', text.lower()).split()
+                                if t and t not in show_tokens and not t.isdigit())
+
+            et, fn = residual(ep_title), residual(base)
+            if len(et) >= 4 and len(fn) >= 3 and fuzz.token_set_ratio(et, fn) >= 80:
+                return True
+
+        return False
+
     def _check_match(self, parsed_file_info: Dict[str, Any], item: Dict[str, Any], use_relaxed_matching: bool, xem_mapping: Optional[Dict[str, int]] = None) -> bool:
         """
         Checks if a pre-parsed file info dictionary matches a media item (TV Episode logic).
@@ -485,6 +541,18 @@ class MediaMatcher:
         # else: # No need for else, target_season/episode already hold original values
         #      logging.debug(f"Using original item S/E for match check: S{target_season}E{target_episode}")
 
+
+        # Season 0 fills only on positive evidence. See
+        # _season_zero_asserts_special for the measurement behind this.
+        if target_season in (0, '0'):
+            from utilities.settings import get_setting as _get_setting
+            if _get_setting('Debug', 'strict_season_zero_match', True):
+                if not self._season_zero_asserts_special(ptt_result, item, parsed_file_info):
+                    logging.info(
+                        f"Season 0 rejected for '{item.get('title')}' S00E{target_episode}: "
+                        f"'{os.path.basename(parsed_file_info.get('path') or '')}' does not "
+                        f"identify itself as a special (bare episode number is not evidence).")
+                    return False
 
         # Check required item fields (use target season/episode now)
         series_title = item.get('series_title', '') or item.get('title', '')
