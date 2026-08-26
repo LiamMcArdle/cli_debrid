@@ -567,10 +567,13 @@ class ScraperManager:
         # They return an empty list like any other miss, so without this they
         # read as "upstream had nothing".
         if unavailable_scope:
+            # The anime pre-pass submits Nyaa/OldNyaa outside scraper_tasks, so
+            # fall back to the instance naming convention ("<Type>_<n>", or the
+            # bare type) that settings_routes uses to infer the same thing.
             task_types = {inst: stype for inst, stype, _ in scraper_tasks}
             for inst in sorted(unavailable_scope):
                 if inst not in instance_summary:
-                    instance_summary[inst] = {'type': task_types.get(inst, 'Unknown'),
+                    instance_summary[inst] = {'type': task_types.get(inst) or inst.split('_')[0],
                                               'count': 'Unavailable'}
 
         # Log the final report
