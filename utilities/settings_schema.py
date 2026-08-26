@@ -1086,6 +1086,11 @@ SETTINGS_SCHEMA = {
             "default": 24,
             "min": 1
         },
+        "enforce_file_title_match": {
+            "type": "boolean",
+            "description": "Reject a file inside a torrent when its name states a different show than the item being filled. Reports without rejecting when disabled. Off by default because PTT returns the EPISODE title for files inside season packs, so enable it only after confirming the reported rejections contain no legitimate pack members.",
+            "default": False
+        },
         "cinesync_path": {
             "type": "string",
             "description": "Absolute path to your CineSync MediaHub main.py file (e.g. /path/to/CineSync/MediaHub/main.py)",

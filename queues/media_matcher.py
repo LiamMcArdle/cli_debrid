@@ -14,6 +14,7 @@ from scraper.functions.anime_utils import detect_absolute_numbering
 from scraper.functions.season_resolution import (
     season_verdict, container_season_from_path, log_verdict,
     episode_title_verdict, episode_title_is_usable)
+from scraper.functions.similarity_checks import title_verdict
 
 class MediaMatcher:
     """Handles media content matching and validation"""
@@ -21,6 +22,7 @@ class MediaMatcher:
     def __init__(self, relaxed_matching: bool = False):
         self.episode_count_cache: Dict[str, Dict[int, int]] = {}
         self.episode_title_cache: Dict[str, Dict[Tuple[int, int], str]] = {}
+        self.official_titles_cache: Dict[str, Optional[List[str]]] = {}
         self.relaxed_matching = relaxed_matching
 
     def _get_episode_titles_cached(self, imdb_id: Optional[str]) -> Dict[Tuple[int, int], str]:
@@ -334,6 +336,84 @@ class MediaMatcher:
             'parsed_info': parsed_info
         }
 
+    def _official_titles_cached(self, item: Dict[str, Any]) -> Optional[List[str]]:
+        """Every name this item may legitimately appear under, or None when that
+        cannot be established. None means "no verdict", not "no aliases"."""
+        imdb_id = item.get('imdb_id')
+        if not imdb_id:
+            return None
+        if imdb_id in self.official_titles_cache:
+            return self.official_titles_cache[imdb_id]
+
+        titles = [item.get('series_title'), item.get('title')]
+        alias_count = 0
+        try:
+            from cli_battery.app.direct_api import DirectAPI
+            if (item.get('type') or '').lower() == 'movie':
+                aliases, _ = DirectAPI.get_movie_aliases(imdb_id)
+            else:
+                aliases, _ = DirectAPI.get_show_aliases(imdb_id)
+            for country_aliases in (aliases or {}).values():
+                for alias in (country_aliases or []):
+                    titles.append(alias)
+                    alias_count += 1
+        except Exception as e:
+            logging.debug(f"Alias lookup failed for {imdb_id}: {e}")
+            self.official_titles_cache[imdb_id] = None
+            return None
+
+        genres = item.get('genres') or []
+        if isinstance(genres, str):
+            genres = [genres]
+        if alias_count == 0 and any('anime' in str(g).lower() for g in genres):
+            # Anime with no alias record: releases very likely carry a romaji name
+            # the stored title does not contain, so judging them against it alone
+            # would reject the only files that exist. No verdict is safer.
+            self.official_titles_cache[imdb_id] = None
+            return None
+
+        result = [t for t in titles if t]
+        self.official_titles_cache[imdb_id] = result
+        return result
+
+    def _file_title_agrees(self, ptt_result: Dict[str, Any], item: Dict[str, Any],
+                           parsed_file_info: Dict[str, Any]) -> bool:
+        """False only when the filename positively names a DIFFERENT show.
+
+        Measured 2026-08-26: PTT returns the EPISODE title for files inside season
+        packs - 'S01E03 - The Chelsea Girls.mkv' parses to 'The Chelsea Girls' and
+        'Season 1/03 - Weapons of Science.mkv' to 'Weapons of Science'. Those are
+        long enough to clear title_verdict's no-assertion floor, so the episode
+        title escape hatch below is what keeps legitimate pack members, and is the
+        reason this gate reports rather than rejects until proven on real traffic.
+        """
+        from utilities.settings import get_setting
+
+        official_titles = self._official_titles_cached(item)
+        if official_titles is None:
+            return True
+
+        ok, score, reason = title_verdict(ptt_result.get('title', ''), official_titles)
+        if ok:
+            return True
+
+        filename = (parsed_file_info.get('path') or ptt_result.get('original_filename')
+                    or ptt_result.get('original_title') or '')
+        if self._episode_title_identifies(item, filename):
+            logging.debug(
+                f"File title '{ptt_result.get('title')}' disagrees with "
+                f"'{item.get('title')}' ({reason}) but the filename names the "
+                f"episode - allowing.")
+            return True
+
+        logging.warning(
+            f"File '{os.path.basename(filename) or filename}' for item "
+            f"'{item.get('title')}' S{item.get('season_number')}"
+            f"E{item.get('episode_number')}: {reason}"
+            + ("" if get_setting('Debug', 'enforce_file_title_match', False)
+               else " (reporting only; set Debug.enforce_file_title_match to reject)"))
+        return False
+
     def _check_match(self, parsed_file_info: Dict[str, Any], item: Dict[str, Any], use_relaxed_matching: bool, xem_mapping: Optional[Dict[str, int]] = None) -> bool:
         """
         Checks if a pre-parsed file info dictionary matches a media item (TV Episode logic).
@@ -354,6 +434,17 @@ class MediaMatcher:
             return False
 
         ptt_result = parsed_file_info['parsed_info'] # Get the PTT result stored earlier
+
+        # A file whose name states a DIFFERENT show is not this episode, however
+        # well its numbers line up. Nothing below this point compares titles at
+        # all: on 2026-08-26 a file named 'House of the Dragon S01E03 ...' was
+        # symlinked into a Dr. Stone entry on an S1E3 coordinate match alone.
+        # This is a backstop - filter_results is the primary gate - so it only
+        # reports by default. See _file_title_agrees for why.
+        if not self._file_title_agrees(ptt_result, item, parsed_file_info):
+            from utilities.settings import get_setting as _get_setting
+            if _get_setting('Debug', 'enforce_file_title_match', False):
+                return False
 
         # Determine target season/episode: Use XEM if available, otherwise original item S/E
         target_season = item.get('season') or item.get('season_number')
