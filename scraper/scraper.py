@@ -384,11 +384,33 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
 
             # media_country_code already fetched above
             
+            # Take aliases from EVERY country, not just the show's own. The
+            # origin country's list is the native and romaji names, which for a
+            # Japanese show means the English names - the ones most releases are
+            # actually titled with - were being discarded: JoJo kept
+            # 'ジョジョの奇妙な冒険' and 'JoJo no Kimyou na Bouken' and threw away
+            # every '[us] JoJo's Bizarre Adventure'.
+            #
+            # That was survivable only while the stored title was itself English,
+            # since main_title_sim then carried the match on its own. It stopped
+            # being survivable when TVDB became the metadata source and titles
+            # started arriving in their native script: measured 2026-08-26, those
+            # shows scored 0.29 against every release and collected nothing.
+            #
+            # Origin country first so its names still win ties, then the rest.
             matching_aliases = []
-            if item_aliases and media_country_code in item_aliases:
-                matching_aliases = [alias for alias in item_aliases[media_country_code] if alias.lower() != title.lower()]
+            if item_aliases:
+                ordered = []
+                if media_country_code and media_country_code in item_aliases:
+                    ordered.extend(item_aliases.get(media_country_code) or [])
+                for code, names in item_aliases.items():
+                    if code != media_country_code:
+                        ordered.extend(names or [])
+                matching_aliases = [a for a in ordered
+                                    if a and a.lower() != title.lower()]
                 matching_aliases = list(dict.fromkeys(matching_aliases))
-                logging.info(f"Found {len(matching_aliases)} matching aliases: {matching_aliases}")
+                logging.info(f"Found {len(matching_aliases)} matching aliases across "
+                             f"{len(item_aliases)} countries (origin: {media_country_code})")
 
         # Initialize anime-specific variables
         genres = filter_genres(genres)
