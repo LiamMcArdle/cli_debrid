@@ -125,6 +125,18 @@ def normalize_title(title: str) -> str:
         '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9'
     })
     title = title.translate(supersub_digit_map)
+
+    # Characters that stand in for a plain 'x' in stylised titles. NFKD does not
+    # decompose these, and the ASCII filter below drops anything non-Latin, so
+    # 'HUNTER×HUNTER' normalised to 'hunterhunter' and scored 42 against
+    # 'Hunter x Hunter 1999 - 30' -- well under the 0.8 floor -- while every
+    # release on every indexer spells it with an ASCII x. Measured 2026-08-26.
+    title = title.translate(str.maketrans({
+        '×': 'x',   # U+00D7 multiplication sign
+        'ｘ': 'x',   # U+FF58 fullwidth latin small x
+        'Ｘ': 'X',   # U+FF38 fullwidth latin capital X
+        '✕': 'x', '✖': 'x', '⨯': 'x',
+    }))
     
     # Handle percentage signs early if present
     if '%' in title:
