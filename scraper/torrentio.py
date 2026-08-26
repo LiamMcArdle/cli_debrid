@@ -102,26 +102,22 @@ def fetch_data(url: str) -> Dict:
             # Non-200 that did not raise: treat rate limits as unavailable,
             # anything else as a completed request with no payload.
             if response.status_code == 429:
-                last_error = f"HTTP 429 rate limited"
-                sleep_seconds = _rate_limit_backoff(response, attempt, base_backoff_seconds)
-                if attempt < max_retries - 1:
-                    logging.warning(
-                        f"Torrentio rate limited (429) for {url} "
-                        f"(attempt {attempt + 1}/{max_retries}). Retrying in {sleep_seconds:.2f}s"
-                    )
-                    time.sleep(sleep_seconds)
-                    continue
-                break
+                # Do not retry. A 429 is upstream saying stop, and retrying it
+                # on a seconds-long backoff is what turns a brief limit into a
+                # standing block: four attempts inside five seconds, twice per
+                # item, was eight requests per coordinate per pass. Hand it to
+                # the retry ladder instead, which waits 30 minutes and — via
+                # the unavailable set — does not spend a rung on it.
+                raise ScraperUnavailable(f"torrentio rate limited (429) for {url}")
             logging.warning(f"Non-200 status ({response.status_code}) for URL {url}")
             return {}
         except (api.exceptions.RequestException, RemoteDisconnected) as e:
             last_error = str(e)
             status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+            if status_code == 429:
+                raise ScraperUnavailable(f"torrentio rate limited (429) for {url}")
             if attempt < max_retries - 1:
-                if status_code == 429:
-                    sleep_seconds = _rate_limit_backoff(getattr(e, 'response', None), attempt, base_backoff_seconds)
-                else:
-                    sleep_seconds = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.25)
+                sleep_seconds = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.25)
                 logging.warning(
                     f"Error fetching data: {e} (attempt {attempt + 1}/{max_retries}) for {url}. "
                     f"Retrying in {sleep_seconds:.2f}s"
@@ -136,25 +132,6 @@ def fetch_data(url: str) -> Dict:
     raise ScraperUnavailable(
         f"torrentio exhausted {max_retries} attempts for {url}: {last_error}"
     )
-
-
-def _rate_limit_backoff(response, attempt: int, base_backoff_seconds: float) -> float:
-    """Backoff for a 429, honouring Retry-After but bounded by the batch timeout.
-
-    Total backoff across all attempts stays around 8s. Anything longer would
-    exceed Scraping.scraper_timeout and the whole batch — including every result
-    the other scrapers already returned — would be cancelled and discarded.
-    """
-    retry_after = 0
-    try:
-        if response is not None:
-            retry_after = int(response.headers.get('Retry-After', 0) or 0)
-    except (TypeError, ValueError, AttributeError):
-        retry_after = 0
-    retry_after = min(max(retry_after, 0), 4)
-    if retry_after:
-        return float(retry_after)
-    return min(base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.3), 4.0)
 
 
 def parse_results(streams: List[Dict[str, Any]], instance: str) -> List[Dict[str, Any]]:

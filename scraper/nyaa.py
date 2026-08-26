@@ -12,6 +12,7 @@ import time
 import re
 import random
 import requests
+from scraper.scrape_status import ScraperUnavailable
 
 # Helper - build proxy context for limited environment
 from contextlib import contextmanager
@@ -211,24 +212,29 @@ def scrape_nyaa_with_retry(query: str, category: int, subcategory: int, filters:
             
         except Exception as e:
             error_str = str(e).lower()
-            
+
+            # A 429 is not retryable here. Retrying it a second later just
+            # confirms the limit and deepens it; the escalating retry ladder
+            # re-asks in 30 minutes instead, and treats an unreachable scraper
+            # as "never asked" rather than spending a rung.
+            if '429' in error_str:
+                logging.warning(f"Nyaa rate limited (429) for query: {query}")
+                raise ScraperUnavailable(f"nyaa rate limited (429) for query: {query}")
+
             # Check for specific HTTP errors that should trigger retries
             is_retryable_error = (
-                '429' in error_str or  # Rate limit
                 '504' in error_str or  # Gateway timeout
                 '502' in error_str or  # Bad gateway
                 '503' in error_str or  # Service unavailable
                 'timeout' in error_str or
                 'connection' in error_str
             )
-            
+
             if is_retryable_error and attempt < max_retries - 1:
                 # Calculate exponential backoff with jitter
                 delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
-                
-                if '429' in error_str:
-                    logging.warning(f"Nyaa rate limit (429) hit. Waiting {delay:.2f}s before retry {attempt + 1}/{max_retries}")
-                elif '504' in error_str:
+
+                if '504' in error_str:
                     logging.warning(f"Nyaa gateway timeout (504) hit. Waiting {delay:.2f}s before retry {attempt + 1}/{max_retries}")
                 else:
                     logging.warning(f"Nyaa request failed with retryable error. Waiting {delay:.2f}s before retry {attempt + 1}/{max_retries}. Error: {str(e)}")
@@ -376,7 +382,11 @@ def scrape_nyaa_instance(settings: Dict[str, Any], title: str, year: int, conten
             processed_results.sort(key=lambda x: x['seeders'], reverse=True)
         
         return processed_results
-        
+
+    except ScraperUnavailable:
+        # Propagate: the retry ladder must be able to tell 'we never got an
+        # answer' apart from 'upstream returned nothing'.
+        raise
     except Exception as e:
         logging.error(f"Error scraping Nyaa: {str(e)}")
         return []
@@ -450,6 +460,10 @@ def scrape_nyaa_anime_episode(title: str, year: int, season: int, episode: int, 
                 logging.info(f"Found {len(results)} results with format {format_type} but none contain target episode S{season}E{episode}, continuing search")
                 continue
                 
+        except ScraperUnavailable:
+            # Every format would hit the same wall; stop rather than
+            # hammering the remaining ones and reporting an empty result.
+            raise
         except Exception as e:
             logging.error(f"Error scraping format {format_type}: {e}")
             # Continue to next format even if this one failed
@@ -500,6 +514,9 @@ def _scrape_nyaa_with_format(title: str, year: int, format_pattern: str, is_tran
         # Pass the is_translated_search flag to scrape_nyaa_instance
         results = scrape_nyaa_instance(settings, search_query, year, "episode", None, None, False, is_translated_search)
         return results
+    except ScraperUnavailable:
+        # Propagate: an unreachable Nyaa must not read as 'nothing found'.
+        raise
     except Exception as e:
         logging.error(f"Error scraping Nyaa with format {format_pattern}: {str(e)}")
         return []
