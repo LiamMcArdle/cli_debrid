@@ -258,8 +258,22 @@ _EXPLICIT_X_RE = re.compile(
     re.IGNORECASE,
 )
 _EXPLICIT_ANIME_SEASON_RE = re.compile(
+    # The trailing guard also refuses a resolution suffix letter: without it
+    # "Show - S01 - 1080p" reads as the explicit coordinate S01E1080 and the
+    # conflict short-circuit rejects every correctly numbered file in the pack.
     r'(?<![A-Za-z0-9])S(?P<season>\d{1,2})\s*[-–—]\s*'
-    r'(?P<episode>\d{1,4})(?!\d)',
+    r'(?P<episode>\d{1,4})(?![\dpi])',
+    re.IGNORECASE,
+)
+
+# Continuations of an explicit coordinate: the extra episodes named by
+# multi-episode files such as S01E01E02, S01E01-E02, S01E01-02 or 1x01x02.
+# Without reading them, the first episode is the only coordinate the file is
+# credited with and every later episode of the span is rejected as an
+# explicit conflict.  The x-branch refuses codec tokens (x264/x265/x266) and
+# the trailing guard refuses resolution suffixes (-1080p).
+_EXPLICIT_SPAN_CONT_RE = re.compile(
+    r'(?:[._ -]{0,3}E|[._ -]{0,3}x(?!26[456])|-)(?P<episode>\d{1,4})(?![\dpi])',
     re.IGNORECASE,
 )
 
@@ -292,11 +306,30 @@ def explicit_coordinates(text: Optional[str]) -> List[Tuple[int, int]]:
     parser default from an actual ``S01E03`` claim.
     """
     found = []
+    src = text or ''
     for pattern in (_EXPLICIT_COORD_RE, _EXPLICIT_X_RE, _EXPLICIT_ANIME_SEASON_RE):
-        for match in pattern.finditer(text or ''):
-            pair = (int(match.group('season')), int(match.group('episode')))
-            if pair not in found:
-                found.append(pair)
+        for match in pattern.finditer(src):
+            season = int(match.group('season'))
+            episodes = [int(match.group('episode'))]
+            # Read multi-episode continuations (S01E01E02, S01E01-E02, ...)
+            # so every episode of the span counts as explicitly named.
+            pos = match.end()
+            while True:
+                cont = _EXPLICIT_SPAN_CONT_RE.match(src, pos)
+                if not cont:
+                    break
+                episodes.append(int(cont.group('episode')))
+                pos = cont.end()
+            # A two-number ascending span is a range (S01E01-E13 names all
+            # thirteen episodes).  The cap keeps a stray year or hash from
+            # fabricating hundreds of coordinates.
+            if (len(episodes) == 2 and episodes[0] < episodes[1]
+                    and episodes[1] - episodes[0] <= 100):
+                episodes = list(range(episodes[0], episodes[1] + 1))
+            for episode in episodes:
+                pair = (season, episode)
+                if pair not in found:
+                    found.append(pair)
     return found
 
 
