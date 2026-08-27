@@ -414,8 +414,11 @@ class MediaMatcher:
         if ok:
             return True
 
-        filename = (parsed_file_info.get('path') or ptt_result.get('original_filename')
-                    or ptt_result.get('original_title') or '')
+        # Basename only: episode_title_verdict's contract.  A pack folder may
+        # list many titles, which would make every file in it look like a hit.
+        filename = os.path.basename(
+            parsed_file_info.get('path') or ptt_result.get('original_filename')
+            or ptt_result.get('original_title') or '')
         if self._episode_title_identifies(item, filename):
             logging.debug(
                 f"File title '{ptt_result.get('title')}' disagrees with "
@@ -597,8 +600,14 @@ class MediaMatcher:
             own_coordinate = (stored_season, stored_episode)
             other_titles = [value for key, value in show_titles.items()
                             if key != own_coordinate]
-            filename = (parsed_file_info.get('path')
-                        or ptt_result.get('original_filename') or '')
+            file_path = (parsed_file_info.get('path')
+                         or ptt_result.get('original_filename') or '')
+            # The verdict's filename contract is basename only: folder text
+            # would both leak sibling episode titles into the title haystack
+            # and turn folder tokens like "S01 - 1080p" into bogus explicit
+            # coordinates for every file inside.  The full path is kept solely
+            # for the container-season reading, which is folder semantics.
+            filename = os.path.basename(file_path) or file_path
             identity_match, identity_reason = episode_identity_verdict(
                 target_coordinates=coordinates,
                 file_seasons=ptt_result.get('seasons'),
@@ -606,7 +615,7 @@ class MediaMatcher:
                 filename=filename,
                 absolute_episode=self._compute_absolute_episode_for_item(item)
                 if is_anime else None,
-                container_season=container_season_from_path(filename),
+                container_season=container_season_from_path(file_path),
                 is_anime=is_anime,
                 target_air_date=item.get('release_date'),
                 file_air_date=ptt_result.get('date'),
@@ -993,6 +1002,7 @@ class MediaMatcher:
             # Narrow candidates by season/episode indexes to avoid scanning all files
             target_season = item.get('season') or item.get('season_number')
             target_episode = item.get('episode') or item.get('episode_number')
+            stored_season, stored_episode = target_season, target_episode
 
             # Apply XEM mapping from item if available (similar to how scraper.py does it)
             if xem_mapping:
@@ -1025,6 +1035,33 @@ class MediaMatcher:
                 for pf in by_episode_only.get(target_episode, []):
                     if id(pf) not in seen_ids:
                         seen_ids.add(id(pf)); candidate_files.append(pf)
+                # A mapped coordinate (XEM or Cinemeta) narrows the lookup, but
+                # the files themselves are indexed by their RAW parsed numbers.
+                # An anime stored as S1E25 whose resolver answers S2E1 would
+                # otherwise never even see 'Show - 25.mkv' as a candidate, and
+                # fail to match its own torrent.  _check_match already accepts
+                # both pairs, so also offer the stored coordinate's buckets.
+                if (stored_season, stored_episode) != (target_season, target_episode) \
+                        and stored_episode is not None:
+                    for pf in by_season_episode.get((stored_season, stored_episode), []):
+                        if id(pf) not in seen_ids:
+                            seen_ids.add(id(pf)); candidate_files.append(pf)
+                    for pf in by_season_episode.get((None, stored_episode), []):
+                        if id(pf) not in seen_ids:
+                            seen_ids.add(id(pf)); candidate_files.append(pf)
+                    for pf in by_episode_only.get(stored_episode, []):
+                        if id(pf) not in seen_ids:
+                            seen_ids.add(id(pf)); candidate_files.append(pf)
+                # Anime absolute-numbered files, mirroring find_related_items.
+                if is_anime:
+                    abs_ep = self._compute_absolute_episode_for_item(item)
+                    if abs_ep is not None:
+                        for pf in by_episode_only.get(abs_ep, []):
+                            if id(pf) not in seen_ids:
+                                seen_ids.add(id(pf)); candidate_files.append(pf)
+                        for pf in by_season_episode.get((1, abs_ep), []):
+                            if id(pf) not in seen_ids:
+                                seen_ids.add(id(pf)); candidate_files.append(pf)
             else:
                 candidate_files = parsed_files  # Fallback if no episode available
 
@@ -1284,8 +1321,17 @@ class MediaMatcher:
         claimed_basenames = {os.path.basename(p) for p in (claimed_file_paths or ())}
         # Plus anything a previous pass already handed out -- see
         # _basenames_already_in_use for why the in-memory set alone is not enough.
+        # Only flat files (no directory component) are checked against the DB:
+        # for those the basename IS the file identity. Foldered packs reuse
+        # generic per-season basenames ('Season 1/01.mkv', 'Season 2/01.mkv'),
+        # so a bare-basename DB claim would mark every file of a NEW season as
+        # already owned by the old one and block the whole pack from sibling
+        # filling. The in-memory set still prevents double-assignment within a
+        # pass, which is where the Dragon Ball Z many-seasons collision arose.
+        flat_basenames = [os.path.basename(pf['path']) for pf in parsed_torrent_files
+                          if not os.path.dirname(pf.get('path') or '')]
         claimed_basenames |= self._basenames_already_in_use(
-            [os.path.basename(pf['path']) for pf in parsed_torrent_files],
+            flat_basenames,
             original_item.get('imdb_id'),
             exclude_item_id=original_item.get('id'),
         )
