@@ -111,6 +111,11 @@ def fetch_data(url: str) -> Dict:
                 raise ScraperUnavailable(f"torrentio rate limited (429) for {url}")
             logging.warning(f"Non-200 status ({response.status_code}) for URL {url}")
             return {}
+        except ScraperUnavailable:
+            # Already the right answer (429). Falling through to the generic
+            # handler below would log it as an "Unexpected error" with a full
+            # traceback and re-wrap the message on every rate limit.
+            raise
         except (api.exceptions.RequestException, RemoteDisconnected) as e:
             last_error = str(e)
             status_code = getattr(getattr(e, 'response', None), 'status_code', None)

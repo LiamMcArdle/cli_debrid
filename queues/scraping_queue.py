@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime, date, timedelta, time as dt_time
 import json
 import time
@@ -723,6 +723,14 @@ class ScrapingQueue:
                     # future operator whether the scrapers returned nothing at all
                     # (dead coordinate / rate limit) or returned results we rejected.
                     raw_result_count = len(results) + len(filtered_out_results)
+                    # scrape() calls reset_unavailable() on EVERY invocation, so the
+                    # thread-local only ever describes the most recent scrape. This
+                    # item may be scraped twice (initial, then the multi-pack
+                    # fallback), and a rate limit on the first must not be erased by
+                    # a clean second pass -- that is what decides whether the failure
+                    # costs a ladder rung. Accumulate across every scrape of THIS item.
+                    from scraper.scrape_status import get_unavailable as _get_unavailable
+                    unavailable_scrapers = set(_get_unavailable())
 
                     # Filter and process results from the first attempt
                     filtered_results = []
@@ -838,6 +846,7 @@ class ScrapingQueue:
                         fallback_filtered_out = fallback_filtered_out if fallback_filtered_out is not None else []
                         filtered_out_results = filtered_out_results + fallback_filtered_out
                         raw_result_count += len(fallback_results) + len(fallback_filtered_out)
+                        unavailable_scrapers |= set(_get_unavailable())
 
                         if fallback_results: # Only filter if there are raw results from fallback
                             current_filtered_fallback_results = []
@@ -896,7 +905,8 @@ class ScrapingQueue:
                         self.handle_no_results(
                             item_to_process, queue_manager,
                             filtered_out_results=filtered_out_results,
-                            raw_result_count=raw_result_count
+                            raw_result_count=raw_result_count,
+                            unavailable_scrapers=unavailable_scrapers
                         )
                         processed_successfully_or_moved = True
                         processed_count += 1
@@ -1536,7 +1546,8 @@ class ScrapingQueue:
      
     def handle_no_results(self, item: Dict[str, Any], queue_manager,
                           filtered_out_results: List[Dict[str, Any]] = None,
-                          raw_result_count: int = 0):
+                          raw_result_count: int = 0,
+                          unavailable_scrapers: Optional[set] = None):
         item_identifier = queue_manager.generate_identifier(item)
         is_upgrade = item.get('upgrading') or item.get('upgrading_from') is not None
 
@@ -1644,7 +1655,10 @@ class ScrapingQueue:
         from scraper.scrape_status import get_unavailable
 
         filtered_out_results = filtered_out_results or []
-        unavailable = sorted(get_unavailable())
+        # Prefer the set accumulated across every scrape of this item; fall back to
+        # the thread-local for callers that did not track one.
+        unavailable = sorted(unavailable_scrapers if unavailable_scrapers is not None
+                             else get_unavailable())
 
         # is_item_old survives only as an input to the ladder's STARTING rung:
         # back-catalogue content does not reappear in 30 minutes, so an old item
