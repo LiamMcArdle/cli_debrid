@@ -883,8 +883,13 @@ class QueueManager:
         # disk into the retry ladder. blacklist_item had an equivalent guard;
         # without it here a Collected row whose upgrade flags were lost would
         # leave the library while its symlink stayed behind.
+        # Deliberately NOT keyed on location_on_disk: the vanished-file cleanup
+        # re-Wants a row while leaving location_on_disk populated, so that field
+        # alone would bounce a file-less item back to Collected forever.
+        # collected_at and filled_by_file are both cleared by that path, so
+        # either one still present means a genuinely collected file.
         if not (item.get('upgrading') or item.get('upgrading_from')):
-            if item.get('collected_at') or item.get('location_on_disk'):
+            if item.get('collected_at') or item.get('filled_by_file'):
                 logging.warning(
                     f"⛔ BLOCKED: {item_identifier} has a collected file on disk "
                     f"(collected_at={item.get('collected_at')}, "
@@ -895,25 +900,62 @@ class QueueManager:
                 return
 
         if hold_rung:
+            # Bound consecutive holds. Holding is right during a genuine
+            # outage, but a permanently unreachable or misconfigured scraper
+            # produces the same signal forever -- without a cap every affected
+            # item cycles Sleeping->Wanted->Scraping at the hold interval
+            # indefinitely and never reaches Dormant. The count lives in the
+            # failure record and resets whenever any other failure stage (or a
+            # successful scrape) overwrites it.
+            import json as _json
+            prev_holds = 0
             try:
-                hold_minutes = int(get_setting("Queue", "retry_unavailable_hold_minutes", 30))
+                prev_record = _json.loads(item.get('last_scrape_failure') or '{}')
+                if prev_record.get('stage') == 'scrape_unavailable':
+                    prev_holds = int(prev_record.get('holds') or 0)
             except (TypeError, ValueError):
-                hold_minutes = 30
-            if hold_minutes <= 0:
-                hold_minutes = 30
+                prev_holds = 0
+            consecutive_holds = prev_holds + 1
             try:
-                current_rung = int(item.get('sleep_cycles') or 0)
+                max_holds = int(get_setting("Queue", "retry_unavailable_max_holds", 8))
             except (TypeError, ValueError):
-                current_rung = 0
-            deadline = datetime.now() + timedelta(minutes=hold_minutes)
-            logging.info(
-                f"Item {item_identifier} could not be scraped (scraper unavailable) in "
-                f"{from_queue}. Holding at rung {current_rung}, retrying at "
-                f"{deadline.isoformat(timespec='seconds')}."
-            )
-            self.move_to_sleeping(item, from_queue, rung=current_rung, next_retry_at=deadline,
-                                  failure_record=failure_record)
-            return
+                max_holds = 8
+            if failure_record is not None:
+                try:
+                    record = _json.loads(failure_record)
+                    record['holds'] = consecutive_holds
+                    failure_record = _json.dumps(record)
+                except (TypeError, ValueError):
+                    pass
+
+            if max_holds > 0 and consecutive_holds > max_holds:
+                logging.warning(
+                    f"Item {item_identifier}: scraper unavailable for "
+                    f"{consecutive_holds} consecutive attempts (cap {max_holds}). "
+                    f"Treating as a real failure and advancing the retry ladder."
+                )
+                # fall through to the normal ladder advance below
+            else:
+                try:
+                    hold_minutes = int(get_setting("Queue", "retry_unavailable_hold_minutes", 30))
+                except (TypeError, ValueError):
+                    hold_minutes = 30
+                if hold_minutes <= 0:
+                    hold_minutes = 30
+                try:
+                    current_rung = int(item.get('sleep_cycles') or 0)
+                except (TypeError, ValueError):
+                    current_rung = 0
+                deadline = datetime.now() + timedelta(minutes=hold_minutes)
+                logging.info(
+                    f"Item {item_identifier} could not be scraped (scraper unavailable) in "
+                    f"{from_queue}. Holding at rung {current_rung} "
+                    f"({consecutive_holds}/{max_holds}), retrying at "
+                    f"{deadline.isoformat(timespec='seconds')}."
+                )
+                self.move_to_sleeping(item, from_queue, rung=current_rung, next_retry_at=deadline,
+                                      failure_record=failure_record)
+                return
 
         ladder = get_ladder(item.get('version'))
         rung = next_rung(item, is_old=is_old)

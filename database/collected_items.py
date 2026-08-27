@@ -1275,6 +1275,8 @@ def _add_collected_items_impl(media_items_batch, recent=False, backfill=False, d
                                             filled_by_magnet = NULL,
                                             filled_by_torrent_id = NULL,
                                             collected_at = NULL,
+                                            location_on_disk = NULL,
+                                            location_basename = NULL,
                                             last_updated = ?,
                                             version = TRIM(version, '*')
                                         WHERE id = ?

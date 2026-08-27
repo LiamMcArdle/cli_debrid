@@ -519,6 +519,12 @@ SETTINGS_SCHEMA = {
             "default": 30,
             "min": 1
         },
+        "retry_unavailable_max_holds": {
+            "type": "integer",
+            "description": "Maximum consecutive rung-holding retries before an unavailable scraper is treated as a real failure and the ladder advances. Prevents a permanently unreachable scraper from re-scraping the whole backlog at the hold interval forever. 0 disables the cap.",
+            "default": 8,
+            "min": 0
+        },
         "dormant_recheck_days": {
             "type": "number",
             "description": "How often a Dormant item is re-scraped. Dormant items are re-checked forever and are never automatically blacklisted.",
