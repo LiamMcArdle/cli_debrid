@@ -27,6 +27,12 @@ class TestEnglishAccessibilityScore(unittest.TestCase):
         self.assertLess(_module.english_accessibility_score(
             ['Hunter x Hunter VOSTFR'])[0], 0)
 
+    def test_portuguese_dub_marker_in_release_order_is_penalized(self):
+        score, reason = _module.english_accessibility_score(
+            ['Hunter X Hunter Dublado Pt-br Completo'])
+        self.assertLess(score, 0)
+        self.assertIn('non-English-only', reason)
+
     def test_english_evidence_wins_over_non_english_tag(self):
         self.assertGreater(_module.english_accessibility_score(
             ['Hunter x Hunter English Subs French Subs'])[0], 0)

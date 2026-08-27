@@ -537,6 +537,48 @@ def get_episode_details(imdb_id: str, season: int, episode: int) -> dict:
     finally:
         conn.close()
 
+
+def get_episode_title_context(
+    imdb_id: str, season: int, episode: int
+) -> Tuple[Optional[str], List[str]]:
+    """Return the target episode title and every other title for the show.
+
+    A filename title is only safe identity evidence when another episode of
+    the same show cannot also claim it.  Fetching both sides in one read keeps
+    that uniqueness check cheap enough to run once per scrape, before the
+    per-alias scraper fan-out.
+    """
+    if not imdb_id or season is None or episode is None:
+        return None, []
+
+    conn = get_db_connection()
+    try:
+        rows = conn.execute('''
+            SELECT season_number, episode_number, episode_title
+            FROM media_items
+            WHERE imdb_id = ?
+              AND type = 'episode'
+              AND episode_title IS NOT NULL
+              AND TRIM(episode_title) != ''
+        ''', (imdb_id,)).fetchall()
+        target_title = None
+        other_titles = []
+        for row in rows:
+            row_title = row['episode_title']
+            if row['season_number'] == season and row['episode_number'] == episode:
+                target_title = row_title
+            else:
+                other_titles.append(row_title)
+        return target_title, other_titles
+    except Exception as e:
+        logging.error(
+            f"Error retrieving episode title context (IMDb ID: {imdb_id}, "
+            f"S{season:02d}E{episode:02d}): {e}"
+        )
+        return None, []
+    finally:
+        conn.close()
+
 def get_imdb_aliases(imdb_id: str) -> List[str]:
     """
     Get all IMDB aliases for a given IMDB ID from the database.

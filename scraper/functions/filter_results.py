@@ -103,7 +103,9 @@ def filter_results(
     original_episode: Optional[int] = None,
     original_season: Optional[int] = None,  # Original TVDB season before XEM remapping
     id_season: Optional[int] = None,        # Coordinate ID-based scrapers were queried at
-    id_episode: Optional[int] = None
+    id_episode: Optional[int] = None,
+    episode_title: Optional[str] = None,
+    other_episode_titles: Optional[List[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
 
     # --- START Logging for season_episode_counts ---
@@ -1350,6 +1352,7 @@ def filter_results(
                     # One shared, pair-atomic identity gate.  The detailed checks
                     # below retain pack/F1 diagnostics, but may no longer rescue a
                     # file that this gate proves belongs to another episode.
+                    identity_confirmed = False
                     if not is_formula_1:
                         parsed_date = parsed_info.get('date')
                         target_coordinates = [(season, episode)]
@@ -1381,6 +1384,8 @@ def filter_results(
                             is_anime=is_anime,
                             target_air_date=target_air_date,
                             file_air_date=parsed_date,
+                            episode_title=episode_title,
+                            other_episode_titles=other_episode_titles,
                             series_title=title,
                         )
                         result['identity_verdict'] = identity_reason
@@ -1391,6 +1396,7 @@ def filter_results(
                                 f"while targeting S{season}E{episode}"
                             )
                             continue
+                        identity_confirmed = True
 
                     # --- Season Check --- 
                     season_match = False
@@ -1423,7 +1429,13 @@ def filter_results(
                             # season_match remains False
                     
                     else: # Original logic for non-Formula 1 content
-                        if season in result_seasons:
+                        # The pair-atomic gate above is the authority.  These
+                        # legacy checks provide diagnostics for unconfirmed
+                        # paths, but cannot veto exact absolute/date/title
+                        # evidence that the gate has already accepted.
+                        if identity_confirmed:
+                            season_match = True
+                        elif season in result_seasons:
                             # Parsed season explicitly matches the target (XEM-mapped) season
                             season_match = True
                         else:
@@ -1499,7 +1511,7 @@ def filter_results(
                     # --- End Pack Checks ---
 
                     # --- Episode Check --- 
-                    episode_match = False
+                    episode_match = identity_confirmed
                     parsed_date_str = None # Initialize parsed date string
                     #logging.debug(f"Inspecting parsed_info for '{original_title}': {parsed_info}") # Log parsed_info
 
@@ -1521,7 +1533,9 @@ def filter_results(
                             parsed_date_str = None # Reset on error
                     # else: parsed_date_str remains None if neither method works
 
-                    if not result_episodes:
+                    if episode_match:
+                        pass
+                    elif not result_episodes:
                         # Case 1: No episode numbers parsed by PTT. Check date or fallback number.
                         comparison_result = "Skipped" # Default if check doesn't run
                         if target_air_date and parsed_date_str:

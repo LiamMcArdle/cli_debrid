@@ -6,7 +6,10 @@ from difflib import SequenceMatcher
 from utilities.settings import get_setting
 import time
 from datetime import datetime, timedelta, timezone
-from database.database_reading import get_movie_runtime, get_episode_runtime, get_episode_count, get_all_season_episode_counts
+from database.database_reading import (
+    get_movie_runtime, get_episode_runtime, get_episode_count,
+    get_all_season_episode_counts, get_episode_title_context,
+)
 from database.database_writing import update_anime_format, update_preferred_alias, get_preferred_alias
 from fuzzywuzzy import fuzz
 import os
@@ -345,6 +348,16 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
     
     xem_applied = False # Flag to track if XEM logic actually modified/confirmed season/episode
     calc_absolute_episode: Optional[int] = None # Will capture arithmetic/API-calculated absolute episode for anime
+
+    # Selected filenames can identify releases whose numbering cannot be
+    # reconciled with provider seasons (notably old anime OVA packs).  Load the
+    # stored episode title plus the show's other titles once so the shared
+    # identity gate can use that evidence without making it ambiguous.
+    target_episode_title = None
+    other_episode_titles = []
+    if content_type.lower() == 'episode':
+        target_episode_title, other_episode_titles = get_episode_title_context(
+            imdb_id, original_season, original_episode)
 
     # NEW: Fetch show's season episode structure for accurate num_items calculation in ranking
     show_season_episode_counts_for_query = {} # Default to empty
@@ -1380,7 +1393,9 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 original_episode=original_episode,
                 original_season=original_season,  # Pass original TVDB season so filter accepts both scene and TVDB-numbered torrents
                 id_season=id_season_map,
-                id_episode=id_episode_map
+                id_episode=id_episode_map,
+                episode_title=target_episode_title,
+                other_episode_titles=other_episode_titles,
             )
             filtered_out_results = [result for result in normalized_results if result not in filtered_results]
             task_timings['filtering'] = time.time() - task_start

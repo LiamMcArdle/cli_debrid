@@ -384,6 +384,20 @@ class TestEpisodeIdentityVerdict(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(reason, _sr.IDENTITY_ABSOLUTE)
 
+    def test_hunter_x_hunter_year_does_not_hide_delimited_absolute_81(self):
+        """PTT returns no episode for this exact live Torrentio filename."""
+        ok, reason = self.verdict(
+            '[Samir755] Hunter X Hunter 1999 -81- An Encounter x Chrollo.mkv',
+            [], [])
+        self.assertTrue(ok)
+        self.assertEqual(reason, _sr.IDENTITY_ABSOLUTE)
+
+    def test_delimited_in_season_number_is_not_an_absolute_match(self):
+        ok, reason = self.verdict(
+            '[VEGETA] Hunter X Hunter (1999) - 03 - Wrong Episode.mkv', [], [])
+        self.assertFalse(ok)
+        self.assertEqual(reason, _sr.IDENTITY_MISSING)
+
     def test_s01e_absolute_notation_is_accepted_for_later_anime_season(self):
         ok, reason = self.verdict(
             '[Judas] Hunter x Hunter (2011) - S01E112.mkv',

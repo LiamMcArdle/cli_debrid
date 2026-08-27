@@ -262,6 +262,26 @@ _EXPLICIT_ANIME_SEASON_RE = re.compile(
     re.IGNORECASE,
 )
 
+# PTT deliberately ignores a bare anime number when a release also contains a
+# year (the observed ``Hunter x Hunter 1999 -81- ...`` filename parses no
+# episode at all).  A number bracketed by release separators is still strong
+# filename evidence, provided it is only used by the anime absolute-number
+# check below.  Requiring separators on both sides avoids treating years,
+# resolutions, hashes, or ordinary title digits as episodes.
+_DELIMITED_ANIME_NUMBER_RE = re.compile(
+    r'(?<![A-Za-z0-9])[-–—]\s*(?P<episode>\d{1,4})\s*[-–—](?![A-Za-z0-9])'
+)
+
+
+def delimited_anime_numbers(text: Optional[str]) -> List[int]:
+    """Return bare anime numbers written as ``- 81 -`` or ``-81-``."""
+    found = []
+    for match in _DELIMITED_ANIME_NUMBER_RE.finditer(text or ''):
+        number = int(match.group('episode'))
+        if number not in found:
+            found.append(number)
+    return found
+
 
 def explicit_coordinates(text: Optional[str]) -> List[Tuple[int, int]]:
     """Return complete S/E claims written by a filename.
@@ -328,6 +348,10 @@ def episode_identity_verdict(
         return False, IDENTITY_EXPLICIT_CONFLICT
 
     numbers = [n for n in (file_numbers or []) if isinstance(n, int)]
+    if is_anime:
+        for number in delimited_anime_numbers(filename):
+            if number not in numbers:
+                numbers.append(number)
     seasons = [s for s in (file_seasons or []) if isinstance(s, int)]
 
     for target_season, target_episode in coordinates:

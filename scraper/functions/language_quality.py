@@ -14,7 +14,9 @@ _ENGLISH_AUDIO = re.compile(
 _NON_ENGLISH_ONLY = re.compile(
     r'(?<![a-z])vostfr(?![a-z])|'
     r'(?<![a-z])(?:french|rus|russian|spa|spanish|latino|german|ger|'
-    r'italian|ita|portuguese|por|pt[ ._-]*br)[ ._-]*(?:sub|subs|dub|dubbed)(?![a-z])',
+    r'italian|ita|portuguese|por|pt[ ._-]*br)[ ._-]*(?:sub|subs|dub|dubbed|dublado)(?![a-z])|'
+    r'(?<![a-z])(?:dub|dubbed|dublado)[ ._-]*(?:french|rus|russian|spa|spanish|latino|'
+    r'german|ger|italian|ita|portuguese|por|pt[ ._-]*br)(?![a-z])',
     re.I,
 )
 

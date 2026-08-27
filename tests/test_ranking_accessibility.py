@@ -56,6 +56,17 @@ class TestRankingAccessibility(unittest.TestCase):
         unknown = self.result('', 'Test Movie.mkv')
         self.assertLess(self.score(non_english), self.score(unknown))
 
+    def test_multi_subs_beat_portuguese_dub_from_live_canary(self):
+        multi_subs = self.result(
+            'DVD 576p Multi Subs',
+            'Hunter X Hunter 1999 -81- An Encounter.mkv',
+        )
+        portuguese_dub = self.result(
+            'Dublado Pt-br Completo',
+            'Hunter X Hunter Dublado Pt-br.mkv',
+        )
+        self.assertGreater(self.score(multi_subs), self.score(portuguese_dub))
+
 
 if __name__ == '__main__':
     unittest.main()

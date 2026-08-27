@@ -930,7 +930,7 @@ class TestFilterResultsAnimeXEM(unittest.TestCase):
         r['id_based_scraper'] = id_based
         return r
 
-    def _filter_with_coords(self, results, stored, resolved):
+    def _filter_with_coords(self, results, stored, resolved, **extra):
         """Filter at the stored coordinate, with the resolved pair supplied for
         ID-based results only."""
         return filter_results(
@@ -951,7 +951,8 @@ class TestFilterResultsAnimeXEM(unittest.TestCase):
             imdb_id=self.imdb_id,
             direct_api=self.mock_direct_api,
             id_season=resolved[0],
-            id_episode=resolved[1]
+            id_episode=resolved[1],
+            **extra,
         )[0]
 
     def test_coordinate_applies_per_result_not_per_batch(self):
@@ -1014,6 +1015,40 @@ class TestFilterResultsAnimeXEM(unittest.TestCase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(kept[0].get('identity_filename'),
                          "Test Anime - 81 - An Encounter in the Dark.mkv")
+
+    def test_live_style_id_filename_with_year_uses_absolute_number(self):
+        result = self._coord_result(
+            "Test Anime 1999 Complete DVD 576p Multi Subs", [1], [38],
+            id_based=True)
+        result['additional_metadata']['filename'] = (
+            "[Samir755] Test Anime 1999 -81- An Encounter in the Dark.mkv")
+        result['match_coordinate'] = {
+            'season': 4, 'episode': 3, 'provenance': 'stored',
+            'scraper_mode': 'id',
+        }
+        result['target_abs_episode'] = 81
+
+        kept = self._filter_with_coords([result], (4, 3), (4, 3))
+        self.assertEqual(len(kept), 1)
+
+    def test_selected_episode_title_keeps_unreconciled_ova_option(self):
+        result = self._coord_result(
+            "Test Anime Greed Island Final OVA", [], [], id_based=True)
+        result['additional_metadata']['filename'] = (
+            "Test Anime Greed Island Final - 03 - "
+            "An Encounter x Kuroro x The Gold Dust Girl.mkv")
+        result['match_coordinate'] = {
+            'season': 4, 'episode': 3, 'provenance': 'stored',
+            'scraper_mode': 'id',
+        }
+        result['target_abs_episode'] = 81
+
+        kept = self._filter_with_coords(
+            [result], (4, 3), (4, 3),
+            episode_title='An Encounter x Kuroro x The Gold Dust Girl',
+            other_episode_titles=['Masadra x Big Strides x Mad Bomber'],
+        )
+        self.assertEqual(len(kept), 1)
 
     def test_id_pack_rejects_wrong_selected_filename(self):
         """The observed HxH failure selected episode 03 for absolute 81."""
