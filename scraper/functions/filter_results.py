@@ -1404,10 +1404,16 @@ def filter_results(
                     if not is_formula_1:
                         parsed_date = parsed_info.get('date')
                         target_coordinates = [(season, episode)]
-                        # Legacy queued results had only a batch-wide XEM field.
-                        # Preserve their old legitimate alternative as a COMPLETE
-                        # pair, never as separate season/episode fallbacks.
-                        if not match_coordinate and original_season is not None \
+                        # A scene-remapped scrape asks in scene numbering, but
+                        # releases named in original TVDB numbering are just as
+                        # legitimate.  Offer the original pair as a COMPLETE
+                        # alternative coordinate, never as separate season /
+                        # episode fallbacks.  This must not be gated on
+                        # match_coordinate: scraper.py stamps that on every
+                        # live result, which previously made this fallback dead
+                        # and rejected every TVDB-numbered release for
+                        # XEM-mapped shows as an explicit conflict.
+                        if original_season is not None \
                                 and original_episode is not None \
                                 and (original_season, original_episode) != (season, episode):
                             target_coordinates.append((original_season, original_episode))
