@@ -1232,9 +1232,6 @@ def get_media_item_presence_overall(imdb_id: str | None = None, tmdb_id: str | N
         if 'Collected' in states:
             return 'Collected' if len(states) == 1 else 'Partial'
 
-        if 'Dormant' in states and len(states) == 1:
-            return 'Dormant'
-
         for preferred in ('Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping',
                           'Dormant', 'Unreleased'):
             if preferred in states:

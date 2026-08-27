@@ -345,7 +345,10 @@ QUEUE_DISPLAY_COLUMNS = [
     'id', 'imdb_id', 'tmdb_id', 'title', 'year', 'type', 'state', 'version',
     'season_number', 'episode_number', 'release_date', 'physical_release_date',
     'airtime', 'content_source', 'content_source_detail', 'filled_by_file', 'filled_by_torrent_id',
-    'wake_count', 'sleep_cycles', 'next_retry_at', 'last_scrape_failure',
+    # last_scrape_failure is deliberately absent: this list only feeds
+    # DB_FETCH_QUEUES (Wanted, Final_Check), neither of which renders it, and the
+    # column holds up to 2000 chars per row that would be re-streamed every tick.
+    'wake_count', 'sleep_cycles', 'next_retry_at',
     'collected_at', 'last_updated', 'final_check_add_timestamp',
     'force_priority', 'ghostlisted'
 ]

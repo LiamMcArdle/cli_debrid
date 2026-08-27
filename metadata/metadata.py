@@ -1613,8 +1613,12 @@ def _source_allows_specials(item_from_input_list) -> bool:
     if not content_source_id:
         return False
     try:
-        from queues.config_manager import load_config
-        cs_config = load_config().get('Content Sources', {}).get(content_source_id, {})
+        # get_setting('Content Sources') is the codebase's accessor for this
+        # section. queues.config_manager.load_config() additionally runs a
+        # content-source auto-fix that can REWRITE config.json, which has no place
+        # in a per-item loop over a metadata batch.
+        from utilities.settings import get_setting as _get_setting
+        cs_config = (_get_setting('Content Sources') or {}).get(content_source_id, {})
         if isinstance(cs_config, dict):
             return bool(cs_config.get('allow_specials', False))
     except Exception as e:
