@@ -180,13 +180,12 @@ def filter_results(
     # If it's not anime, apply dynamic threshold for short titles.
     similarity_threshold = base_similarity_threshold
     query_title_len = len(normalized_query_title)
-    # Ceiling on the short-title escalation below. The scoring path cannot
-    # produce 1.0 for a short title: a torrent title longer than 3x the query
-    # takes a 0.9 penalty on the token-set component, which is then blended
-    # 0.3/0.7, capping the achievable score at 0.97 — so a threshold of 1.0
-    # rejected 100% of results with no possible remedy. The acronym rescue is
-    # itself capped at 0.95, which makes 0.95 the highest defensible value.
-    SHORT_TITLE_THRESHOLD_CEILING = 0.95
+    # No escalation below may exceed 0.95. The scoring path cannot produce 1.0 for
+    # a short title: a torrent title longer than 3x the query takes a 0.9 penalty
+    # on the token-set component, which is then blended 0.3/0.7, capping the
+    # achievable score at 0.97 — so the old threshold of 1.0 rejected 100% of
+    # results with no possible remedy. The acronym rescue is itself capped at 0.95,
+    # which makes 0.95 the highest defensible value.
     if not is_anime: # Only apply dynamic scaling if not anime (UFC check is per-result)
         if query_title_len == 0:
             # Length 0 means normalization destroyed the title (a wholly
@@ -199,9 +198,6 @@ def filter_results(
             similarity_threshold = 0.90
         elif query_title_len < 10:
             similarity_threshold = 0.85
-        # Never escalate above what the scorer can actually reach.
-        similarity_threshold = min(similarity_threshold, SHORT_TITLE_THRESHOLD_CEILING) \
-            if similarity_threshold > base_similarity_threshold else similarity_threshold
         # If query_title_len >= 10, it uses the base_similarity_threshold (e.g., 0.8)
         # or the anime threshold if is_anime was true.
 

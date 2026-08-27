@@ -14,7 +14,8 @@ from scraper.functions.anime_utils import detect_absolute_numbering
 from scraper.functions.season_resolution import (
     season_verdict, container_season_from_path, log_verdict,
     episode_title_verdict, episode_title_is_usable)
-from scraper.functions.similarity_checks import title_verdict, MIN_TITLE_MATCH
+from scraper.functions.similarity_checks import (
+    title_verdict, title_is_asserted, MIN_TITLE_MATCH)
 
 # Words by which a release states it IS a special rather than a numbered
 # episode. Used only for season 0, where a bare number is not evidence.
@@ -831,11 +832,24 @@ class MediaMatcher:
             # own name matches this item, and fall back to size only if nothing
             # names it - a file that asserts no title is still better than a file
             # that asserts a different one.
-            if len(video_files) > 1:
+            # None from _official_titles_cached means 'no verdict possible' (the
+            # alias lookup failed, or this is anime with no alias record), which
+            # everywhere else means DO NOT judge. Falling back to the stored title
+            # alone there is exactly the case documented as unsafe, so skip the
+            # naming preference entirely and let size decide.
+            official_titles = self._official_titles_cached(item)
+            if len(video_files) > 1 and official_titles:
                 named = []
                 for pf in video_files:
                     cand = (pf.get('parsed_info') or {}).get('title') or ''
-                    ok, score, _ = title_verdict(cand, self._official_titles_cached(item) or [item.get('title')])
+                    # A file that asserts no title cannot be used to pick between
+                    # films: title_verdict fails open at 1.0 for those, which would
+                    # sort every bare-numbered file ('01.mkv') above the file that
+                    # actually names this item and silently reinstate the
+                    # largest-file bug this block exists to fix.
+                    if not title_is_asserted(cand):
+                        continue
+                    ok, score, _ = title_verdict(cand, official_titles)
                     if ok and score >= MIN_TITLE_MATCH:
                         named.append((score, pf.get('bytes', 0), pf))
                 if named:

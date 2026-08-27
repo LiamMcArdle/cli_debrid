@@ -201,6 +201,18 @@ def normalize_title(title: str) -> str:
 MIN_TITLE_MATCH = 0.60
 
 
+def title_is_asserted(candidate_title: str) -> bool:
+    """Whether a candidate name says anything about WHICH show it belongs to.
+
+    Fewer than four letters is a bare number or a tag ('03', 'v2', 'ep'), which
+    asserts nothing -- files inside season packs are routinely named that way.
+    ``title_verdict`` fails open on these, so any caller that RANKS by the score
+    it returns must exclude them first, or an unnamed file scores a perfect 1.0
+    and outranks the file that actually names the item.
+    """
+    return len(re.sub(r'[^a-z]', '', normalize_title(candidate_title or ''))) >= 4
+
+
 def title_verdict(candidate_title: str, official_titles: List[str],
                   threshold: float = MIN_TITLE_MATCH) -> Tuple[bool, float, str]:
     """Does `candidate_title` name one of `official_titles`?
@@ -232,10 +244,7 @@ def title_verdict(candidate_title: str, official_titles: List[str],
     tokens a candidate adds, which is the information this function lacks.
     """
     normalized_candidate = normalize_title(candidate_title or '')
-    # Fewer than four letters is a bare number or a tag ('03', 'v2', 'ep'), which
-    # asserts nothing about which show a file belongs to. Files inside season
-    # packs are routinely named that way.
-    if len(re.sub(r'[^a-z]', '', normalized_candidate)) < 4:
+    if not title_is_asserted(candidate_title):
         return True, 1.0, 'no title asserted'
 
     names = [n for n in (normalize_title(t) for t in official_titles if t) if n]
