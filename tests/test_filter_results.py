@@ -1060,6 +1060,34 @@ class TestFilterResultsAnimeXEM(unittest.TestCase):
             [result], (4, 3), (4, 3), max_absolute_episode=92)
         self.assertEqual(kept, [])
 
+    def test_explicit_portuguese_only_dub_conflicts_with_japanese_profile(self):
+        result = self._coord_result(
+            "Test Anime Dublado Pt-br Completo 01-92", [1],
+            list(range(1, 93)), id_based=True)
+        result['parsed_info']['languages'] = ['pt']
+        result['parsed_info']['dubbed'] = True
+        result['additional_metadata']['filename'] = "Test Anime - 81.mkv"
+        result['target_abs_episode'] = 81
+
+        kept = self._filter_with_coords(
+            [result], (4, 3), (4, 3), preferred_language='ja',
+            max_absolute_episode=92)
+        self.assertEqual(kept, [])
+
+    def test_explicit_dual_audio_remains_eligible(self):
+        result = self._coord_result(
+            "Test Anime Dual Audio Complete 01-92", [1],
+            list(range(1, 93)), id_based=True)
+        result['parsed_info']['languages'] = ['en']
+        result['parsed_info']['dubbed'] = True
+        result['additional_metadata']['filename'] = "Test Anime - 81.mkv"
+        result['target_abs_episode'] = 81
+
+        kept = self._filter_with_coords(
+            [result], (4, 3), (4, 3), preferred_language='ja',
+            max_absolute_episode=92)
+        self.assertEqual(len(kept), 1)
+
     def test_id_pack_rejects_wrong_selected_filename(self):
         """The observed HxH failure selected episode 03 for absolute 81."""
         result = self._coord_result(

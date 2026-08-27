@@ -274,6 +274,53 @@ def filter_results(
                 result['filter_reason'] = "Missing parsed info"
                 logging.info(f"Rejected: Missing parsed info for '{original_title}' (Size: {result['size']:.2f}GB)")
                 continue
+
+            # A declared single-language dub that conflicts with the version's
+            # configured language is not a quality fallback; it is inaccessible
+            # content.  Keep unknown-language releases eligible (most fansubs do
+            # not tag audio at all), and keep explicit dual/multi-audio releases
+            # because they may contain the preferred track even when PTT only
+            # recognizes one language token.
+            parsed_languages = parsed_info.get('languages') or []
+            if isinstance(parsed_languages, str):
+                parsed_languages = [parsed_languages]
+            parsed_languages = {
+                str(language).strip().lower()
+                for language in parsed_languages if language
+            }
+            preferred_language_code = (
+                str(preferred_language).strip().lower()
+                if preferred_language else None
+            )
+            audio_evidence = ' '.join(
+                str(value) for value in (original_title, filename) if value
+            )
+            explicit_multi_audio = (
+                len(parsed_languages) > 1
+                or 'multi' in parsed_languages
+                or bool(re.search(
+                    r'(?<![a-z])(?:dual|multi)[ ._-]*audio(?![a-z])',
+                    audio_evidence,
+                    re.IGNORECASE,
+                ))
+            )
+            if (
+                preferred_language_code
+                and parsed_info.get('dubbed') is True
+                and parsed_languages
+                and preferred_language_code not in parsed_languages
+                and not explicit_multi_audio
+            ):
+                result['filter_reason'] = (
+                    "Explicit single-language dub conflicts with preferred "
+                    f"language {preferred_language_code}: "
+                    f"{sorted(parsed_languages)}"
+                )
+                logging.info(
+                    f"Rejected: {result['filter_reason']} for "
+                    f"'{original_title}' (Size: {result['size']:.2f}GB)"
+                )
+                continue
             
             # DEBUG: Add detailed logging for Frasier-like cases to see what PTT parsed
             if "frasier" in original_title.lower() or "1993" in original_title or "2004" in original_title:
