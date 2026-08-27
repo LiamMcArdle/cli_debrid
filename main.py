@@ -1,6 +1,13 @@
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from setproctitle import setproctitle
+    setproctitle('cli_debrid')
+except ImportError:
+    pass
+
 import appdirs
 import threading
 import time
@@ -82,8 +89,6 @@ from logging_config import stop_global_profiling, start_global_profiling
 import babelfish
 
 # Global variables
-metadata_process = None
-metadata_lock = threading.Lock()
 global_program_runner_instance = None
 
 def get_babelfish_data_dir():
@@ -467,10 +472,16 @@ def backup_database(skip_if_recent=False, skip_hours=6):
         removed_count = 0
         for old_backup in backups_to_remove:
             try:
-                os.remove(old_backup)
-                removed_count += 1
-                backup_age = get_backup_age_category(old_backup) if old_backup not in invalid_backups else 'invalid'
-                logging.info(f"[BACKUP] Removed {backup_age} backup: {os.path.basename(old_backup)}")
+                if os.path.exists(old_backup):
+                    os.remove(old_backup)
+                    removed_count += 1
+                    backup_age = get_backup_age_category(old_backup) if old_backup not in invalid_backups else 'invalid'
+                    logging.info(f"[BACKUP] Removed {backup_age} backup: {os.path.basename(old_backup)}")
+                else:
+                    logging.debug(f"[BACKUP] Backup already removed: {os.path.basename(old_backup)}")
+            except FileNotFoundError:
+                # File was removed between exists check and remove call (race condition)
+                logging.debug(f"[BACKUP] Backup already removed (race condition): {os.path.basename(old_backup)}")
             except Exception as e:
                 logging.warning(f"[BACKUP] Failed to remove backup {old_backup}: {e}")
 
@@ -498,6 +509,64 @@ def backup_database(skip_if_recent=False, skip_hours=6):
     except Exception as e:
         logging.error(f"[BACKUP] Error creating database backup: {str(e)}")
         return False
+
+
+def backup_climount_databases():
+    """
+    Back up cli_mount's HYBR database files (entries.db, items.db) if data_path is configured.
+    Stores backups in {data_path}/db/backups/ using the same tiered retention as CLI backups.
+    Returns True if successful or skipped (not configured), False on error.
+    """
+    try:
+        from utilities.settings import get_setting
+        data_path = get_setting('Usenet Provider', 'data_path', '').strip()
+        if not data_path:
+            return True  # Not configured — skip silently
+
+        db_dir = os.path.join(data_path, 'db')
+        if not os.path.isdir(db_dir):
+            logging.debug(f"[DCY_BACKUP] cli_mount db dir not found: {db_dir}, skipping")
+            return True
+
+        backup_dir = os.path.join(db_dir, 'backups')
+        os.makedirs(backup_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backed_up = []
+
+        for db_name in ('entries.db', 'items.db'):
+            src = os.path.join(db_dir, db_name)
+            if not os.path.exists(src):
+                continue
+            dst = os.path.join(backup_dir, f'{os.path.splitext(db_name)[0]}_{timestamp}.db')
+            import shutil as _shutil
+            _shutil.copy2(src, dst)
+            size_mb = os.path.getsize(dst) / (1024 * 1024)
+            logging.info(f"[DCY_BACKUP] Backed up {db_name} → {os.path.basename(dst)} ({size_mb:.1f} MB)")
+            backed_up.append((db_name, dst))
+
+            # Tiered retention: keep 4 backups per file
+            prefix = os.path.splitext(db_name)[0] + '_'
+            existing = sorted(
+                [os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
+                 if f.startswith(prefix) and f.endswith('.db')],
+                key=os.path.getmtime, reverse=True
+            )
+            for old in existing[4:]:
+                try:
+                    os.remove(old)
+                    logging.info(f"[DCY_BACKUP] Removed old backup: {os.path.basename(old)}")
+                except Exception as e:
+                    logging.warning(f"[DCY_BACKUP] Could not remove old backup {old}: {e}")
+
+        if backed_up:
+            logging.info(f"[DCY_BACKUP] cli_mount backup complete: {len(backed_up)} file(s)")
+        return True
+
+    except Exception as e:
+        logging.error(f"[DCY_BACKUP] Error backing up cli_mount databases: {e}")
+        return False
+
 
 def get_version():
     try:
@@ -734,18 +803,6 @@ def setup_tray_icon():
             program_runner_instance.stop()
             print("Main program stopped.")
 
-        # Terminate the metadata battery process
-        global metadata_process # Keep metadata_process global for now
-        with metadata_lock:
-            if metadata_process and metadata_process.poll() is None:
-                print("Stopping metadata battery...")
-                metadata_process.terminate()
-                try:
-                    metadata_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    metadata_process.kill()
-                print("Metadata battery stopped.")
-
         # Terminate any running phalanx_db_hyperswarm processes
         try:
             # Find any node/npm processes running phalanx_db_hyperswarm
@@ -885,25 +942,12 @@ def stop_program(from_signal=False):
     # Access ProgramRunner singleton directly
     from queues.run_program import ProgramRunner
     program_runner_instance = ProgramRunner() # Get singleton instance
-    # Keep metadata_process global for now
-    global metadata_process 
     print("\nStopping the program...")
 
     # Stop the main program runner using the instance
     if program_runner_instance and program_runner_instance.is_running():
         program_runner_instance.stop()
         print("Main program stopped.")
-
-    # Terminate the metadata battery process
-    with metadata_lock:
-        if metadata_process and metadata_process.poll() is None:
-            print("Stopping metadata battery...")
-            metadata_process.terminate()
-            try:
-                metadata_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                metadata_process.kill()
-            print("Metadata battery stopped.")
 
     # Find and terminate all related processes
     try:
@@ -1607,10 +1651,6 @@ def migrate_theatrical_release_dates():
     logging.info("Theatrical release date migration started in background thread.")
 
 def main():
-    # Remove global program_runner from here as well
-    global metadata_process 
-    metadata_process = None 
-
     logging.info("Starting the program...")
 
     # --- START EDIT: Import flask_app and _execute_start_program here ---
@@ -1627,18 +1667,6 @@ def main():
     setup_directories()
     backup_config()
     backup_database(skip_if_recent=True, skip_hours=6)  # Skip if backup exists from last 6 hours
-    
-    # Delete not wanted files on startup
-    try:
-        db_content_dir = os.environ.get('USER_DB_CONTENT', '/user/db_content')
-        not_wanted_files = ['not_wanted_magnets.pkl', 'not_wanted_urls.pkl']
-        for not_wanted_file in not_wanted_files:
-            file_path = os.path.join(db_content_dir, not_wanted_file)
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                logging.info(f"Deleted not wanted file on startup: {file_path}")
-    except Exception as e:
-        logging.warning(f"Could not delete not wanted files on startup: {str(e)}")
     
     # Purge content source cache files on startup
     # try:
@@ -1699,6 +1727,16 @@ def main():
         logging.info("Download stats cache initialized successfully")
     except Exception as e:
         logging.error(f"Error during statistics summary/cache initialization: {e}")
+
+    # Generate collection poster previews in background (non-blocking)
+    try:
+        import threading as _threading
+        from database.collection_poster_renderer import generate_preview_images as _gen_previews
+        _t = _threading.Thread(target=_gen_previews, daemon=True, name='poster-preview-gen')
+        _t.start()
+        logging.info("Collection poster preview generation started in background.")
+    except Exception as _e:
+        logging.warning(f"Could not start poster preview generation: {_e}")
 
     from utilities.settings import ensure_settings_file, get_setting, set_setting
     # from database import verify_database # No longer needed here
@@ -1761,6 +1799,12 @@ def main():
         if updated:
             save_config(config)
             logging.info("Saved config after setting default monitor_mode for Collected content sources.")
+
+    # --- MIGRATION: Remove spurious hyphenated filter keys and stale scraper keys from version configs ---
+    from routes.settings_routes import migrate_clean_version_filter_keys, migrate_clean_stale_scraper_keys_from_versions
+    migrate_clean_version_filter_keys()
+    migrate_clean_stale_scraper_keys_from_versions()
+    # --- End migration ---
 
     # Batch set deprecated settings
     set_setting('Debug', 'skip_initial_plex_update', False)
@@ -2262,15 +2306,6 @@ def main():
         set_setting('Scraping', 'upgrading_percentage_threshold', '0.1')
         logging.info("Set blank upgrading_percentage_threshold to default value of 0.1")
 
-    import os
-    # Get battery port from environment variable
-    battery_port = int(os.environ.get('CLI_DEBRID_BATTERY_PORT', '5001'))
-    battery_host = os.environ.get('CLI_DEBRID_BATTERY_HOST', 'localhost')
-    
-    # Set metadata battery URL with the correct port
-    set_setting('Metadata Battery', 'url', f'http://{battery_host}:{battery_port}')
-    logging.info(f"Set metadata battery URL to http://{battery_host}:{battery_port}")
-
     ensure_settings_file()
     # verify_database() # No longer needed here
     validate_not_wanted_entries()
@@ -2332,13 +2367,7 @@ def main():
         tray_thread.daemon = True
         tray_thread.start()
 
-    # Run the metadata battery only on Windows
-    is_windows = platform.system() == 'Windows'
-    if is_windows:
-        # Start the metadata battery
-        print("Running on Windows. Starting metadata battery...")
-    else:
-        print("Running on a non-Windows system. Metadata battery will not be started.")
+    # Metadata battery is now in-process (no separate process needed)
 
     # Always print this message
     print("Running in console mode.")

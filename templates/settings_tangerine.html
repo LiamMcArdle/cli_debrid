@@ -3,7 +3,8 @@
 {% block title %}Settings{% endblock %}
 
 {% block content %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tangerine/tangerine_settings.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tangerine/tangerine_settings.css') }}?v=34">
+<style>body { font-family: 'Inter', sans-serif !important; }</style>
 
 <!-- Mobile Menu Toggle Button -->
 <button class="settings-mobile-menu-toggle" id="settingsMobileMenuToggle" aria-label="Toggle settings menu">
@@ -19,17 +20,20 @@
         <div class="settings-sidebar-header">
             <h1 class="settings-sidebar-title">Settings</h1>
             <p class="settings-sidebar-subtitle">Configure your application</p>
+        </div>
 
-            <!-- Settings Search Bar -->
-            <div class="settings-search-container">
-                <label for="settingsSearch" class="sr-only">Search Settings</label>
-                <input type="text" id="settingsSearch" name="settings_search" class="settings-search-input" placeholder="Search settings..." autocomplete="off">
-                <button type="button" id="clearSearch" class="settings-search-clear" style="display: none;">
-                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
-                    </svg>
-                </button>
-            </div>
+        <!-- Settings Search Bar -->
+        <div class="settings-search-container">
+            <svg class="settings-search-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <circle cx="11" cy="11" r="8"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35"/>
+            </svg>
+            <label for="settingsSearch" class="sr-only">Search Settings</label>
+            <input type="text" id="settingsSearch" name="settings_search" class="settings-search-input" placeholder="Search settings..." autocomplete="off">
+            <button type="button" id="clearSearch" class="settings-search-clear" style="display: none;">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
         </div>
 
         <nav>
@@ -101,12 +105,13 @@
                     </svg>
                     Reverse Parser
                 </div> -->
-                <div class="settings-nav-item" data-tab="true-debug">
+                <!-- true-debug tab hidden: merged into Advanced Settings -->
+                <!-- <div class="settings-nav-item" data-tab="true-debug">
                     <svg class="settings-nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/>
                     </svg>
                     Debug
-                </div>
+                </div> -->
                 {% endif %}
             </div>
         </nav>
@@ -244,9 +249,9 @@
 </div>
 
 <script src="{{ url_for('static', filename='js/loading.js') }}"></script>
-<script type="module" src="{{ url_for('static', filename='js/settings.js') }}"></script>
+<script type="module" src="/static/js/settings.js?v=1778267907"></script>
 <script type="module">
-    import { updateSettings } from '/static/js/settings.js';
+    import { updateSettings } from '/static/js/settings.js?v=1778267907';
     import { showPopup, POPUP_TYPES } from '/static/js/notifications.js';
 
     // Make POPUP_TYPES available globally for other scripts
@@ -537,18 +542,21 @@
         const lowerQuery = query.toLowerCase();
         const tabContents = document.querySelectorAll('.settings-tab-content');
 
+        // Always reset first to clear any previous search state
+        removeSearchHighlights();
+
         if (!query) {
-            // Reset: hide all search highlights and show normal view
-            removeSearchHighlights();
             return;
         }
 
         let totalMatches = 0;
         const matchesByTab = {};
 
-        // Search through all tabs
+        // Search through all tabs (skip true-debug — it's merged into Advanced Settings
+        // and inaccessible via the nav, so its matches would duplicate the debug tab count)
         tabContents.forEach(tabContent => {
             const tabId = tabContent.id;
+            if (tabId === 'true-debug') return;
             const sections = tabContent.querySelectorAll('.settings-section');
             let tabMatches = 0;
 
@@ -666,13 +674,25 @@
                 'debug': 'Advanced Settings',
                 'notifications': 'Notifications',
                 'reverse-parser': 'Reverse Parser',
-                'true-debug': 'Debug'
+                'true-debug': 'Advanced Settings'
             };
 
-            let tabsList = Object.entries(matchesByTab)
-                .map(([tabId, count]) => {
-                    const tabName = tabDisplayNames[tabId] || tabId.charAt(0).toUpperCase() + tabId.slice(1).replace(/-/g, ' ');
-                    return `<span class="search-tab-match" data-tab="${tabId}">${tabName} (${count})</span>`;
+            // Merge counts for tabs that share the same display name (debug + true-debug → Advanced Settings)
+            const mergedMatches = {};
+            const mergedTabId = {};  // display name → first tab id (for navigation)
+            Object.entries(matchesByTab).forEach(([tabId, count]) => {
+                const name = tabDisplayNames[tabId] || tabId.charAt(0).toUpperCase() + tabId.slice(1).replace(/-/g, ' ');
+                if (mergedMatches[name] === undefined) {
+                    mergedMatches[name] = 0;
+                    mergedTabId[name] = tabId;
+                }
+                mergedMatches[name] += count;
+            });
+
+            let tabsList = Object.entries(mergedMatches)
+                .map(([name, count]) => {
+                    const tabId = mergedTabId[name];
+                    return `<span class="search-tab-match" data-tab="${tabId}">${name} (${count})</span>`;
                 })
                 .join('');
 

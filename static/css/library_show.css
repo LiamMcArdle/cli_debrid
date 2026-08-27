@@ -231,8 +231,14 @@
     justify-content: space-between;
 }
 
+.season-action-buttons {
+    display: inline-flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
 button.btn.btn-sm.btn-danger.delete-season-btn {
-    margin: 0px 0px 10px 0px;
     display: inline-flex;
     align-items: center;
     gap: 0.375rem;
@@ -244,6 +250,49 @@ button.btn.btn-sm.btn-danger.delete-season-btn {
     cursor: pointer;
     transition: all 0.2s ease;
     font-size: 0.875rem;
+}
+
+button.btn.btn-sm.replace-season-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    border-radius: 0.375rem;
+    background: rgba(59, 130, 246, 0.15);
+    color: #ffffff;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-size: 0.875rem;
+}
+
+button.btn.btn-sm.replace-season-btn:hover {
+    background: rgba(59, 130, 246, 0.3);
+    border-color: rgba(59, 130, 246, 0.5);
+    transform: translateY(-1px);
+}
+
+button.btn.btn-sm.replace-season-btn.replace-season-pending {
+    border-color: rgba(234, 179, 8, 0.4);
+    background: rgba(234, 179, 8, 0.15);
+}
+
+button.btn.btn-sm.replace-season-btn.replace-season-pending:hover {
+    background: rgba(234, 179, 8, 0.25);
+    border-color: rgba(234, 179, 8, 0.6);
+}
+
+.replace-pending-badge {
+    display: inline-block;
+    margin-left: 0.75rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 9999px;
+    background: rgba(234, 179, 8, 0.2);
+    border: 1px solid rgba(234, 179, 8, 0.4);
+    color: rgba(234, 179, 8, 0.9);
+    font-size: 0.75rem;
+    font-weight: 500;
+    vertical-align: middle;
 }
 
 .action-btn {
@@ -717,6 +766,57 @@ button.btn.btn-sm.btn-danger.delete-season-btn {
     transition: width 0.3s ease;
 }
 
+/* Phantom Season Tab Styling */
+.season-tab.phantom-season-tab {
+    opacity: 0.7;
+    background: repeating-linear-gradient(
+        45deg,
+        rgba(50, 50, 50, 0.6),
+        rgba(50, 50, 50, 0.6) 10px,
+        rgba(30, 30, 30, 0.6) 10px,
+        rgba(30, 30, 30, 0.6) 20px
+    );
+    border-left: 3px dashed rgba(239, 68, 68, 0.5);
+}
+
+.season-tab.phantom-season-tab:hover {
+    opacity: 0.75;
+    background: repeating-linear-gradient(
+        45deg,
+        rgba(29, 35, 42, 0.5),
+        rgba(29, 35, 42, 0.5) 10px,
+        rgba(15, 19, 25, 0.5) 10px,
+        rgba(15, 19, 25, 0.5) 20px
+    );
+    border-left: 3px dashed rgba(239, 68, 68, 0.7);
+}
+
+.season-tab.phantom-season-tab.active {
+    opacity: 0.8;
+    background: repeating-linear-gradient(
+        45deg,
+        rgba(29, 35, 42, 0.6),
+        rgba(29, 35, 42, 0.6) 10px,
+        rgba(15, 19, 25, 0.6) 10px,
+        rgba(15, 19, 25, 0.6) 20px
+    );
+    border-left: 3px dashed rgba(239, 68, 68, 0.8);
+}
+
+.season-tab.phantom-season-tab .season-tab-title {
+    color: rgba(255, 255, 255, 0.4);
+    font-style: italic;
+}
+
+.season-tab.phantom-season-tab.active .season-tab-title {
+    color: rgba(255, 255, 255, 0.6);
+}
+
+.season-tab.phantom-season-tab .season-tab-stats {
+    color: rgba(255, 255, 255, 0.3);
+    font-style: italic;
+}
+
 /* ==========================================================================
    Season Panels (Tab Content)
    ========================================================================== */
@@ -879,6 +979,18 @@ button.btn.btn-sm.btn-danger.delete-season-btn {
 .refresh-btn svg {
     width: 16px;
     height: 16px;
+}
+
+/* Magnet assign episode button - no rotation on hover */
+.magnet-assign-episode-btn {
+    border-color: rgba(255, 145, 102, 0.3);
+    color: #ff9166;
+}
+
+.magnet-assign-episode-btn:hover {
+    background: rgba(255, 145, 102, 0.15) !important;
+    border-color: rgba(255, 145, 102, 0.5) !important;
+    transform: none !important;
 }
 
 /* Files Toggle Button */
@@ -1424,7 +1536,7 @@ body.modal-open {
 .overlay-content {
     position: relative;
     background-color: #1a1a1a;
-    padding: 0 20px 20px 20px;
+    /* padding: 0 20px 20px 20px; */
     border-radius: 8px;
     width: 85%;
     max-width: 1200px;
@@ -1591,19 +1703,7 @@ tr.filtered-out-item:hover {
     align-items: center;
 }
 
-.loading-content {
-    background: rgba(26, 26, 26, 0.95);
-    backdrop-filter: blur(20px);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    padding: 20px;
-    border-radius: 20px;
-    text-align: center;
-}
-
-.loading-content p {
-    color: #e0e0e0;
-    margin-bottom: 15px;
-}
+/* Loading overlay styles defined in base.css */
 
 .loading-message {
     margin-bottom: 10px;
@@ -1690,27 +1790,6 @@ tr.filtered-out-item:hover {
     }
 }
 
-.close-loading {
-    background: linear-gradient(135deg, #3b82f6 0%, #60a5fa 100%);
-    color: white;
-    border: none;
-    padding: 12px 20px;
-    text-align: center;
-    text-decoration: none;
-    display: inline-block;
-    font-size: 16px;
-    font-weight: 600;
-    margin: 4px 2px;
-    cursor: pointer;
-    border-radius: 12px;
-    transition: all 0.3s ease;
-}
-
-.close-loading:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 24px rgba(59, 130, 246, 0.4);
-}
-
 /* ========================================
    Torrent Overlay Styles (from scraper.css)
    ======================================== */
@@ -1720,7 +1799,7 @@ tr.filtered-out-item:hover {
     background: rgba(26, 26, 26, 0.95);
     backdrop-filter: blur(20px);
     border: 1px solid rgba(255, 255, 255, 0.1);
-    padding: 0 20px 20px 20px;
+    /* padding: 0 20px 20px 20px; */
     border-radius: 20px;
     width: 85%;
     max-width: 1200px;
@@ -2147,8 +2226,8 @@ td#scraper-source .source-badge {
     transform: translateY(0);
 }
 @media (max-width: 1045px) {
+    .close-btn { display: none !important; }
     .overlay-content {
-
         margin-top: 90px;
     }
     .overlay-content h3 {
@@ -2197,22 +2276,22 @@ td#scraper-source .source-badge {
         hyphens: none;
     }
     .torresult .assign-magnet-icon {
-        position: absolute;
-        bottom: 10px;
-        right: 10px;
-        width: 28px;
-        padding: 3px;
-        height: 28px;
-        background-color: #e17c52;
-        border: #c56b3d;
-        border-radius: 6px;
-        display: flex;
+        position: static;
+        flex-shrink: 0;
+        width: 30px;
+        height: 30px;
+        padding: 0;
+        background: rgba(232,96,28,.08);
+        border: 1px solid rgba(232,96,28,.25);
+        border-radius: 5px;
+        color: #e8601c;
+        display: inline-flex;
         align-items: center;
         justify-content: center;
-        z-index: 10;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+        z-index: auto;
+        box-shadow: none;
         cursor: pointer;
-        transition: all 0.2s ease;
+        transition: all .15s;
     }
     .torresult {
         width: 47% !important;
@@ -2234,11 +2313,7 @@ td#scraper-source .source-badge {
         margin: 0;
     }
 
-    #overlayContent {
-        padding: 12px;
-        width: 100%;
-        box-sizing: border-box;
-    }
+
 
     #overlayContent > div {
         display: flex;
@@ -2313,22 +2388,22 @@ td#scraper-source .source-badge {
         hyphens: none;
     }
     .torresult .assign-magnet-icon {
-        position: absolute;
-        bottom: 10px;
-        right: 10px;
-        width: 28px;
-        padding: 3px;
-        height: 28px;
-        background-color: #e17c52;
-        border: #c56b3d;
-        border-radius: 6px;
-        display: flex;
+        position: static;
+        flex-shrink: 0;
+        width: 30px;
+        height: 30px;
+        padding: 0;
+        background: rgba(232,96,28,.08);
+        border: 1px solid rgba(232,96,28,.25);
+        border-radius: 5px;
+        color: #e8601c;
+        display: inline-flex;
         align-items: center;
         justify-content: center;
-        z-index: 10;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+        z-index: auto;
+        box-shadow: none;
         cursor: pointer;
-        transition: all 0.2s ease;
+        transition: all .15s;
     }
     .torresult {
         width: 47% !important;
@@ -2380,4 +2455,20 @@ td#scraper-source .source-badge {
 
 .phantom-missing svg {
     stroke: rgba(239, 68, 68, 0.7);
+}
+
+/* Hide trailer text on mobile, show only play icon */
+@media (max-width: 768px) {
+    .trailer-text {
+        display: none !important;
+    }
+}
+
+@keyframes cal-ep-pulse {
+    0%   { background-color: rgba(255, 165, 0, 0.3); }
+    50%  { background-color: rgba(255, 165, 0, 0.05); }
+    100% { background-color: rgba(255, 165, 0, 0.3); }
+}
+.cal-episode-highlight {
+    animation: cal-ep-pulse 1s ease-in-out infinite;
 }

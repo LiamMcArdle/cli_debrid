@@ -820,7 +820,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                             episode_in_xem = True
                             break
                 
-                if not episode_in_xem:
+                if isinstance(xem_mapping_list, list) and not episode_in_xem:
                     logging.info(f"Episode S{original_season}E{original_episode} not found in XEM mapping. Treating as absolute episode {original_episode}.")
                     # For anime, when episode is not in XEM mapping, treat it as absolute episode number
                     # Now check if this absolute episode maps to a different season/episode in XEM
@@ -929,7 +929,12 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
         languages_to_try = [lang.strip() for lang in language_setting.split(',') if lang.strip() and lang.strip().lower() != 'en']
         logging.info(f"Languages to attempt translation for (from version '{version}' settings): {languages_to_try}")
 
-        preferred_language = None # Language for which translation was successful
+        # preferred_language reflects the user's setting regardless of whether a
+        # translated title is found — needed so rank_results can still score
+        # releases against the preferred audio/sub language (detected via PTT)
+        # even for titles that are identical across languages (e.g. "Inception"),
+        # where no distinct translated title would ever be found.
+        preferred_language = languages_to_try[0] if languages_to_try else None
         translated_title = None
 
         if languages_to_try:
@@ -944,7 +949,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
 
                     if current_translated_title:
                         translated_title = current_translated_title
-                        preferred_language = lang_code # Store the successful language code
+                        preferred_language = lang_code # Use the language the translation matched
                         logging.info(f"Found translated title ({preferred_language}): {translated_title}")
                         break # Stop searching once a translation is found
                     else:
@@ -978,7 +983,8 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             scene_season_map: Optional[int] = None,
             scene_episode_map: Optional[int] = None,
             check_pack_wantedness: bool = False,
-            original_episode: Optional[int] = None
+            original_episode: Optional[int] = None,
+            original_season: Optional[int] = None
         ) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]], Dict[str, float]]:
             start_time = time.time()
             task_timings = {}
@@ -1060,9 +1066,18 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             # Extract titles and sizes for batch processing
             titles = [result.get('title', '') for result in all_results]
             sizes = [result.get('size', None) for result in all_results]
-            
+
+            # If Spanish episode parsing is enabled, pre-convert Cap.XXYY → SxxExx
+            # before passing to PTT so season/episode numbers are correctly detected.
+            # The original titles are preserved in all_results for display and similarity.
+            if version_settings.get('enable_spanish_episode_parsing', False):
+                from scraper.functions.ptt_parser import convert_spanish_cap_format
+                parse_titles = [convert_spanish_cap_format(t) for t in titles]
+            else:
+                parse_titles = titles
+
             # Batch process all titles
-            parsed_results = batch_parse_torrent_info(titles, sizes)
+            parsed_results = batch_parse_torrent_info(parse_titles, sizes)
             
             # Create normalized results and capture parsing failures
             normalized_results = []
@@ -1121,19 +1136,42 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
 
             # Filter results
             task_start = time.time()
+
+            # If use_alternative_titles is enabled, include title aliases for the version's language code.
+            effective_matching_aliases = list(matching_aliases)
+            if version_settings.get('use_alternative_titles', False) and imdb_id_for_fallback:
+                try:
+                    if content_type.lower() == 'movie':
+                        full_aliases, _ = direct_api_instance.get_movie_aliases(imdb_id_for_fallback)
+                    else:
+                        full_aliases, _ = direct_api_instance.get_show_aliases(imdb_id_for_fallback)
+                    if full_aliases:
+                        lang_code = version_settings.get('language_code', 'en').lower()
+                        existing_lower = {a.lower() for a in effective_matching_aliases}
+                        for key, aliases in full_aliases.items():
+                            if key.lower().startswith(lang_code):
+                                for alias in (aliases or []):
+                                    if alias and alias.lower() != original_media_title.lower() and alias.lower() not in existing_lower:
+                                        effective_matching_aliases.append(alias)
+                                        existing_lower.add(alias.lower())
+                                        logging.info(f"Alternative title alias added ({key}): '{alias}'")
+                except Exception as _alt_err:
+                    logging.warning(f"Failed to fetch alternative title aliases for {imdb_id_for_fallback}: {_alt_err}")
+
             # --- Pass imdb_id_for_fallback and direct_api_instance ---
             filtered_results, pre_size_filtered_results = filter_results(
                 normalized_results, tmdb_id, original_media_title, year, content_type,
                 season, episode, multi, version_settings, runtime, episode_count,
-                season_episode_counts, genres, matching_aliases,
-                imdb_id=imdb_id_for_fallback, 
-                direct_api=direct_api_instance, 
+                season_episode_counts, genres, effective_matching_aliases,
+                imdb_id=imdb_id_for_fallback,
+                direct_api=direct_api_instance,
                 preferred_language=preferred_language,
                 translated_title=translated_title,
                 target_air_date=target_air_date,
                 check_pack_wantedness=check_pack_wantedness,
-                current_scrape_target_version=version, # Pass the 'version' from _do_scrape's scope
-                original_episode=original_episode  # Pass the original episode number for filtering
+                current_scrape_target_version=version,
+                original_episode=original_episode,
+                original_season=original_season  # Pass original TVDB season so filter accepts both scene and TVDB-numbered torrents
             )
             filtered_out_results = [result for result in normalized_results if result not in filtered_results]
             task_timings['filtering'] = time.time() - task_start
@@ -1316,8 +1354,9 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                     # Pass the determined scene mapping (or None) to _do_scrape
                     scene_season_map=scene_season, # This is the XEM-mapped season (or None)
                     scene_episode_map=scene_episode, # This is the XEM-mapped episode (or None)
-                    check_pack_wantedness=check_pack_wantedness, # Pass parameter
-                    original_episode=original_episode  # Pass the original episode number for filtering
+                    check_pack_wantedness=check_pack_wantedness,
+                    original_episode=original_episode,
+                    original_season=original_season  # Pass original TVDB season before any XEM remapping
                 )
                 logging.debug(f"[scrape_main] _do_scrape for '{search_title}' returned: passed={len(filtered_results)}, filtered_out={len(filtered_out_results if filtered_out_results else [])}")
                 
@@ -1449,6 +1488,42 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             if initial_count != final_count:
                  logging.info(f"Applied minimum scrape score filter ({minimum_scrape_score_setting}): {initial_count} -> {final_count} results. Added {len(score_filtered_out_results)} to filtered out results.")
         # --- End Minimum Scrape Score Filter ---
+
+        # --- SeaDex Priority: move the SeaDex-confirmed-best release (if present) to
+        # the front, after every other sort/filter has already run. This deliberately
+        # does not touch rank_result_key's scoring — a Seadex-boosted result still had
+        # to pass the minimum score filter above like anything else; only its final
+        # position changes. Anime-only, and never inside a "Non-Anime Only" version.
+        if (is_anime
+                and get_setting('Scraping', 'enable_seadex_priority', False)
+                and version_settings.get('anime_filter_mode') != 'Non-Anime Only'):
+            try:
+                from scraper.seadex import get_seadex_hashes
+                from debrid.common.utils import extract_hash_from_magnet
+                seadex_hashes = get_seadex_hashes(imdb_id)
+                if seadex_hashes:
+                    boosted, rest = [], []
+                    for result in deduplicated_results:
+                        # info_hash is only populated by the debrid-catalog scrapers
+                        # (Torrentio/MediaFusion/AIOStreams/Zilean); Jackett/Prowlarr
+                        # store it under 'hash', and Nyaa doesn't expose a hash field
+                        # at all — only a magnet link it was built from. Checking only
+                        # info_hash meant SeaDex's boost silently never matched a Nyaa
+                        # result, even when it was the correct, top-ranked release.
+                        result_hash = (result.get('info_hash') or result.get('hash') or '').lower()
+                        if not result_hash and result.get('magnet'):
+                            try:
+                                result_hash = extract_hash_from_magnet(result['magnet']).lower()
+                            except ValueError:
+                                result_hash = ''
+                        (boosted if result_hash in seadex_hashes else rest).append(result)
+                    if boosted:
+                        logging.info(f"SeaDex Priority: promoted {len(boosted)} result(s) to top for '{title}'")
+                        deduplicated_results = boosted + rest
+            except Exception as e:
+                # Never let a SeaDex lookup failure affect scraping.
+                logging.debug(f"SeaDex Priority lookup failed for '{title}': {e}")
+        # --- End SeaDex Priority ---
 
         # Log final results
         logging.info(f"Final sorted results for '{title}' ({year}): {len(deduplicated_results)}")

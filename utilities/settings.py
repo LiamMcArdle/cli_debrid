@@ -92,6 +92,16 @@ def load_config():
                     with open(config_file_path, 'r') as config_file:
                         config = json.load(config_file)
 
+                    # One-time migration: rename legacy 'Decypharr' section → 'cli_mount'
+                    if 'Decypharr' in config and 'cli_mount' not in config:
+                        config['cli_mount'] = config.pop('Decypharr')
+                        logging.info("Settings migration: renamed 'Decypharr' section to 'cli_mount'")
+                        try:
+                            with open(config_file_path, 'w') as _mf:
+                                json.dump(config, _mf, indent=4)
+                        except Exception as _me:
+                            logging.warning(f"Settings migration: could not persist rename: {_me}")
+
                     # Parse string representations in Content Sources (Keep this logic)
                     if 'Content Sources' in config:
                         for key, value in config['Content Sources'].items():
@@ -559,5 +569,25 @@ def ensure_settings_file():
             if config_updated:
                 save_config(config)
                 logging.info(f"ensure_settings_file: Saved config with new schema defaults to {config_file_path}")
+
+
+def get_nas_paths():
+    """Return the list of configured NAS path prefixes (from Debug.nas_paths).
+    Each entry is stripped and non-empty. Returns [] if none configured."""
+    config = load_config()
+    paths = config.get('Debug', {}).get('nas_paths', [])
+    if isinstance(paths, list):
+        return [p.strip() for p in paths if p and p.strip()]
+    return []
+
+
+def is_nas_path(path, nas_paths):
+    """Return True if the given path starts with any of the configured NAS prefixes."""
+    if not path or not nas_paths:
+        return False
+    for prefix in nas_paths:
+        if path.startswith(prefix):
+            return True
+    return False
 
     

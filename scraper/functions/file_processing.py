@@ -195,6 +195,7 @@ def _process_single_title(args):
             'episodes': parsed_info_from_ptt.get('episodes', []),
             'type': parsed_info_from_ptt.get('type'),
             'country': parsed_info_from_ptt.get('country'),
+            'languages': parsed_info_from_ptt.get('languages', []),
             'date': parsed_info_from_ptt.get('date'),
             'documentary': parsed_info_from_ptt.get('documentary', False),
             'site': site,
@@ -281,16 +282,25 @@ def get_media_info_for_bitrate(media_items: List[Dict[str, Any]]) -> List[Dict[s
                 total_db_time += db_duration
                 #logging.debug(f"Item {item_idx} ('{item.get('title', 'N/A')}') get_movie_runtime took {db_duration:.4f}s")
 
-                if db_runtime:
+                if db_runtime and str(db_runtime).strip() not in ('', 'None'):
                     item['episode_count'] = 1
-                    item['runtime'] = db_runtime
+                    item['runtime'] = int(float(str(db_runtime).strip()))
                 else:
-                    metadata_start_time = time.time()
-                    metadata = get_metadata(tmdb_id=item['tmdb_id'], item_media_type='movie')
-                    metadata_duration = time.time() - metadata_start_time
-                    total_metadata_time += metadata_duration
-                    #logging.debug(f"Item {item_idx} ('{item.get('title', 'N/A')}') get_metadata (movie) took {metadata_duration:.4f}s")
-                    item['runtime'] = metadata.get('runtime', 100)
+                    tmdb_id_for_meta = item.get('tmdb_id')
+                    imdb_id_for_meta = item.get('imdb_id')
+
+                    if not tmdb_id_for_meta and imdb_id_for_meta:
+                        tmdb_id_for_meta, _ = get_tmdb_id_and_media_type(imdb_id_for_meta)
+
+                    if tmdb_id_for_meta or imdb_id_for_meta:
+                        metadata_start_time = time.time()
+                        metadata = get_metadata(tmdb_id=tmdb_id_for_meta, imdb_id=imdb_id_for_meta, item_media_type='movie')
+                        metadata_duration = time.time() - metadata_start_time
+                        total_metadata_time += metadata_duration
+                        item['runtime'] = int(metadata.get('runtime', 100) or 100)
+                    else:
+                        logging.warning(f"Could not fetch details for movie: {item.get('title', 'N/A')}")
+                        item['runtime'] = 100
                     item['episode_count'] = 1
         
             elif item['media_type'] == 'episode':
@@ -300,8 +310,8 @@ def get_media_info_for_bitrate(media_items: List[Dict[str, Any]]) -> List[Dict[s
                 total_db_time += db_runtime_duration
                 #logging.debug(f"Item {item_idx} ('{item.get('title', 'N/A')}') get_episode_runtime took {db_runtime_duration:.4f}s")
 
-                if db_runtime:
-                    item['runtime'] = db_runtime
+                if db_runtime and str(db_runtime).strip() not in ('', 'None'):
+                    item['runtime'] = int(float(str(db_runtime).strip()))
                     db_episode_count_start_time = time.time()
                     item['episode_count'] = get_episode_count(item['tmdb_id'])
                     db_episode_count_duration = time.time() - db_episode_count_start_time
@@ -323,7 +333,7 @@ def get_media_info_for_bitrate(media_items: List[Dict[str, Any]]) -> List[Dict[s
                         metadata_duration = time.time() - metadata_start_time
                         total_metadata_time += metadata_duration
                         #logging.debug(f"Item {item_idx} ('{item.get('title', 'N/A')}') get_metadata (tv) took {metadata_duration:.4f}s")
-                        item['runtime'] = metadata.get('runtime', 30)
+                        item['runtime'] = int(metadata.get('runtime', 30) or 30)
                         seasons = metadata.get('seasons', {})
                         item['episode_count'] = sum(season.get('episode_count', 0) for season in seasons.values())
                     else:

@@ -9,8 +9,8 @@
                 Settings
             </h3>
             <div class="ui-settings-actions action-buttons settings-expand-collapse-buttons">
-                <button type="button" class="ui-settings-btn btn-secondary settings-collapse-all">Collapse All</button>
-                <button type="button" class="ui-settings-btn btn-secondary settings-expand-all">Expand All</button>
+                <button type="button" class="ui-settings-btn btn-secondary settings-collapse-all"><i class="fa-solid fa-compress"></i> Collapse All</button>
+                <button type="button" class="ui-settings-btn btn-secondary settings-expand-all"><i class="fa-solid fa-expand"></i> Expand All</button>
             </div>
         </div>
 
@@ -189,6 +189,19 @@
                    class="settings-input" data-section="UI Settings" data-key="upcoming_releases_end_limit">
             <p class="settings-description">How many days forward should be displayed on statistics page</p>
         </div>
+
+        <!-- Stats Provider Priority -->
+        <div class="settings-form-group">
+            <label for="ui-settings-stats_provider_priority" class="settings-title">Stats Provider Priority:</label>
+            <select id="ui-settings-stats_provider_priority" name="UI Settings.stats_provider_priority"
+                    class="settings-input" data-section="UI Settings" data-key="stats_provider_priority">
+                <option value="auto" {% if settings.get('UI Settings', {}).get('stats_provider_priority', 'auto') == 'auto' %}selected{% endif %}>Auto (debrid if configured, otherwise usenet)</option>
+                <option value="debrid" {% if settings.get('UI Settings', {}).get('stats_provider_priority') == 'debrid' %}selected{% endif %}>Debrid</option>
+                <option value="usenet" {% if settings.get('UI Settings', {}).get('stats_provider_priority') == 'usenet' %}selected{% endif %}>Usenet</option>
+                <option value="combined" {% if settings.get('UI Settings', {}).get('stats_provider_priority') == 'combined' %}selected{% endif %}>Combined (debrid + usenet)</option>
+            </select>
+            <p class="settings-description">Choose which provider's download stats to display on the Statistics page. Usenet shows cli_mount connection stats even when a debrid provider is also configured. Combined shows the total size and broken count across every debrid provider and usenet together.</p>
+        </div>
     </div>
 </div>
 
@@ -217,9 +230,9 @@
         <!-- Auto Run Program -->
         <div class="settings-form-group">
             <label class="settings-title">
-                <input type="checkbox" id="auto-run-program" name="UI Settings.auto_run_program"
-                       data-section="UI Settings" data-key="auto_run_program"
-                       {% if settings.get('UI Settings', {}).get('auto_run_program', True) %}checked{% endif %}>
+                <input type="checkbox" id="auto-run-program" name="Debug.auto_run_program"
+                       data-section="Debug" data-key="auto_run_program"
+                       {% if settings.get('Debug', {}).get('auto_run_program', False) %}checked{% endif %}>
                 Auto Run Program
             </label>
             <p class="settings-description">When enabled, the program will automatically start running when the application starts</p>

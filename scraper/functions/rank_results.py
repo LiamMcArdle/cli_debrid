@@ -43,7 +43,8 @@ def rank_result_key(
     multi: bool, content_type: str, version_settings: Dict[str, Any],
     preferred_language: str = None,
     translated_title: str = None,
-    show_season_episode_counts: Optional[Dict[int, int]] = None
+    show_season_episode_counts: Optional[Dict[int, int]] = None,
+    upgrade_mode: bool = False,
 ) -> Tuple:
     torrent_title = result.get('title', '')
     parsed_info = result.get('parsed_info', {})
@@ -65,6 +66,15 @@ def rank_result_key(
     language_weight = float(version_settings.get('language_weight', 3.0))
     year_match_weight = float(version_settings.get('year_match_weight', 3.0)) # New weight
 
+    # Upgrade Hub mode: size, bitrate, country and language are irrelevant when
+    # comparing quality upgrades — they cause REMUX files to be mis-scored and
+    # produce wildly inconsistent improvement percentages across items.
+    if upgrade_mode:
+        size_weight = 0.0
+        bitrate_weight = 0.0
+        country_weight = 0.0
+        language_weight = 0.0
+
     # Calculate base scores
     normalized_query = normalize_title(query).lower()
     normalized_extracted_title = normalize_title(extracted_title).lower()
@@ -80,7 +90,18 @@ def rank_result_key(
         resolution = parsed_info.get('resolution', '').lower()
         if resolution == 'unknown':
             resolution_score = 1
-    
+
+    # Cap resolution_score to the version's max_resolution rank.
+    # Without this, a 2160p wrong-title result outscores a 1080p correct-title
+    # result when max_resolution is 1080p, because the 1000-pt resolution gap
+    # (rank 4→3) exceeds the title similarity score difference.
+    _max_res = (version_settings.get('max_resolution') or '').lower()
+    _max_res_rank_map = {'2160p': 4, '4k': 4, '1080p': 3, '1080i': 3, '720p': 2, '576p': 1, '480p': 1, 'sd': 1}
+    if _max_res and _max_res in _max_res_rank_map:
+        _max_rank = _max_res_rank_map[_max_res]
+        if resolution_score > _max_rank:
+            resolution_score = _max_rank
+
     hdr_score = 1 if parsed_info.get('is_hdr', False) and version_settings.get('enable_hdr', True) else 0
 
     media_country = result.get('media_country_code')
@@ -358,6 +379,29 @@ def rank_result_key(
             language_reason += f" + Bonus for having language codes: {detected_language_codes}"
     # --- End Language Code Ranking Logic ---
 
+    # --- Preferred Audio/Sub Language Ranking (via PTT-detected languages) ---
+    # The blocks above only compare title text (useless when a title is identical
+    # across languages, e.g. "Inception") or release-region codes (UK/US/AU — an
+    # unrelated concept). This checks the actual audio/subtitle languages PTT
+    # detected in the release name (FRENCH, VF, MULTI, etc.) against the
+    # user's preferred language code, so a non-English audio preference actually
+    # affects ranking for titles with no distinct translated title.
+    detected_release_languages = [str(l).lower() for l in (parsed_info.get('languages') or [])]
+    if preferred_language:
+        preferred_language_lower = preferred_language.lower()
+        if preferred_language_lower in detected_release_languages:
+            language_score += 75
+            language_reason += f" + Bonus for matching preferred language '{preferred_language_lower}' in release ({detected_release_languages})"
+        elif detected_release_languages and preferred_language_lower not in detected_release_languages:
+            # Release has detected languages but not the preferred one — only
+            # penalize if it's *not* multi-language (MULTI releases typically
+            # include the preferred language as an undubbed extra track PTT
+            # doesn't always tag, so don't punish those).
+            if 'multi' not in detected_release_languages:
+                language_score -= 30
+                language_reason += f" - Penalty for missing preferred language '{preferred_language_lower}' (found {detected_release_languages})"
+    # --- End Preferred Audio/Sub Language Ranking ---
+
     normalized_language = language_score # Use the raw score
 
     # Apply weights
@@ -505,7 +549,9 @@ def rank_result_key(
 
     # Content type matching score
     content_type_score = 0
-    if content_type.lower() == 'movie' and not result.get('is_anime', False):
+    if upgrade_mode:
+        pass  # Content type is already known for upgrade candidates — skip penalties
+    elif content_type.lower() == 'movie' and not result.get('is_anime', False):
         if re.search(r'(s\d{2}|e\d{2}|season|episode)', torrent_title, re.IGNORECASE):
             content_type_score = -500
             #logging.debug(f"Applied penalty for movie with season/episode in title")
@@ -570,6 +616,12 @@ def rank_result_key(
                     logging.debug(f"Applied penalty for anime with no clear episode number")
     else:
         logging.warning(f"Unknown content type: {content_type} for result: {torrent_title}")
+
+    # The synthetic current-file result always has the correct content type — its
+    # title is the clean query title (no S/E indicators) so the pattern check above
+    # would incorrectly apply a -500 penalty.  Skip it entirely.
+    if result.get('source') == '__current__':
+        content_type_score = 0
 
     # Add content_type_score to the total score
     total_score += content_type_score

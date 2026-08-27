@@ -778,26 +778,40 @@ def get_media_meta(tmdb_id: str, media_type: str) -> Optional[Tuple[str, str, li
         return cached_media_meta
 
     # Use the correct endpoints for TV shows and movies
-    if media_type == 'tv' or media_type == 'show':
+    _is_tv = media_type in ('tv', 'show')
+    if _is_tv:
         details_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={tmdb_api_key}&language=en-US"
+        images_url  = f"https://api.themoviedb.org/3/tv/{tmdb_id}/images?api_key={tmdb_api_key}&include_image_language=en,null"
     else:
         details_url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={tmdb_api_key}&language=en-US"
-    
+        images_url  = f"https://api.themoviedb.org/3/movie/{tmdb_id}/images?api_key={tmdb_api_key}&include_image_language=en,null"
+
     try:
-        # Fetch details
+        # Fetch details (overview, genres, ratings, backdrop)
         details_response = api.get(details_url)
         details_response.raise_for_status()
         details_data = details_response.json()
 
-        # DISABLED: asyncio.run() creates event loop accumulation
-        # async def fetch_poster_url():
-        #     async with aiohttp.ClientSession() as session:
-        #         return await get_poster_url(session, tmdb_id, media_type)
-        # poster_url = asyncio.run(fetch_poster_url())
-
-        # Fallback: construct poster URL synchronously
+        # Fetch English-only posters from the images endpoint.
+        # Prefer iso_639_1='en' posters — these have baked-in title text and are
+        # the standard library poster. Only fall back to null-language posters if
+        # no English results exist (e.g. non-English original content with no EN poster).
         poster_url = None
-        if details_data.get('poster_path'):
+        try:
+            images_response = api.get(images_url)
+            images_response.raise_for_status()
+            all_posters = images_response.json().get('posters', [])
+            # Prefer English posters; fall back to all results only if none found
+            en_posters = [p for p in all_posters if p.get('iso_639_1') == 'en']
+            posters = en_posters if en_posters else all_posters
+            if posters:
+                posters.sort(key=lambda p: p.get('vote_average', 0), reverse=True)
+                poster_url = f"https://image.tmdb.org/t/p/w500{posters[0]['file_path']}"
+        except Exception as _img_err:
+            logging.debug(f"TMDB images endpoint failed for {media_type} {tmdb_id}: {_img_err}")
+
+        # Fallback to the details poster_path if the images endpoint returned nothing
+        if not poster_url and details_data.get('poster_path'):
             poster_url = f"https://image.tmdb.org/t/p/w500{details_data['poster_path']}"
         
         overview = details_data.get('overview', '')
@@ -819,11 +833,13 @@ def get_media_meta(tmdb_id: str, media_type: str) -> Optional[Tuple[str, str, li
         status_code = getattr(getattr(e, 'response', None), 'status_code', None)
         if status_code == 404:
             logging.warning(f"TMDb details not found (404) for {media_type} {tmdb_id}: {e}")
+        elif status_code == 429:
+            logging.warning(f"TMDb rate limit hit for {media_type} {tmdb_id}")
         else:
-            logging.error(f"Error fetching media meta from TMDb: {e}")
+            logging.warning(f"TMDb HTTP error for {media_type} {tmdb_id}: {e}")
         return None
-    except api.exceptions.RequestException as e:
-        logging.error(f"Error fetching media meta from TMDb: {e}")
+    except (api.exceptions.RequestException, ValueError) as e:
+        logging.warning(f"TMDb request failed for {media_type} {tmdb_id}: {e}")
         return None
     
 def overseerr_tvshow(title: str, year: Optional[int] = None, media_id: Optional[int] = None, season: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -1749,20 +1765,28 @@ def process_media_selection(media_id: str, title: str, year: str, media_type: st
                 # No hash extraction needed for torrent URLs, but include them in results
                 processed_passed_results.append(result)
                 logging.info(f"Added torrent URL result: {result['title']}")
+            # Pass through NZB results — no magnet/hash needed, nzb_url carries the link
+            elif result.get('protocol') == 'nzb' or result.get('nzb_url'):
+                processed_passed_results.append(result)
 
-    # Get the debrid provider and check its capabilities
-    debrid_provider = get_debrid_provider()
-    supports_cache_check = debrid_provider.supports_direct_cache_check
-    supports_bulk_check = debrid_provider.supports_bulk_cache_checking
-    
+    # Get all configured debrid providers (primary + fallbacks)
+    from debrid import get_debrid_providers
+    all_providers = get_debrid_providers()
+    # usenet-only setup: no debrid provider. Use None + capability flags off so the
+    # cache-check blocks below (all gated on supports_cache_check) are skipped.
+    debrid_provider = all_providers[0] if all_providers else None  # primary — capability flags / legacy paths
+    supports_cache_check = debrid_provider.supports_direct_cache_check if debrid_provider else False
+    supports_bulk_check = debrid_provider.supports_bulk_cache_checking if debrid_provider else False
+
     # Determine behavior from provider capability flags
     is_real_debrid = getattr(debrid_provider, 'supports_direct_cache_check', False)
-    
-    logging.info(f"Debrid provider: supports_cache_check={supports_cache_check}, supports_bulk_check={supports_bulk_check}, is_real_debrid={is_real_debrid}")
+
+    logging.info(f"Debrid provider chain: {[p.PROVIDER_NAME for p in all_providers]} — supports_cache_check={supports_cache_check}, supports_bulk_check={supports_bulk_check}")
 
     # Initialize all cache statuses as 'Not Checked'
     for result in processed_passed_results:
         result['cached'] = 'Not Checked'
+        result['cache_providers'] = {}  # per-provider: {provider_name: 'Yes'/'No'/'Error'}
         
         # Ensure both magnet and magnet_link are set (for UI and cache checking)
         if 'magnet' in result and not 'magnet_link' in result:
@@ -1790,6 +1814,8 @@ def process_media_selection(media_id: str, title: str, year: str, media_type: st
                 logging.info(f"Magnet link result: {result.get('title', 'Unknown')} (Link: {result['magnet_link'][:40]}...)")
             except (TypeError, KeyError) as e:
                 logging.warning(f"Error logging magnet link result: {e}")
+        elif result.get('protocol') == 'nzb' or result.get('nzb_url'):
+            logging.info(f"NZB result: {result.get('title', 'Unknown')} (source: {result.get('source', 'Unknown')})")
         else:
             try:
                 logging.warning(f"Result without magnet or torrent URL: {result.get('title', 'Unknown')}")
@@ -1810,61 +1836,56 @@ def process_media_selection(media_id: str, title: str, year: str, media_type: st
         
         if supports_cache_check:
             try:
-                if supports_bulk_check:
-                    # If provider supports bulk checking, check all hashes at once
-                    cache_status = debrid_provider.is_cached(hashes_to_check)
-                    if isinstance(cache_status, bool):
-                        # If we got a single boolean back, convert to dict
-                        cache_status = {hash_value: cache_status for hash_value in hashes_to_check}
-                    
-                    # Update results with cache status
-                    for result in processed_passed_results:
-                        hash_value = result.get('hash')
-                        if hash_value and hash_value in cache_status:
-                            is_cached = cache_status[hash_value]
-                            result['cached'] = 'Yes' if is_cached else 'No'
-                else:
-                    # Check hashes in parallel for providers that don't support bulk checking
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                    # Collect hashes to check (limit to 5)
-                    results_to_check = [r for r in processed_passed_results if r.get('hash')][:5]
+                def _check_hash_for_provider(prov, hash_value):
+                    """Check a single hash against a single provider. Returns ('Yes'/'No'/'Error')."""
+                    try:
+                        if prov.supports_bulk_cache_checking:
+                            status = prov.is_cached([hash_value])
+                            if isinstance(status, dict):
+                                val = status.get(hash_value)
+                                return 'Yes' if val else ('No' if val is False else 'Error')
+                            return 'Yes' if status else 'No'
+                        else:
+                            val = prov.is_cached(hash_value)
+                            return 'Yes' if val else 'No'
+                    except Exception as _e:
+                        logging.warning(f"[{prov.PROVIDER_NAME}] cache check error for {hash_value}: {_e}")
+                        return 'Error'
 
-                    # Parallel cache checking function
-                    def check_single_hash(result_with_hash):
-                        result, hash_value = result_with_hash
+                results_to_check = [r for r in processed_passed_results if r.get('hash')][:5]
+
+                # Check all results × all providers in parallel
+                futures = {}
+                with ThreadPoolExecutor(max_workers=min(len(results_to_check) * len(all_providers), 10)) as executor:
+                    for result in results_to_check:
+                        h = result.get('hash')
+                        for prov in all_providers:
+                            fut = executor.submit(_check_hash_for_provider, prov, h)
+                            futures[fut] = (result, prov)
+
+                    for fut in as_completed(futures):
+                        result, prov = futures[fut]
                         try:
-                            is_cached = debrid_provider.is_cached(hash_value)
-                            return (result, 'Yes' if is_cached else 'No')
-                        except Exception as e:
-                            logging.error(f"Error checking individual cache status for {hash_value}: {e}")
-                            return (result, 'Error')
+                            status = fut.result()
+                            result['cache_providers'][prov.PROVIDER_NAME] = status
+                            # Overall cached = Yes if any provider says Yes
+                            if status == 'Yes' and result['cached'] != 'Yes':
+                                result['cached'] = 'Yes'
+                            elif result['cached'] == 'Not Checked' and status == 'No':
+                                result['cached'] = 'No'
+                        except Exception as _e:
+                            logging.error(f"Error in parallel provider cache check: {_e}")
+                            result['cache_providers'][prov.PROVIDER_NAME] = 'Error'
 
-                    # Execute checks in parallel (max 5 workers for 5 hashes)
-                    with ThreadPoolExecutor(max_workers=5) as executor:
-                        # Submit all cache checks concurrently
-                        future_to_result = {
-                            executor.submit(check_single_hash, (result, result.get('hash'))): result
-                            for result in results_to_check
-                        }
-
-                        # Collect results as they complete
-                        for future in as_completed(future_to_result):
-                            try:
-                                result, cached_status = future.result()
-                                result['cached'] = cached_status
-                            except Exception as e:
-                                logging.error(f"Error in parallel cache check: {e}")
-                                future_to_result[future]['cached'] = 'Error'
-                
                 # Mark all remaining results as N/A
                 for result in processed_passed_results:
                     if result['cached'] == 'Not Checked':
                         result['cached'] = 'N/A'
-                        
+
             except Exception as e:
                 logging.error(f"Error checking cache status: {e}")
-                # Fall back to N/A on error
                 for result in processed_passed_results:
                     if result['cached'] == 'Not Checked':
                         result['cached'] = 'N/A'
@@ -1894,7 +1915,8 @@ def process_media_selection(media_id: str, title: str, year: str, media_type: st
                         )
                         
                         result['cached'] = 'Yes' if cache_result else 'No'
-                        
+                        result['cache_providers'][debrid_provider.PROVIDER_NAME] = result['cached']
+
                         # Try to find the torrent ID using the hash
                         torrent_id = debrid_provider._all_torrent_ids.get(hash_value)
                         if torrent_id:
@@ -1903,6 +1925,7 @@ def process_media_selection(media_id: str, title: str, year: str, media_type: st
                     except Exception as e:
                         logging.error(f"Error checking cache for hash {hash_value}: {str(e)}")
                         result['cached'] = 'Error'
+                        result['cache_providers'][debrid_provider.PROVIDER_NAME] = 'Error'
                 
                 # Remove all torrents after checking (even if they're cached)
                 for torrent_id in torrent_ids_to_remove:
@@ -1983,7 +2006,12 @@ def process_torrent_selection(torrent_index: int, torrent_results: List[Dict[str
         if magnet_link:
             logging.info(f"Selected torrent: {selected_torrent}")
             logging.info(f"Magnet link: {magnet_link}")
-            debrid_provider = get_debrid_provider()
+            try:
+                debrid_provider = get_debrid_provider()
+            except Exception:
+                debrid_provider = None
+            if not debrid_provider:
+                return {"success": False, "message": "No debrid provider configured"}
             result = debrid_provider.add_to_debrid(magnet_link)
             if result:
                 logging.info(f"Torrent result: {result}")

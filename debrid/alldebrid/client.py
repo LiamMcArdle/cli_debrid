@@ -48,6 +48,7 @@ STATUS_CODE_MAP = {
 class AllDebridProvider(DebridProvider):
     """AllDebrid implementation of the DebridProvider interface"""
 
+    PROVIDER_NAME = "AllDebrid"
     API_BASE_URL = "https://api.alldebrid.com/v4"
     MAX_DOWNLOADS = 20  # AllDebrid typical limit
 
@@ -91,6 +92,8 @@ class AllDebridProvider(DebridProvider):
 
     def _load_api_key(self) -> str:
         """Load API key from settings"""
+        if getattr(self, '_api_key', None):
+            return self._api_key
         try:
             from .api import get_api_key
             return get_api_key()
@@ -141,7 +144,12 @@ class AllDebridProvider(DebridProvider):
             return {
                 'days_remaining': days_remaining,
                 'expiration': expiration,
-                'premium': premium
+                'premium': premium,
+                'username': user_info.get('username', ''),
+                'email': user_info.get('email', ''),
+                'points': user_info.get('fidelityPoints', 0),
+                'locale': user_info.get('lang', ''),
+                'type': 'premium' if premium else 'free',
             }
         except Exception as e:
             logging.error(f"Error fetching subscription status: {str(e)}")
@@ -255,6 +263,7 @@ class AllDebridProvider(DebridProvider):
 
             # Fall back to add torrent + check status
             torrent_id = None
+            torrent_was_preexisting = False
             try:
                 # Add the magnet/torrent to AllDebrid
                 torrent_id = self.add_torrent(
@@ -376,14 +385,18 @@ class AllDebridProvider(DebridProvider):
                     self._cached_torrent_ids[hash_value] = torrent_id
                     self._cached_torrent_titles[hash_value] = info.get('filename', '')
 
-                    if local_remove_cached:
+                    if torrent_was_preexisting:
+                        logging.info(f"{log_prefix} Skipping removal of pre-existing cached torrent {torrent_id}")
+                    elif local_remove_cached:
                         try:
                             self.remove_torrent(torrent_id, "Torrent is cached - removed after cache check due to remove_cached=True")
                         except Exception as e:
                             logging.error(f"{log_prefix} Error removing cached torrent: {str(e)}")
                             self.update_status(torrent_id, TorrentStatus.CLEANUP_NEEDED)
                 else:
-                    if local_remove_uncached:
+                    if torrent_was_preexisting:
+                        logging.info(f"{log_prefix} Skipping removal of pre-existing uncached torrent {torrent_id}")
+                    elif local_remove_uncached:
                         try:
                             self.remove_torrent(torrent_id, "Torrent is not cached - removed after cache check")
                             from database.torrent_tracking import update_cache_check_removal
@@ -396,7 +409,7 @@ class AllDebridProvider(DebridProvider):
 
             except Exception as e:
                 logging.error(f"{log_prefix} Error checking cache: {str(e)}")
-                if torrent_id:
+                if torrent_id and not torrent_was_preexisting:
                     self.update_status(torrent_id, TorrentStatus.ERROR)
                     try:
                         self.remove_torrent(torrent_id, f"Error during cache check: {str(e)}")
@@ -494,11 +507,14 @@ class AllDebridProvider(DebridProvider):
                 torrents.append({
                     'id': str(magnet.get('id', '')),
                     'filename': magnet.get('filename', ''),
+                    'original_filename': magnet.get('filename', ''),
                     'hash': magnet.get('hash', '').lower(),
-                    'status': status.value if hasattr(status, 'value') else str(status),
+                    'status': str(status.value) if hasattr(status, 'value') else str(status),
                     'progress': progress,
                     'bytes': size,
-                    'original_filename': magnet.get('filename', '')
+                    'added': magnet.get('uploadDate'),
+                    'message': magnet.get('statusText', ''),
+                    'debrid_folder_name': magnet.get('filename', ''),
                 })
 
             return torrents
@@ -627,11 +643,13 @@ class AllDebridProvider(DebridProvider):
                             largest_file = max(video_files, key=lambda x: x.get('bytes', 0))
                             updated_item_data = {
                                 'filled_by_title': info.get('filename'),
-                                'filled_by_file': largest_file.get('path', '')
+                                'filled_by_file': largest_file.get('path', ''),
+                                'debrid_folder_name': info.get('filename'),
                             }
                             updated_trigger_details = {
                                 'source': 'alldebrid',
-                                'status_code': status_code
+                                'status_code': status_code,
+                                'selected_files': [{'path': f.get('path', ''), 'bytes': f.get('bytes', 0), 'selected': True} for f in video_files],
                             }
                             updated_metadata = {
                                 'debrid_info': {

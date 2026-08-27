@@ -83,7 +83,8 @@ def filter_results(
     target_air_date: Optional[str] = None,
     check_pack_wantedness: bool = False,
     current_scrape_target_version: Optional[str] = None,
-    original_episode: Optional[int] = None  # Add original episode parameter
+    original_episode: Optional[int] = None,
+    original_season: Optional[int] = None  # Original TVDB season before XEM remapping
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
 
     # --- START Logging for season_episode_counts ---
@@ -105,14 +106,25 @@ def filter_results(
     filter_out = version_settings.get('filter_out', [])
     enable_hdr = version_settings.get('enable_hdr', False)
     disable_adult = get_setting('Scraping', 'disable_adult', False)
+    disable_nzb_season_packs = get_setting('Usenet Provider', 'disable_nzb_season_packs', False)
     
     #logging.debug(f"Starting filter_results with {len(results)} results")
     #logging.debug(f"Version settings: resolution={max_resolution}({resolution_wanted}), size={min_size_gb}-{max_size_gb}GB, HDR={enable_hdr}")
     #logging.debug(f"Filter patterns - in: {filter_in}, out: {filter_out}")
     
-    # Pre-compile patterns
-    filter_in_patterns = filter_in if filter_in else []
-    filter_out_patterns = filter_out if filter_out else []
+    # Normalize filter items — support both plain strings (legacy) and
+    # {"pattern": "...", "source": "both|nzb|debrid"} dicts (new format).
+    def _normalize_filter_list(raw):
+        out = []
+        for item in (raw or []):
+            if isinstance(item, dict):
+                out.append({'pattern': item.get('pattern', ''), 'source': item.get('source', 'both')})
+            else:
+                out.append({'pattern': str(item), 'source': 'both'})
+        return out
+
+    filter_in_patterns = _normalize_filter_list(filter_in)
+    filter_out_patterns = _normalize_filter_list(filter_out)
     adult_pattern = re.compile('|'.join(adult_terms), re.IGNORECASE) if disable_adult else None
     
     # Determine content type specific settings
@@ -255,6 +267,13 @@ def filter_results(
             parsed_title_str = parsed_info.get('title', '')
             # logging.debug(f"  - Parsed info title: '{parsed_title_str}', parsed_info keys: {list(parsed_info.keys()) if parsed_info else 'None'}")
             normalized_parsed_title = normalize_title(parsed_title_str).lower() if parsed_title_str else None
+
+            # Parenthesized alternative title extracted from torrent filename
+            # e.g. "El renacido (The Revenant) 2015 SPANISH" → "The Revenant"
+            # Only used when Spanish/alternative content parsing is enabled
+            _spanish_parsing = version_settings.get('enable_spanish_episode_parsing', False)
+            paren_title_str = parsed_info.get('parenthesized_title', '') if _spanish_parsing else ''
+            normalized_paren_title = normalize_title(paren_title_str).lower() if paren_title_str else None
 
             # Create simplified versions by removing all punctuation and spaces (used by all similarity checks)
             simple_query = re.sub(r'[^a-z0-9]', '', normalized_query_title)
@@ -438,8 +457,19 @@ def filter_results(
                     trans_original_sim = translated_title_sim
                     translated_title_sim *= trans_penalty_factor
 
+            # --- Parenthesized Alternative Title Similarity ---
+            # Handles Spanish-style releases: "El renacido (The Revenant) 2015 SPANISH"
+            # PTT parses "El renacido" as the title but the real match is "(The Revenant)"
+            paren_title_sim = 0.0
+            if normalized_paren_title:
+                paren_sim_set = fuzz.token_set_ratio(normalized_query_title, normalized_paren_title) / 100.0
+                paren_sim_sort = fuzz.token_sort_ratio(normalized_query_title, normalized_paren_title) / 100.0
+                paren_title_sim = (paren_sim_set + paren_sim_sort) / 2.0
+                if paren_title_sim >= 0.85:
+                    logging.info(f"Parenthesized title match: '{paren_title_str}' sim={paren_title_sim:.2f} for query '{title}'")
+
             # Compute initial best similarity score (without API aliases)
-            best_sim = max(main_title_sim, best_alias_sim, translated_title_sim)
+            best_sim = max(main_title_sim, best_alias_sim, translated_title_sim, paren_title_sim)
 
             # --- Fetch additional aliases via DirectAPI ---
             item_aliases = {}
@@ -636,9 +666,9 @@ def filter_results(
             if item_alias_similarities:
                 alias_similarities.extend(item_alias_similarities)
                 best_alias_sim = max(alias_similarities)
-                best_sim = max(main_title_sim, best_alias_sim, translated_title_sim)
+                best_sim = max(main_title_sim, best_alias_sim, translated_title_sim, paren_title_sim)
             else:
-                best_sim = max(main_title_sim, best_alias_sim, translated_title_sim)
+                best_sim = max(main_title_sim, best_alias_sim, translated_title_sim, paren_title_sim)
 
 
             # -------------------------------------------------------------
@@ -858,7 +888,7 @@ def filter_results(
             # Content type specific checks
             if is_movie and not is_ufc:
                 parsed_year = parsed_info.get('year')
-                if parsed_year:
+                if parsed_year and year is not None:
                     if isinstance(parsed_year, list):
                         if not any(abs(int(py) - year) <= 1 for py in parsed_year):
                             result['filter_reason'] = f"Year mismatch: {parsed_year} (expected: {year})"
@@ -914,29 +944,32 @@ def filter_results(
                             parsed_year = extracted_year
                             logging.info(f"PTT didn't parse year, extracted {extracted_year} from title: '{original_title}'")
                     
-                    if parsed_year:
+                    if parsed_year and year is not None:
                         # For TV shows, we should compare against the season's air date, not the original show premiere
                         # Get the season-specific year if available, otherwise fall back to the original year
                         target_year = year  # Default to original year
                         
                         # Try to get the season-specific year from the database
-                        if imdb_id and season is not None:
+                        # Use original_season for year lookup when XEM/absolute remapping has occurred
+                        # (e.g. anime S03E12 remapped to scene S01E12 — look up S3 year, not S1 year)
+                        year_lookup_season = original_season if (original_season is not None and original_season != season) else season
+                        if imdb_id and year_lookup_season is not None:
                             # Check cache first
-                            cache_key = (imdb_id, season)
+                            cache_key = (imdb_id, year_lookup_season)
                             if cache_key in _season_year_cache:
                                 target_year = _season_year_cache[cache_key]
                                 # logging.debug(f"Using cached season year for {imdb_id} S{season}: {target_year}")
                             else:
                                 try:
                                     from database.database_reading import get_season_year
-                                    season_year = get_season_year(imdb_id=imdb_id, season_number=season)
+                                    season_year = get_season_year(imdb_id=imdb_id, season_number=year_lookup_season)
                                     if season_year:
                                         target_year = season_year
                                         _season_year_cache[cache_key] = season_year  # Cache the result
-                                        logging.info(f"Using season {season} air date year ({season_year}) instead of original show year ({year}) for '{original_title}'")
+                                        logging.info(f"Using season {year_lookup_season} air date year ({season_year}) instead of original show year ({year}) for '{original_title}'")
                                     else:
                                         # Fallback: Try to get season year from metadata API
-                                        logging.debug(f"No season year in database for {imdb_id} S{season}, trying metadata API fallback")
+                                        logging.debug(f"No season year in database for {imdb_id} S{year_lookup_season}, trying metadata API fallback")
                                         if direct_api:
                                             # Check metadata cache first
                                             if imdb_id in _show_metadata_cache:
@@ -950,11 +983,11 @@ def filter_results(
                                                     logging.warning(f"Error getting show metadata for {imdb_id}: {api_err}")
                                                     show_metadata = None
                                                     _show_metadata_cache[imdb_id] = None  # Cache the failure
-                                            
+
                                             if show_metadata and isinstance(show_metadata, dict):
                                                 trakt_seasons_data = show_metadata.get('seasons')
-                                                if isinstance(trakt_seasons_data, dict) and season in trakt_seasons_data:
-                                                    current_season_trakt_data = trakt_seasons_data[season]
+                                                if isinstance(trakt_seasons_data, dict) and year_lookup_season in trakt_seasons_data:
+                                                    current_season_trakt_data = trakt_seasons_data[year_lookup_season]
                                                     if isinstance(current_season_trakt_data, dict) and 'episodes' in current_season_trakt_data:
                                                         episodes_dict_for_season = current_season_trakt_data['episodes']
                                                         if episodes_dict_for_season:
@@ -974,15 +1007,15 @@ def filter_results(
                                                                         season_year = utc_dt.year
                                                                         target_year = season_year
                                                                         _season_year_cache[cache_key] = season_year  # Cache the result
-                                                                        logging.info(f"Using season {season} air date year ({season_year}) from metadata API instead of original show year ({year}) for '{original_title}'")
+                                                                        logging.info(f"Using season {year_lookup_season} air date year ({season_year}) from metadata API instead of original show year ({year}) for '{original_title}'")
                                                                     except Exception as date_parse_err:
-                                                                        logging.warning(f"Failed to parse season {season} air date from metadata API: {date_parse_err}")
-                                    
+                                                                        logging.warning(f"Failed to parse season {year_lookup_season} air date from metadata API: {date_parse_err}")
+
                                     if target_year == year:  # If we still haven't found a season year
                                         _season_year_cache[cache_key] = year  # Cache the fallback
-                                        logging.debug(f"No season-specific year found for {imdb_id} S{season}, using original show year ({year})")
+                                        logging.debug(f"No season-specific year found for {imdb_id} S{year_lookup_season}, using original show year ({year})")
                                 except Exception as season_year_err:
-                                    logging.warning(f"Error getting season year for {imdb_id} S{season}: {season_year_err}, using original show year ({year})")
+                                    logging.warning(f"Error getting season year for {imdb_id} S{year_lookup_season}: {season_year_err}, using original show year ({year})")
                                     _season_year_cache[cache_key] = year  # Cache the fallback
                         
                         if isinstance(parsed_year, list):
@@ -1081,12 +1114,22 @@ def filter_results(
                 
                 if multi:
                     #logging.debug(f"Multi-episode mode: season={season}, season_pack={season_episode_info.get('season_pack')}, seasons={season_episode_info.get('seasons')}")
-                    
+
                     episodes = season_episode_info.get('episodes', [])
                     if len(episodes) == 1:
                         result['filter_reason'] = "Single episode result when searching for multi"
                         logging.info(f"Rejected: Single episode in multi mode for '{original_title}' (Size: {result['size']:.2f}GB)")
                         continue
+
+                    # Reject partial multi-episode files (e.g. S01E01E02) in season pack searches
+                    # A result with explicit episode numbers but fewer than the season episode count
+                    # is a partial pack, not a full season pack
+                    if len(episodes) > 1:
+                        _season_ep_count = season_episode_counts.get(season, 0) if season_episode_counts else 0
+                        if _season_ep_count > 0 and len(episodes) < _season_ep_count:
+                            result['filter_reason'] = f"Partial multi-episode file ({len(episodes)} eps) when searching for full season pack ({_season_ep_count} eps)"
+                            logging.info(f"Rejected: Partial multi-episode {episodes} for season pack of {_season_ep_count} eps: '{original_title}'")
+                            continue
 
                     if episodes and episode is not None and episode not in episodes:
                         result['filter_reason'] = f"Multi-episode pack does not contain requested episode {episode}"
@@ -1145,10 +1188,42 @@ def filter_results(
                                 logging.info(f"Rejected: Not enough episodes for multi mode for '{original_title}' (is_anime={is_anime}, heuristic_failed={not is_likely_anime_pack}) (Size: {result['size']:.2f}GB)")
                                 continue
                     else:
-                        if season not in season_episode_info.get('seasons', []):
+                        result_seasons = season_episode_info.get('seasons', [])
+                        if season not in result_seasons:
                             result['filter_reason'] = f"Season pack not containing the requested season: {season}"
                             logging.info(f"Rejected: Season pack missing season {season} for '{original_title}' (Size: {result['size']:.2f}GB)")
                             continue
+                        # Reject multi-season packs when searching for a single season in multi mode.
+                        # A pack containing seasons [1,2,3,4,5] is not a valid match for a season 1
+                        # request — downloading 4 extra seasons is wrong regardless of cache status.
+                        if len(result_seasons) > 1:
+                            result['filter_reason'] = f"Multi-season pack {result_seasons} when searching for single season {season}"
+                            logging.info(f"Rejected: Multi-season pack {result_seasons} for single season {season} request: '{original_title}' (Size: {result['size']:.2f}GB)")
+                            continue
+                    # NZB-specific: reject incomplete season packs using the indexer's file count
+                    # WHEN that count is actually reported. If the indexer reports fewer files than
+                    # the expected episode count, the pack is missing episodes — reject it.
+                    #
+                    # If nzb_files == 0 the indexer simply didn't report a count (e.g. Prowlarr never
+                    # populates the newznab `files` attr) — that is "unknown", NOT "zero/incomplete".
+                    # Rejecting it here drops 100% of such packs, including complete ones. Instead,
+                    # fall through to the SAME per-episode size heuristic that torrent packs already
+                    # use (total size / expected episodes vs the version's min_size_gb) — backed by
+                    # cli-debrid's per-file episode matching, which re-acquires any genuinely-missing
+                    # episodes via the normal Wanted→Scraping flow. Nothing NZB-specific is invented;
+                    # we just stop treating count-less NZB packs differently from every other result.
+                    _nzb_files = result.get('nzb_files', 0)
+                    _protocol = result.get('protocol', '')
+                    if _protocol == 'nzb' and season and season_episode_counts:
+                        _expected_eps = season_episode_counts.get(season, 0)
+                        if _expected_eps > 0:
+                            if _nzb_files == 0:
+                                logging.debug(f"NZB pack '{original_title}': indexer reported no file count (unverifiable) — deferring to the size heuristic instead of rejecting")
+                            elif _nzb_files < _expected_eps:
+                                result['filter_reason'] = f"Incomplete NZB season pack: {_nzb_files} files but season has {_expected_eps} episodes"
+                                logging.info(f"Rejected: Incomplete NZB pack ({_nzb_files}/{_expected_eps} files) for '{original_title}' (Size: {result['size']:.2f}GB)")
+                                continue
+
                     #logging.debug("✓ Passed multi-episode checks")
                 else: # Single episode mode
                     #logging.debug(f"Single episode mode: S{season}E{episode}")
@@ -1191,8 +1266,14 @@ def filter_results(
                     
                     else: # Original logic for non-Formula 1 content
                         if season in result_seasons:
-                            # Parsed season explicitly matches the target season
+                            # Parsed season explicitly matches the target (XEM-mapped) season
                             season_match = True
+                        elif original_season is not None and original_season != season and original_season in result_seasons:
+                            # Torrent uses original TVDB season numbering (e.g. S03) while XEM mapped
+                            # the search to scene season (e.g. S01).  Accept both so that season-by-
+                            # season scene releases aren't rejected purely due to the XEM remap.
+                            season_match = True
+                            logging.debug(f"Season matched via original TVDB season S{original_season} (XEM remapped to S{season}) for '{original_title}'")
                         elif is_anime and parsed_season_is_missing_or_default and season > 1:
                              # Check if title explicitly mentions a different season before applying leniency
                              # Example: Searching S7, title says "S01". We should NOT be lenient here.
@@ -1275,11 +1356,14 @@ def filter_results(
                             logging.info(f"Rejected: Multi-season pack in single episode mode for '{original_title}' (Size: {result['size']:.2f}GB)")
                             continue
 
-                        # Also check if multiple distinct episodes are detected explicitly
+                        # Allow multi-episode files (e.g. S01E01E02) if target episode is included
+                        # Reject only if target episode is NOT in the file
                         if len(result_episodes) > 1:
-                            result['filter_reason'] = f"Multiple episodes detected: {result_episodes} when searching for single episode {episode}"
-                            logging.info(f"Rejected: Multiple episodes {result_episodes} in single episode mode for '{original_title}' (Size: {result['size']:.2f}GB)")
-                            continue
+                            if episode is not None and episode not in result_episodes:
+                                result['filter_reason'] = f"Multi-episode file {result_episodes} does not contain episode {episode}"
+                                logging.info(f"Rejected: Multi-episode file {result_episodes} missing episode {episode} for '{original_title}'")
+                                continue
+                            # else: target episode is in the file — allow through
                         
                         # This check is for single season packs and should apply only in single mode.
                         # It identifies torrents that are packs of the correct season but don't list episodes,
@@ -1477,6 +1561,15 @@ def filter_results(
                 is_identified_as_pack = (season_pack_type_from_parse not in ['N/A', 'Unknown']) or \
                                         (len(parsed_episodes_list_from_parse) > 1)
 
+                # NZB season packs re-download the whole pack to repair a single damaged
+                # article, unlike per-episode/aggregate results which only re-grab the
+                # affected episode. When disabled, reject NZB packs outright rather than
+                # scoring/selecting them — movies and non-NZB (torrent) packs are unaffected.
+                if disable_nzb_season_packs and is_identified_as_pack and result.get('protocol') == 'nzb':
+                    result['filter_reason'] = "NZB season packs disabled"
+                    logging.info(f"Rejected: NZB season pack disabled by setting for '{original_title}' (Size: {result['size']:.2f}GB)")
+                    continue
+
                 # --- START: New Pack Wantedness Check ---
                 from database.database_reading import get_all_media_items
 
@@ -1600,7 +1693,6 @@ def filter_results(
                                     logging.info(f"API fallback for 'Complete' pack '{original_title}'. Set num_episodes_in_pack to {num_episodes_in_pack}")
                     elif season_pack_type_from_parse not in ['N/A', 'Unknown']:
                         # Logic for specific season packs (S01, S01,S02) to calculate num_episodes_in_pack
-                        # (as previously implemented, including API fallback)
                         current_sum = 0
                         try:
                             season_numbers_in_pack = []
@@ -1609,26 +1701,36 @@ def filter_results(
                                 cleaned_part = part.strip().lstrip('S').lstrip('s')
                                 if cleaned_part.isdigit():
                                     season_numbers_in_pack.append(int(cleaned_part))
+
+                            # Sanity check: if the pack claims more seasons than the show has,
+                            # it's a bad parse (e.g. anime "Season 2 - 11" parsed as S2-S11).
+                            # Cap to avoid thousands of log lines and wasted API calls.
+                            known_season_count = len(season_episode_counts) if season_episode_counts else 0
+                            if known_season_count > 0 and len(season_numbers_in_pack) > known_season_count + 2:
+                                logging.debug(f"Pack type '{season_pack_type_from_parse}' claims {len(season_numbers_in_pack)} seasons but show only has {known_season_count} — likely bad parse for '{original_title}', skipping pack calc")
+                                season_numbers_in_pack = []
+
                             if season_numbers_in_pack:
+                                _logged_fallback = False
                                 for s_num in season_numbers_in_pack:
                                     ep_count_for_season = season_episode_counts.get(s_num, 0) if season_episode_counts else 0
                                     if ep_count_for_season == 0 and imdb_id and direct_api:
-                                        # API fallback logic for specific season
-                                        logging.warning(f"Season S{s_num} count is 0 for '{original_title}'. Attempting API fallback for imdb_id: {imdb_id}.")
+                                        if not _logged_fallback:
+                                            logging.warning(f"Season count is 0 for '{original_title}' (pack={season_pack_type_from_parse}). Attempting API fallback for imdb_id: {imdb_id}.")
+                                            _logged_fallback = True
                                         if _fetched_detailed_seasons_data_cache is None:
                                             try:
                                                 detailed_s_data, _ = direct_api.get_show_seasons(imdb_id=imdb_id)
                                                 _fetched_detailed_seasons_data_cache = detailed_s_data if detailed_s_data else {}
                                             except Exception as api_err:
-                                                logging.error(f"API fallback direct_api.get_show_seasons failed for {imdb_id} (S{s_num}): {api_err}")
+                                                logging.error(f"API fallback direct_api.get_show_seasons failed for {imdb_id}: {api_err}")
                                                 _fetched_detailed_seasons_data_cache = {}
                                         if s_num in _fetched_detailed_seasons_data_cache:
                                             fetched_s_data = _fetched_detailed_seasons_data_cache[s_num]
                                             ep_count_for_season = fetched_s_data.get('episode_count', 0)
-                                            logging.info(f"API fallback for S{s_num} of '{original_title}' got episode_count: {ep_count_for_season}")
                                     current_sum += ep_count_for_season
                                 num_episodes_in_pack = current_sum
-                        except ValueError: # Fallback for parsing error
+                        except ValueError:
                             if len(parsed_episodes_list_from_parse) > 1:
                                 num_episodes_in_pack = len(parsed_episodes_list_from_parse)
                     else: # Pack identified by PTT parsed episodes list
@@ -1689,17 +1791,21 @@ def filter_results(
             pre_size_filtered_results.append(result.copy()) 
             
             # Size filters
-            if result['size'] > 0:
-                if result['size'] < min_size_gb:
-                    size_type_msg = "Average episode size" if is_episode and is_identified_as_pack and num_episodes_in_pack > 0 else "Size"
-                    result['filter_reason'] = f"{size_type_msg} too small: {result['size']:.2f} GB (min: {min_size_gb} GB)"
-                    logging.info(f"Rejected: {size_type_msg} {result['size']:.2f}GB below minimum {min_size_gb}GB for '{original_title}' (Total pack: {result['total_size_gb']:.2f}GB)")
-                    continue
-                if result['size'] > max_size_gb:
-                    size_type_msg = "Average episode size" if is_episode and is_identified_as_pack and num_episodes_in_pack > 0 else "Size"
-                    result['filter_reason'] = f"Size too large: {result['size']:.2f} GB (max: {max_size_gb} GB)"
-                    logging.info(f"Rejected: {size_type_msg} {result['size']:.2f}GB above maximum {max_size_gb}GB for '{original_title}' (Total pack: {result['total_size_gb']:.2f}GB)")
-                    continue
+            # result['size'] == 0 means the scraper could not parse a size (e.g. an
+            # AIOStreams/MediaFusion result whose description has no machine-readable
+            # size), not that the release is verified to be empty — it must still be
+            # held to min_size_gb rather than bypassing the check entirely.
+            if result['size'] < min_size_gb:
+                size_type_msg = "Average episode size" if is_episode and is_identified_as_pack and num_episodes_in_pack > 0 else "Size"
+                reason = "unknown/unparseable" if result['size'] == 0 else f"{result['size']:.2f} GB"
+                result['filter_reason'] = f"{size_type_msg} too small: {reason} (min: {min_size_gb} GB)"
+                logging.info(f"Rejected: {size_type_msg} {reason} below minimum {min_size_gb}GB for '{original_title}' (Total pack: {result['total_size_gb']:.2f}GB)")
+                continue
+            if result['size'] > max_size_gb:
+                size_type_msg = "Average episode size" if is_episode and is_identified_as_pack and num_episodes_in_pack > 0 else "Size"
+                result['filter_reason'] = f"Size too large: {result['size']:.2f} GB (max: {max_size_gb} GB)"
+                logging.info(f"Rejected: {size_type_msg} {result['size']:.2f}GB above maximum {max_size_gb}GB for '{original_title}' (Total pack: {result['total_size_gb']:.2f}GB)")
+                continue
             #logging.debug("✓ Passed size checks")
             
             # Bitrate filters
@@ -1721,17 +1827,22 @@ def filter_results(
             # --- NEW: Pre-Normalization Filter Out Check ---
             # Check filter_out patterns against original fields BEFORE normalization
             if filter_out_patterns:
-                # Only check content fields, exclude technical identifiers like binge_group
+                is_nzb_result = result.get('protocol') == 'nzb'
                 original_fields_to_check = [original_title, filename]
                 matched_pre_norm_pattern = None
-                for pattern in filter_out_patterns:
+                for pobj in filter_out_patterns:
+                    src = pobj['source']
+                    if src == 'nzb' and not is_nzb_result:
+                        continue
+                    if src == 'debrid' and is_nzb_result:
+                        continue
+                    pat = pobj['pattern']
                     for field_value in original_fields_to_check:
-                        # Check only if field_value exists (is not None or empty string)
-                        if field_value and smart_search(pattern, field_value):
-                            matched_pre_norm_pattern = pattern
-                            break # Found a match for this pattern, stop checking fields
+                        if field_value and smart_search(pat, field_value):
+                            matched_pre_norm_pattern = pat
+                            break
                     if matched_pre_norm_pattern:
-                        break # Found a matching pattern, stop checking patterns
+                        break
 
                 if matched_pre_norm_pattern:
                     result['filter_reason'] = f"Matching filter_out pattern(s) before normalization: {matched_pre_norm_pattern}"
@@ -1744,37 +1855,47 @@ def filter_results(
             normalized_filename = normalize_title(filename).lower() if filename else None
             normalized_binge_group = normalize_title(binge_group).lower() if binge_group else None
 
-            # Function to check patterns against multiple fields
+            # Function to check patterns against multiple fields, respecting source type
+            is_nzb_result = result.get('protocol') == 'nzb'
             def check_patterns(patterns, fields_to_check):
                 matched = []
-                for pattern in patterns:
+                for pobj in patterns:
+                    src = pobj['source']
+                    if src == 'nzb' and not is_nzb_result:
+                        continue
+                    if src == 'debrid' and is_nzb_result:
+                        continue
+                    pat = pobj['pattern']
                     for field_value in fields_to_check:
-                        if field_value and smart_search(pattern, field_value):
-                            matched.append(pattern)
-                            break # Stop checking fields for this pattern once matched
+                        if field_value and smart_search(pat, field_value):
+                            matched.append(pat)
+                            break
                 return matched
 
             # Only check content fields, exclude technical identifiers like binge_group
             fields_to_check_patterns = [normalized_filter_title, normalized_filename]
-            
+
             # Filter Out Check (on normalized fields - keep this as well)
             if filter_out_patterns:
-                # Note: This check now runs *after* the pre-normalization check
                 matched_out_patterns = check_patterns(filter_out_patterns, fields_to_check_patterns)
                 if matched_out_patterns:
-                    # Only reject if it wasn't already rejected by the pre-norm check
-                    # (This check is now slightly redundant for patterns caught pre-norm, but harmless)
                     result['filter_reason'] = f"Matching filter_out pattern(s) after normalization: {', '.join(matched_out_patterns)}"
                     logging.info(f"Rejected (post-norm): Matched filter_out patterns '{matched_out_patterns}' for '{original_title}' (Size: {result['size']:.2f}GB)")
                     continue
 
             # Filter In Check (on normalized fields - keep this)
             if filter_in_patterns:
-                matched_in_patterns = check_patterns(filter_in_patterns, fields_to_check_patterns)
-                if not matched_in_patterns: # Reject if NO patterns matched ANY field
-                    result['filter_reason'] = "Not matching any filter_in patterns (post-normalization)"
-                    logging.info(f"Rejected (post-norm): No matching filter_in patterns for '{original_title}' (Size: {result['size']:.2f}GB)")
-                    continue
+                # Only consider patterns applicable to this result's source type
+                applicable_in = [p for p in filter_in_patterns
+                                 if p['source'] == 'both'
+                                 or (p['source'] == 'nzb' and is_nzb_result)
+                                 or (p['source'] == 'debrid' and not is_nzb_result)]
+                if applicable_in:
+                    matched_in_patterns = check_patterns(applicable_in, fields_to_check_patterns)
+                    if not matched_in_patterns:
+                        result['filter_reason'] = "Not matching any filter_in patterns (post-normalization)"
+                        logging.info(f"Rejected (post-norm): No matching filter_in patterns for '{original_title}' (Size: {result['size']:.2f}GB)")
+                        continue
             # logging.debug("✓ Passed pattern checks")
             # --- End Existing Pattern Matching ---
 

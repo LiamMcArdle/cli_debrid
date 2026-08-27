@@ -98,16 +98,16 @@ def search_tv_shows(search_term):
     return items
 
 @trace_memory_usage
-def get_all_media_items(state=None, media_type=None, imdb_id=None, tmdb_id=None, limit: Optional[int] = None):
+def get_all_media_items(state=None, media_type=None, imdb_id=None, tmdb_id=None, limit: Optional[int] = None, columns: Optional[List[str]] = None):
     """
     Retrieves all media items matching the criteria and returns them as a list.
     This function is a wrapper around stream_all_media_items for backward compatibility.
     It can be memory-intensive for large datasets.
     """
-    return list(stream_all_media_items(state, media_type, imdb_id, tmdb_id, limit))
+    return list(stream_all_media_items(state, media_type, imdb_id, tmdb_id, limit, columns))
 
 @trace_memory_usage
-def stream_all_media_items(state=None, media_type=None, imdb_id=None, tmdb_id=None, limit: Optional[int] = None):
+def stream_all_media_items(state=None, media_type=None, imdb_id=None, tmdb_id=None, limit: Optional[int] = None, columns: Optional[List[str]] = None):
     """
     A generator that streams media items from the database one by one.
     This is memory-efficient and suitable for large datasets.
@@ -115,7 +115,8 @@ def stream_all_media_items(state=None, media_type=None, imdb_id=None, tmdb_id=No
     conn = None
     try:
         conn = get_db_connection()
-        query = 'SELECT * FROM media_items WHERE 1=1'
+        col_str = ', '.join(columns) if columns else '*'
+        query = f'SELECT {col_str} FROM media_items WHERE 1=1'
         params = []
         if state:
             if isinstance(state, (list, tuple)):
@@ -1273,18 +1274,29 @@ def get_media_items_presence_batch(tmdb_ids: list[int]) -> dict[int, str]:
             tmdb_states[tmdb_id].add(state)
 
         # Apply the same logic as get_media_item_presence_overall for each ID
+        # "Partial" should ONLY mean: some episodes collected/blacklisted AND some actively wanted
         result = {}
+        wanted_states = {'Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping'}
+
         for tmdb_id in tmdb_ids:
             # Look up using string key since database returns tmdb_id as TEXT
             states = tmdb_states.get(str(tmdb_id), set())
 
             if not states:
                 result[tmdb_id] = "Missing"
-            elif 'Blacklisted' in states:
+            elif 'Blacklisted' in states and len(states) == 1:
+                # All episodes blacklisted
                 result[tmdb_id] = 'Blacklisted'
-            elif 'Collected' in states:
-                result[tmdb_id] = 'Collected' if len(states) == 1 else 'Partial'
+            elif 'Collected' in states or 'Blacklisted' in states:
+                # Has some collected or blacklisted episodes
+                # Check if there are any actively wanted episodes
+                if any(state in wanted_states for state in states):
+                    result[tmdb_id] = 'Partial'
+                else:
+                    # All episodes are either Collected, Blacklisted, or Unreleased (no wanted)
+                    result[tmdb_id] = 'Collected'
             else:
+                # No collected/blacklisted episodes, return first state (likely Wanted or Unreleased)
                 result[tmdb_id] = next(iter(states))
 
         return result
@@ -1522,6 +1534,45 @@ def get_items_with_all_blacklisted_versions() -> List[int]:
         if conn:
             conn.close()
 
+def get_item_counts_by_states(states: list) -> dict:
+    """Fetch COUNT(*) for multiple states in a single DB connection.
+
+    Creates the state index if it doesn't already exist (idempotent), then
+    runs one COUNT query per state inside the same open connection, which
+    is much cheaper than opening/closing a connection for each state.
+
+    Args:
+        states: List of state strings to count (e.g. ['Wanted', 'Blacklisted']).
+
+    Returns:
+        Dict mapping each state string to its item count.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        try:
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_media_items_state ON media_items(state);')
+        except Exception as e:
+            logging.debug(f"Index creation attempt (may already exist): {e}")
+
+        counts = {}
+        for state in states:
+            if state == 'Blacklisted':
+                query = 'SELECT COUNT(*) as count FROM media_items WHERE state = ? AND (ghostlisted IS NULL OR ghostlisted = 0)'
+            else:
+                query = 'SELECT COUNT(*) as count FROM media_items WHERE state = ?'
+            cursor = conn.execute(query, (state,))
+            result = cursor.fetchone()
+            counts[state] = result['count'] if result else 0
+        return counts
+    except Exception as e:
+        logging.error(f"Error in get_item_counts_by_states: {e}")
+        return {state: 0 for state in states}
+    finally:
+        if conn:
+            conn.close()
+
+
 # =============================================================================
 # Deletion Helper Functions (for DeletionManager)
 # =============================================================================
@@ -1704,6 +1755,7 @@ __all__ = [
     'get_show_episode_identifiers_from_db',
     'get_media_item_ids',
     'get_item_count_by_state',
+    'get_item_counts_by_states',
     'check_item_exists_by_directory_name',
     'check_item_exists_by_symlink_path',
     'check_item_exists_with_symlink_path_containing',

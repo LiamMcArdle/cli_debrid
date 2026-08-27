@@ -8,6 +8,7 @@ from collections import defaultdict
 from flask import current_app, g
 from requests.exceptions import RequestException
 import os
+from utilities.version import get_app_version
 
 def setup_api_logging():
     print("Setting up API logging")
@@ -141,6 +142,9 @@ class APIRateLimiter:
 class APITracker:
     def __init__(self):
         self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': f'cli_debrid/{get_app_version()} (+https://github.com/godver3/cli_debrid)'
+        })
         self.cookies = requests.cookies
         self.exceptions = requests.exceptions
         self.utils = requests.utils
@@ -148,7 +152,7 @@ class APITracker:
         self.current_url = None
         self._args = None
         self.rate_limiter = APIRateLimiter()
-        self.monitored_domains = {'api.real-debrid.com', 'api.alldebrid.com', 'api.trakt.tv', 'torrentio.strem.fun'}
+        self.monitored_domains = {'api.real-debrid.com', 'api.alldebrid.com', 'api.trakt.tv', 'torrentio.strem.fun', 'api.themoviedb.org'}
 
     @property
     def args(self):
@@ -161,7 +165,7 @@ class APITracker:
         domain = urlparse(url).netloc
         if domain in self.monitored_domains:
             self.rate_limiter.check_limits(domain)
-        
+
         try:
             self.current_url = url
             self._args = None
@@ -177,7 +181,7 @@ class APITracker:
         domain = urlparse(url).netloc
         if domain in self.monitored_domains:
             self.rate_limiter.check_limits(domain)
-        
+
         try:
             self.current_url = url
             self._args = None
@@ -193,7 +197,7 @@ class APITracker:
         domain = urlparse(url).netloc
         if domain in self.monitored_domains:
             self.rate_limiter.check_limits(domain)
-        
+
         try:
             self.current_url = url
             self._args = None
@@ -209,7 +213,7 @@ class APITracker:
         domain = urlparse(url).netloc
         if domain in self.monitored_domains:
             self.rate_limiter.check_limits(domain)
-        
+
         try:
             self.current_url = url
             self._args = None

@@ -181,7 +181,18 @@ def update_media_item_state(item_id, state, **kwargs):
         params = [state, datetime.now()]
 
         # Add optional fields to the query if they are provided
-        optional_fields = ['filled_by_title', 'filled_by_magnet', 'filled_by_file', 'filled_by_torrent_id', 'scrape_results', 'version', 'resolution', 'upgrading_from']
+        optional_fields = [
+            'filled_by_title',
+            'filled_by_magnet',
+            'filled_by_file',
+            'filled_by_torrent_id',
+            'scrape_results',
+            'version',
+            'resolution',
+            'upgrading_from',
+            'debrid_folder_name',
+            'original_filename',
+        ]
         for field in optional_fields:
             if field in kwargs:
                 query += f", {field} = ?"
@@ -189,6 +200,12 @@ def update_media_item_state(item_id, state, **kwargs):
                 if field == 'scrape_results':
                     value = json.dumps(value) if value else None
                 params.append(value)
+
+        # Always clear scrape_results when transitioning to a terminal state —
+        # scrape_results is only needed while adding/checking and can grow to
+        # hundreds of MB if left on collected/blacklisted items.
+        if state in ('Collected', 'Blacklisted', 'Ghostlisted', 'Unreleased') and 'scrape_results' not in kwargs:
+            query += ", scrape_results = NULL"
 
         # Complete the query
         query += " WHERE id = ?"
@@ -705,6 +722,22 @@ def add_media_item(item: dict, user_initiated: bool = False) -> int:
         item_type = item.get('type')
         version = item.get('version')
 
+        # Resolve imdb_id from tmdb_id if missing — ensures Plex GUID fast-path works
+        # and prevents trial-and-error match loops for items added with only TMDB ID.
+        if not imdb_id and tmdb_id:
+            try:
+                from cli_battery.app.direct_api import DirectAPI
+                _resolved_imdb, _ = DirectAPI.tmdb_to_imdb(
+                    str(tmdb_id),
+                    media_type='show' if item_type in ('episode', 'show') else 'movie'
+                )
+                if _resolved_imdb:
+                    imdb_id = _resolved_imdb
+                    item['imdb_id'] = _resolved_imdb
+                    logging.debug(f"[add_media_item] Resolved imdb_id {_resolved_imdb} from tmdb_id {tmdb_id}")
+            except Exception:
+                pass
+
         # GHOSTLIST/BLACKLIST CHECK
         if imdb_id or tmdb_id:
             # Build query to check for ghostlisted/blacklisted entries
@@ -786,6 +819,22 @@ def add_media_item(item: dict, user_initiated: bool = False) -> int:
                 # Different version: INSERT new entry (leave old ghostlisted alone)
                 else:
                     logging.info(f"🔓 User-initiated add: Different version detected (existing: {existing_version}, new: {version}). Inserting new entry, leaving old ghostlisted entry (ID: {existing_id}) as-is.")
+
+        # Sanitize year — never store the string "None", convert to None/int
+        if 'year' in item:
+            y = item['year']
+            if y == 'None' or y == '' or y is None:
+                # Try to recover from release_date
+                rd = item.get('release_date', '')
+                if rd and len(str(rd)) >= 4:
+                    try:
+                        item['year'] = int(str(rd)[:4])
+                    except (ValueError, TypeError):
+                        item['year'] = None
+                else:
+                    item['year'] = None
+            elif isinstance(y, str) and y.isdigit():
+                item['year'] = int(y)
 
         # Get the column names from the item dictionary
         columns = list(item.keys())
@@ -961,9 +1010,9 @@ def update_media_items_state_batch(item_ids: List[int], state: str, **kwargs):
         base_params = [state, datetime.now()]
 
         # Add optional fields to the query
-        optional_fields = ['filled_by_title', 'filled_by_magnet', 'filled_by_file', 
-                         'filled_by_torrent_id', 'scrape_results', 'version', 
-                         'resolution', 'upgrading_from']
+        optional_fields = ['filled_by_title', 'filled_by_magnet', 'filled_by_file',
+                         'filled_by_torrent_id', 'scrape_results', 'version',
+                         'resolution', 'upgrading_from', 'debrid_folder_name']
         
         for field in kwargs:
             if field in optional_fields:

@@ -1,8 +1,9 @@
 from flask import Blueprint, jsonify, request, render_template
+from flask_login import current_user
 from .models import user_required, onboarding_required
+from .utils import is_user_system_enabled
 from utilities.web_scraper import search_trakt, parse_search_term, get_available_versions
 from cli_battery.app.direct_api import DirectAPI
-from queues.config_manager import load_config
 from database.wanted_items import add_wanted_items
 import logging
 import re
@@ -62,13 +63,18 @@ def request_content():
         media_type = data.get('mediaType', '').lower()
         selected_versions = data.get('versions', [])  # Get selected versions as a list
         selected_seasons = data.get('seasons', [])  # Get selected seasons if provided
-        
+        selected_folder = data.get('selected_folder')  # Custom folder for symlink mode
+        selected_folder_is_custom = data.get('selected_folder_is_custom', False)
+        selected_tags = data.get('selected_tags') or None  # Tags for Plex mode NZB routing
+
         # Convert selected versions to dictionary format
         versions = {version: True for version in selected_versions}
-                  
+
         logging.info(f"Received versions: {versions}")
         if selected_seasons:
             logging.info(f"Received seasons: {selected_seasons}")
+        if selected_folder:
+            logging.info(f"Received folder: {selected_folder} (custom={selected_folder_is_custom})")
 
         # Convert TMDB ID to IMDB ID with media type hint
         if media_type == 'movie':
@@ -172,26 +178,87 @@ def request_content():
             
         # Process metadata
         processed_items = process_metadata([wanted_item])
-        if not processed_items:
-            # Handle cases where process_metadata returns None or an empty dict
-            logging.warning(f"process_metadata returned empty or None for TMDB ID {tmdb_id}. Content might already exist or is invalid.")
-            return jsonify({'error': 'Content already requested or already exists in library.'}), 400
-            
-        # Combine movies and episodes from processed items
-        all_items = processed_items.get('movies', []) + processed_items.get('episodes', [])
+
+        # If metadata is missing or empty, auto-refresh battery and retry once — for both movies and TV shows.
+        # This handles the case where the item has never been in the library (no library page to refresh from).
+        all_items = processed_items.get('movies', []) + processed_items.get('episodes', []) if processed_items else []
+        if not all_items and imdb_id:
+            logging.info(f"No items from process_metadata for {imdb_id} — forcing TMDB mapping refresh and battery refresh, then retrying.")
+            try:
+                # Step 1: Force-refresh the TMDB→IMDB mapping in case it was stale/wrong.
+                # This clears the cached entry and re-fetches from Trakt API.
+                refresh_media_type = 'movie' if media_type == 'movie' else 'show'
+                refreshed_imdb_id, refresh_source = DirectAPI.force_refresh_tmdb_mapping(tmdb_id, media_type=refresh_media_type)
+                if refreshed_imdb_id and refreshed_imdb_id != imdb_id:
+                    logging.info(f"TMDB mapping refreshed: {imdb_id} → {refreshed_imdb_id} (source: {refresh_source}). Updating wanted item.")
+                    imdb_id = refreshed_imdb_id
+                    wanted_item['imdb_id'] = imdb_id
+                elif refreshed_imdb_id:
+                    logging.info(f"TMDB mapping refresh confirmed same IMDB ID: {imdb_id}")
+                else:
+                    logging.warning(f"TMDB mapping refresh returned no IMDB ID for TMDB {tmdb_id}, keeping {imdb_id}")
+
+                # Step 2: Force-refresh battery metadata for the (possibly corrected) IMDB ID.
+                DirectAPI.force_refresh_metadata(imdb_id)
+                processed_items = process_metadata([wanted_item])
+                if processed_items:
+                    all_items = processed_items.get('movies', []) + processed_items.get('episodes', [])
+            except Exception as e_refresh:
+                logging.warning(f"Auto-refresh failed for {imdb_id}: {e_refresh}")
+
         if not all_items:
-            logging.warning(f"No processable items found after metadata processing for TMDB ID {tmdb_id}. Content might already exist.")
-            # Return a more specific message indicating the item might already exist or was filtered
-            return jsonify({'error': 'Content already requested or already exists in library.'}), 400
+            logging.warning(f"No processable items found after metadata processing for TMDB ID {tmdb_id}.")
+            return jsonify({'error': 'Could not retrieve metadata for this title. Please try again in a moment.'}), 400
             
-        # Add content source to all items
+        # Add content source to all items.
+        # When user system is enabled, record the requesting user's username as the detail
+        # so each user's requests get their own Plex label. Falls back to 'CD-Discover'.
+        if is_user_system_enabled() and current_user.is_authenticated:
+            source_detail = current_user.username
+        else:
+            source_detail = 'CD-Discover'
         for item in all_items:
-            item['content_source'] = 'content_requestor'
-            
+            item['content_source'] = 'content_requester'
+            item['content_source_detail'] = source_detail
+            if selected_folder:
+                item['selected_folder'] = selected_folder
+                item['selected_folder_is_custom'] = selected_folder_is_custom
+            if selected_tags:
+                item['tags'] = selected_tags
+
         # Pass versions dictionary to add_wanted_items
-        add_wanted_items(all_items, versions)
-        
-        logging.info(f"Content request processed: TMDB ID {tmdb_id} -> IMDB ID {imdb_id} ({media_type}) with versions {versions}")
+        items_added = add_wanted_items(all_items, versions)
+
+        # If nothing was added for a TV show, the battery may have stale/incomplete episode data.
+        # Force-refresh and retry once to pick up any missing episodes.
+        if items_added == 0 and media_type == 'tv' and imdb_id:
+            logging.info(f"No new items added for TV show {imdb_id} (battery may be stale) — forcing refresh and retrying.")
+            try:
+                DirectAPI.force_refresh_metadata(imdb_id)
+                processed_items = process_metadata([wanted_item])
+                if processed_items:
+                    all_items = processed_items.get('movies', []) + processed_items.get('episodes', [])
+                    for item in all_items:
+                        item['content_source'] = 'content_requester'
+                        item['content_source_detail'] = source_detail
+                        if selected_folder:
+                            item['selected_folder'] = selected_folder
+                            item['selected_folder_is_custom'] = selected_folder_is_custom
+                        if selected_tags:
+                            item['tags'] = selected_tags
+                    items_added = add_wanted_items(all_items, versions)
+                    logging.info(f"After refresh, added {items_added} items for {imdb_id}")
+            except Exception as e_refresh:
+                logging.warning(f"Post-add refresh failed for {imdb_id}: {e_refresh}")
+
+        logging.info(f"Content request processed: TMDB ID {tmdb_id} -> IMDB ID {imdb_id} ({media_type}) with versions {versions}, items added: {items_added}")
+        try:
+            from utilities.ai_habits import track_action
+            _uid = current_user.username if is_user_system_enabled() and current_user.is_authenticated else 'system'
+            _detail = f"{data.get('title', '')} ({data.get('year', '')}) [{media_type}]"
+            track_action('library_add_manual', detail=_detail, user_id=_uid)
+        except Exception:
+            pass
         return jsonify({'success': True, 'item': wanted_item})
         
     except Exception as e:

@@ -1,72 +1,27 @@
 import logging
 import os
 
-# --- Temporary logging setup for debugging the patch ---
-LOG_FLAG_PATCH = "[PLEX_PATCH_DEBUG]"
-patch_logger = logging.getLogger('plex_patch_debugger')
-patch_logger.setLevel(logging.INFO)
-log_dir_debug = os.environ.get('USER_LOGS', '/user/logs')
-os.makedirs(log_dir_debug, exist_ok=True)
-debug_log_path = os.path.join(log_dir_debug, 'patch_debug.log')
-fh = logging.FileHandler(debug_log_path)
-fh.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-fh.setFormatter(formatter)
-patch_logger.addHandler(fh)
-patch_logger.propagate = False
-
-patch_logger.info(f"{LOG_FLAG_PATCH} Logger initialized in plex_watchlist.py")
-# --- End temporary logging setup ---
-
-patch_logger.info(f"{LOG_FLAG_PATCH} Attempting to patch plexapi query methods for logging...")
+# plexapi uses metadata.provider.plex.tv for watchlist requests, but Plex moved
+# the watchlist API to discover.provider.plex.tv. Patch the query method to
+# rewrite the URL before the request goes out.
 try:
-    import plexapi.myplex
-    
-    # Patch PlexServer.query
-    original_plexserver_query = plexapi.myplex.PlexServer.query
-    def patched_plexserver_query(self, key, method=None, headers=None, params=None, timeout=None, **kwargs):
-        # Fix the endpoint URL if it's using the old metadata.provider.plex.tv
-        if 'metadata.provider.plex.tv' in str(key):
-            fixed_key = str(key).replace('metadata.provider.plex.tv', 'discover.provider.plex.tv')
-            patch_logger.info(f"{LOG_FLAG_PATCH} PLEXSERVER QUERY: FIXED ENDPOINT - Original: {key} -> Fixed: {fixed_key}")
-            patch_logger.info(f"{LOG_FLAG_PATCH} PLEXSERVER QUERY: method={method}, params={params}, kwargs={kwargs}")
-            return original_plexserver_query(self, fixed_key, method, headers, params, timeout, **kwargs)
-        else:
-            patch_logger.info(f"{LOG_FLAG_PATCH} PLEXSERVER QUERY: key={key}, method={method}, params={params}, kwargs={kwargs}")
-            return original_plexserver_query(self, key, method, headers, params, timeout, **kwargs)
-
-    plexapi.myplex.PlexServer.query = patched_plexserver_query
-    patch_logger.info(f"{LOG_FLAG_PATCH} SUCCESS: Patched plexapi.myplex.PlexServer.query to log requests.")
-
-    # Patch MyPlexAccount.query
-    original_myplex_query = plexapi.myplex.MyPlexAccount.query
-    def patched_myplex_query(self, url, method=None, headers=None, timeout=None, **kwargs):
-        # Fix the endpoint URL if it's using the old metadata.provider.plex.tv
-        if 'metadata.provider.plex.tv' in url:
-            fixed_url = url.replace('metadata.provider.plex.tv', 'discover.provider.plex.tv')
-            patch_logger.info(f"{LOG_FLAG_PATCH} MYPLEX QUERY: FIXED ENDPOINT - Original: {url} -> Fixed: {fixed_url}")
-            patch_logger.info(f"{LOG_FLAG_PATCH} MYPLEX QUERY: method={method}, kwargs={kwargs}")
-            return original_myplex_query(self, fixed_url, method, headers, timeout, **kwargs)
-        else:
-            patch_logger.info(f"{LOG_FLAG_PATCH} MYPLEX QUERY: url={url}, method={method}, kwargs={kwargs}")
-            return original_myplex_query(self, url, method, headers, timeout, **kwargs)
-
-    plexapi.myplex.MyPlexAccount.query = patched_myplex_query
-    patch_logger.info(f"{LOG_FLAG_PATCH} SUCCESS: Patched plexapi.myplex.MyPlexAccount.query to log requests.")
-
-except (ImportError, AttributeError) as e:
-    patch_logger.error(f"{LOG_FLAG_PATCH} FAILED: Could not patch plexapi query methods. Error: {e}", exc_info=True)
-
-patch_logger.info(f"{LOG_FLAG_PATCH} plex_watchlist.py module execution continues...")
+    import plexapi.myplex as _plexapi_myplex
+    _orig_myplex_query = _plexapi_myplex.MyPlexAccount.query
+    def _patched_myplex_query(self, url, method=None, headers=None, timeout=None, **kwargs):
+        if isinstance(url, str) and 'metadata.provider.plex.tv' in url:
+            url = url.replace('metadata.provider.plex.tv', 'discover.provider.plex.tv')
+        return _orig_myplex_query(self, url, method, headers, timeout, **kwargs)
+    _plexapi_myplex.MyPlexAccount.query = _patched_myplex_query
+except (ImportError, AttributeError):
+    pass
 
 from plexapi.myplex import MyPlexAccount
-patch_logger.info(f"{LOG_FLAG_PATCH} Imported MyPlexAccount from plexapi.myplex.")
 
 from typing import List, Dict, Any, Tuple
 from utilities.settings import get_setting
-from database.database_reading import get_media_item_presence
+from database.database_reading import get_media_item_presence, get_media_item_presence_overall
 from queues.config_manager import load_config
-from cli_battery.app.trakt_metadata import TraktMetadata
+from cli_battery.app import trakt_client
 from cli_battery.app.direct_api import DirectAPI
 import os
 import pickle
@@ -194,15 +149,14 @@ def get_show_status(imdb_id: str) -> str:
     """Get the status of a TV show from Trakt."""
     start_time = time.time()
     try:
-        trakt = TraktMetadata()
-        search_result = trakt._search_by_imdb(imdb_id)
+        search_result = trakt_client.search_by_imdb(imdb_id)
         if search_result and search_result['type'] == 'show':
             show = search_result['show']
             slug = show['ids']['slug']
             
             # Get the full show data using the slug
-            url = f"{trakt.base_url}/shows/{slug}?extended=full"
-            response = trakt._make_request(url)
+            url = f"{trakt_client.TRAKT_BASE_URL}/shows/{slug}?extended=full"
+            response = trakt_client._make_request(url)
             if response and response.status_code == 200:
                 show_data = response.json()
                 status = show_data.get('status', '').lower()
@@ -316,10 +270,10 @@ def get_wanted_from_plex_watchlist(versions: Dict[str, bool]) -> List[Tuple[List
             # Ensure media_type is 'tv' or 'movie' for consistency downstream
             if media_type == 'show': media_type = 'tv' 
             
-            item_state = get_media_item_presence(imdb_id=imdb_id)
+            item_state = get_media_item_presence_overall(imdb_id=imdb_id)
             logging.debug(f"Item '{title}' (IMDB: {imdb_id}) - Presence: {item_state}")
 
-            if item_state == "Collected" and should_remove:
+            if item_state in ("Collected", "Partial") and should_remove:
                 if media_type == 'tv':
                     if keep_series:
                         logging.debug(f"Keeping collected TV series: '{title}' (IMDB: {imdb_id}) - keep_series is enabled.")
@@ -474,70 +428,96 @@ def get_wanted_from_other_plex_watchlist(username: str, token: str, versions: Di
     logging.info(f"get_wanted_from_other_plex_watchlist for user {username} completed in {time.time() - overall_start_time:.4f} seconds.")
     return all_wanted_items
 
+def _check_plex_token(token, label):
+    """Check a single Plex token by hitting /api/v2/user directly.
+
+    Returns (valid: bool, username: str|None, expires_at, error: str|None, transient: bool)
+    - valid=True  → token confirmed good
+    - valid=False, transient=False → token is definitely bad (401)
+    - valid=False, transient=True  → could not reach Plex.tv; do not write invalid status
+    """
+    import requests as _req
+    headers = {
+        'Accept': 'application/json',
+        'X-Plex-Token': token,
+        'X-Plex-Client-Identifier': 'cli-debrid-token-check',
+    }
+    for attempt in range(2):
+        try:
+            r = _req.get('https://plex.tv/api/v2/user', headers=headers, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                username = data.get('username') or data.get('title') or label
+                # rememberExpiresAt not in v2 API response — use None
+                return True, username, None, None, False
+            elif r.status_code == 401:
+                logging.warning(f"Plex token for '{label}' returned 401 — token is invalid/revoked.")
+                return False, None, None, f'401 Unauthorized', False
+            else:
+                logging.warning(f"Plex token check for '{label}' got HTTP {r.status_code} (attempt {attempt+1})")
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                return False, None, None, f'HTTP {r.status_code}', True
+        except Exception as e:
+            logging.warning(f"Plex token check for '{label}' network error (attempt {attempt+1}): {e}")
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            return False, None, None, str(e), True
+    return False, None, None, 'Unknown error', True
+
+
 def validate_plex_tokens():
     """Validate all Plex tokens and return their status."""
     overall_start_time = time.time()
     token_status = {}
-    
+
     # Validate main user's token
-    try:
-        plex_token_validation_start_time = time.time()
-        plex_token = get_setting('Plex', 'token')
-        if plex_token:
-            account = MyPlexAccount(token=plex_token)
-            # Ping to refresh the auth token
-            ping_start_time = time.time()
-            account.ping()
-            logging.debug(f"Main token ping took {time.time() - ping_start_time:.4f} seconds.")
-            # The expiration is stored in the account object directly
-            token_status['main'] = {
-                'valid': True,
-                'expires_at': account.rememberExpiresAt if hasattr(account, 'rememberExpiresAt') else None,
-                'username': account.username
-            }
-            update_token_status('main', True, 
-                              expires_at=account.rememberExpiresAt if hasattr(account, 'rememberExpiresAt') else None,
-                              plex_username=account.username)
-            logging.info(f"Main Plex token validation took {time.time() - plex_token_validation_start_time:.4f} seconds. Valid: True, User: {account.username}")
-    except Exception as e:
-        logging.error(f"Error validating main Plex token: {e}")
-        token_status['main'] = {'valid': False, 'expires_at': None, 'username': None}
-        update_token_status('main', False)
-        logging.info(f"Main Plex token validation took {time.time() - plex_token_validation_start_time:.4f} seconds. Valid: False")
-    
+    plex_token = get_setting('Plex', 'token')
+    if plex_token:
+        t0 = time.time()
+        valid, username, expires_at, error, transient = _check_plex_token(plex_token, 'main')
+        if valid:
+            token_status['main'] = {'valid': True, 'expires_at': expires_at, 'username': username}
+            update_token_status('main', True, expires_at=expires_at, plex_username=username)
+            logging.info(f"Main Plex token valid. User: {username} ({time.time()-t0:.2f}s)")
+        elif transient:
+            # Cannot reach Plex.tv — keep last known status, don't overwrite with False
+            existing = load_token_status().get('main', {})
+            token_status['main'] = existing if existing else {'valid': None, 'expires_at': None, 'username': None}
+            logging.warning(f"Main Plex token check failed transiently ({error}) — keeping last known status.")
+        else:
+            token_status['main'] = {'valid': False, 'expires_at': None, 'username': None}
+            update_token_status('main', False)
+            logging.error(f"Main Plex token invalid: {error} ({time.time()-t0:.2f}s)")
+
     # Validate other users' tokens
     config = load_config()
     content_sources = config.get('Content Sources', {})
-    
+
     for source_id, source in content_sources.items():
         if source.get('type') == 'Other Plex Watchlist':
             username = source.get('username')
             token = source.get('token')
-            
-            if username and token:
-                other_token_validation_start_time = time.time()
-                try:
-                    account = MyPlexAccount(token=token)
-                    # Ping to refresh the auth token
-                    ping_start_time = time.time()
-                    account.ping()
-                    logging.debug(f"Other token ping for user {username} took {time.time() - ping_start_time:.4f} seconds.")
-                    token_status[username] = {
-                        'valid': True,
-                        'expires_at': account.rememberExpiresAt if hasattr(account, 'rememberExpiresAt') else None,
-                        'username': account.username
-                    }
-                    update_token_status(username, True,
-                                      expires_at=account.rememberExpiresAt if hasattr(account, 'rememberExpiresAt') else None,
-                                      plex_username=account.username)
-                    logging.info(f"Plex token validation for user {username} took {time.time() - other_token_validation_start_time:.4f} seconds. Valid: True, User: {account.username}")
-                except Exception as e:
-                    logging.error(f"Error validating Plex token for user {username}: {e}")
-                    token_status[username] = {'valid': False, 'expires_at': None, 'username': None}
-                    update_token_status(username, False)
-                    logging.info(f"Plex token validation for user {username} took {time.time() - other_token_validation_start_time:.4f} seconds. Valid: False")
-    
-    logging.info(f"validate_plex_tokens completed in {time.time() - overall_start_time:.4f} seconds.")
+            if not username or not token:
+                continue
+            t0 = time.time()
+            valid, plex_username, expires_at, error, transient = _check_plex_token(token, username)
+            if valid:
+                token_status[username] = {'valid': True, 'expires_at': expires_at, 'username': plex_username}
+                update_token_status(username, True, expires_at=expires_at, plex_username=plex_username)
+                logging.info(f"Plex token for '{username}' valid. ({time.time()-t0:.2f}s)")
+            elif transient:
+                existing = load_token_status().get(username, {})
+                token_status[username] = existing if existing else {'valid': None, 'expires_at': None, 'username': None}
+                logging.warning(f"Plex token check for '{username}' failed transiently ({error}) — keeping last known status.")
+            else:
+                token_status[username] = {'valid': False, 'expires_at': None, 'username': None}
+                update_token_status(username, False)
+                logging.error(f"Plex token for '{username}' invalid: {error} ({time.time()-t0:.2f}s)")
+
+    logging.info(f"validate_plex_tokens completed in {time.time() - overall_start_time:.2f}s.")
     return token_status
 
 
@@ -612,5 +592,74 @@ def remove_from_plex_watchlist_by_item(item: dict) -> dict:
     except Exception as e:
         result['message'] = f'Error removing from Plex Watchlist: {str(e)}'
         logging.error(f"[PLEX_WATCHLIST_REMOVE] {result['message']}", exc_info=True)
+
+    return result
+
+
+def remove_from_other_plex_watchlist_by_item(item: dict, token: str) -> dict:
+    """
+    Remove an item from another user's Plex Watchlist using their token.
+
+    Args:
+        item:  Dictionary with media item details (must have 'imdb_id', 'title', 'type')
+        token: Plex auth token belonging to the other user
+
+    Returns:
+        dict with 'success' boolean, 'message' string, optional 'not_found' boolean
+    """
+    start_time = time.time()
+    result = {'success': False, 'message': ''}
+
+    try:
+        account = MyPlexAccount(token=token)
+    except Exception as e:
+        result['message'] = f'Failed to connect to Other Plex account: {e}'
+        logging.error(f"[PLEX_WATCHLIST_REMOVE_OTHER] {result['message']}")
+        return result
+
+    imdb_id = item.get('imdb_id')
+    title   = item.get('title', 'Unknown')
+
+    if not imdb_id:
+        result['message'] = f'No IMDB ID provided for item: {title}'
+        logging.warning(f"[PLEX_WATCHLIST_REMOVE_OTHER] {result['message']}")
+        return result
+
+    logging.info(f"[PLEX_WATCHLIST_REMOVE_OTHER] Attempting to remove '{title}' (IMDB: {imdb_id}) "
+                 f"from {account.username}'s Plex Watchlist")
+    try:
+        watchlist = account.watchlist()
+        item_to_remove = None
+        for watchlist_item in watchlist:
+            for guid in getattr(watchlist_item, 'guids', []):
+                guid_str = str(guid.id) if hasattr(guid, 'id') else str(guid)
+                if f'imdb://{imdb_id}' in guid_str or imdb_id in guid_str:
+                    item_to_remove = watchlist_item
+                    break
+            if item_to_remove:
+                break
+
+        if not item_to_remove:
+            result['message'] = f"'{title}' (IMDB: {imdb_id}) not found in {account.username}'s Plex Watchlist"
+            result['not_found'] = True
+            logging.info(f"[PLEX_WATCHLIST_REMOVE_OTHER] {result['message']}")
+            return result
+
+        account.removeFromWatchlist(item_to_remove)
+        result['success'] = True
+        result['message'] = (f"Successfully removed '{title}' from {account.username}'s Plex Watchlist "
+                             f"(took {time.time() - start_time:.4f}s)")
+        logging.info(f"[PLEX_WATCHLIST_REMOVE_OTHER] {result['message']}")
+
+    except AttributeError as e:
+        if 'removeFromWatchlist' in str(e):
+            result['message'] = 'Plex API does not support watchlist removal (plexapi version too old)'
+            logging.warning(f"[PLEX_WATCHLIST_REMOVE_OTHER] {result['message']}: {e}")
+        else:
+            result['message'] = f'Attribute error: {e}'
+            logging.error(f"[PLEX_WATCHLIST_REMOVE_OTHER] {result['message']}", exc_info=True)
+    except Exception as e:
+        result['message'] = f'Error removing from Other Plex Watchlist: {e}'
+        logging.error(f"[PLEX_WATCHLIST_REMOVE_OTHER] {result['message']}", exc_info=True)
 
     return result

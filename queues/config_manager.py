@@ -264,6 +264,33 @@ def save_config(config):
                 except Exception as e:
                     logging.error(f"Failed to delete poster cache: {e}")
 
+        # Clear poster hash for any source whose plex_collection poster settings changed
+        try:
+            _POSTER_KEYS = {'poster_design', 'poster_accent', 'poster_eyebrow', 'poster_icon', 'poster_overlay_opacity', 'poster_glow_opacity', 'poster_glow_radius', 'collection_name'}
+            old_sources = previous_config.get('Content Sources', {})
+            new_sources = config.get('Content Sources', {})
+            _state_file = os.path.join(os.environ.get('USER_CONFIG', '/user/config'), 'plex_collection_state.json')
+            if os.path.exists(_state_file):
+                import json as _json
+                with open(_state_file) as _sf:
+                    _state = _json.load(_sf)
+                _changed = False
+                for src_id, new_src in new_sources.items():
+                    old_src = old_sources.get(src_id, {})
+                    old_pc = old_src.get('plex_collection', {}) if isinstance(old_src, dict) else {}
+                    new_pc = new_src.get('plex_collection', {}) if isinstance(new_src, dict) else {}
+                    if any(old_pc.get(k) != new_pc.get(k) for k in _POSTER_KEYS):
+                        if src_id in _state:
+                            _state[src_id].pop('poster_hash', None)
+                            _state[src_id].pop('poster_has_thumbs', None)
+                            _changed = True
+                            logging.info(f"[PlexCollections] Cleared poster hash for {src_id} due to settings change")
+                if _changed:
+                    with open(_state_file, 'w') as _sf:
+                        _json.dump(_state, _sf, indent=2)
+        except Exception as _e:
+            logging.warning(f"[PlexCollections] Failed to clear poster hashes on save: {_e}")
+
         # Save the new config
         with open(CONFIG_FILE, 'w') as file:
             # Move file pointer to beginning and truncate before writing
@@ -450,7 +477,11 @@ def add_scraper(scraper_type, scraper_config):
         config['Scrapers'] = {}
     
     # Generate a new scraper ID
-    base_name = scraper_type
+    # For Newznab, use the user-provided name as the key prefix instead of the type
+    if scraper_type == 'Newznab' and scraper_config.get('name', '').strip():
+        base_name = scraper_config.get('name').strip().replace(' ', '_')
+    else:
+        base_name = scraper_type
     index = 1
     while f"{base_name}_{index}" in config['Scrapers']:
         index += 1
@@ -501,6 +532,9 @@ def get_content_source_display_names():
         display_name = source_config.get('display_name', '').strip()
         # Use source_id as fallback if display_name is empty
         display_name_map[source_id] = display_name if display_name else source_id
+    # Map ai_butler to the configured AI Assistant display name
+    ai_display_name = (config.get('AI Assistant', {}).get('display_name') or 'AI Butler').strip()
+    display_name_map['ai_butler'] = ai_display_name
     return display_name_map
 
 def save_version_settings(version, settings):
@@ -533,17 +567,49 @@ def get_version_settings(version):
     scraping_config = config.get('Scraping', {})
     versions = scraping_config.get('versions', {})
     settings = versions.get(version, {})
-    
+
     # Convert infinity values back to empty string for both fields
     for field in ['max_size_gb', 'max_bitrate_mbps']:
         if field in settings and settings[field] == float('inf'):
             settings[field] = ''
-    
+
+    # Build the set of currently enabled scraper IDs, used for filtering below.
+    active_scrapers = {
+        k for k, v in config.get('Scrapers', {}).items()
+        if isinstance(v, dict) and v.get('enabled', False)
+    }
+
+    # Valid version config keys = schema keys + display_name + active scraper IDs.
+    # Anything else is a stale scraper key from a disabled or fully removed scraper.
+    valid_version_keys = (
+        set(SETTINGS_SCHEMA.get('Scraping', {}).get('versions', {}).get('schema', {}).keys())
+        | {'display_name'}
+        | active_scrapers
+    )
+
+    # Filter scraper_priorities nested dict to only include currently enabled scrapers.
+    if 'scraper_priorities' in settings and isinstance(settings['scraper_priorities'], dict):
+        settings['scraper_priorities'] = {
+            k: v for k, v in settings['scraper_priorities'].items()
+            if k in active_scrapers
+        }
+
+    # Strip any key not in the valid set (covers disabled AND fully removed scrapers).
+    stale_keys = [k for k in settings if k not in valid_version_keys]
+    for k in stale_keys:
+        del settings[k]
+
+    # Backfill any schema keys that are missing from this version config (new settings added after version was created).
+    version_schema = SETTINGS_SCHEMA.get('Scraping', {}).get('versions', {}).get('schema', {})
+    for k, v in version_schema.items():
+        if k not in settings and 'default' in v:
+            settings[k] = v['default']
+
     logging.debug(f"Fetched settings for version '{version}': {settings}")
-    
+
     if not settings:
         logging.warning(f"No settings found for version: {version}")
-    
+
     return settings
 
 def get_content_source_settings():

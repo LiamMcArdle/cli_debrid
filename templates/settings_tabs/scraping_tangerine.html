@@ -24,12 +24,14 @@
                 Versions
             </h3>
             <div class="scraping-settings-actions action-buttons settings-expand-collapse-buttons">
-                <button type="button" class="scraping-settings-btn btn-secondary settings-collapse-all">Collapse All</button>
-                <button type="button" class="scraping-settings-btn btn-secondary settings-expand-all">Expand All</button>
-                <button id="add-version-btn" class="scraping-settings-btn-primary btn-primary add-version-link">Add New Version</button>
-                <button id="add-default-version-btn" class="scraping-settings-btn-primary btn-primary add-version-link">Add Default Version</button>
-                <button id="add-separate-versions-btn" class="scraping-settings-btn-primary btn-primary add-version-link">Add Separate 1080p/4K Versions</button>
+                <button type="button" class="scraping-settings-btn btn-secondary settings-collapse-all"><i class="fa-solid fa-compress"></i> Collapse All</button>
+                <button type="button" class="scraping-settings-btn btn-secondary settings-expand-all"><i class="fa-solid fa-expand"></i> Expand All</button>
+                <button id="import-versions-btn" class="scraping-settings-btn-primary btn-primary add-version-link"><i class="fa-solid fa-file-import"></i> Import</button>
+                <button id="add-version-btn" class="scraping-settings-btn-primary btn-primary add-version-link"><i class="fa-solid fa-plus"></i> Add New Version</button>
+                <button id="add-default-version-btn" class="scraping-settings-btn-primary btn-primary add-version-link"><i class="fa-solid fa-plus"></i> Add Default Version</button>
+                <button id="add-separate-versions-btn" class="scraping-settings-btn-primary btn-primary add-version-link"><i class="fa-solid fa-plus"></i> Add Separate 1080p/4K Versions</button>
             </div>
+            <input type="file" id="import-versions-file" accept=".json" style="display:none">
         </div>
 
         <div class="version-list">
@@ -170,6 +172,83 @@
         });
     }
 
+    function exportVersion(versionId) {
+        const url = '/settings/versions/export?version=' + encodeURIComponent(versionId);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'version_' + versionId.replace(/\s+/g, '_') + '.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+    }
+
+    function showImportVersionsDialog() {
+        window.showPopup({
+            type: POPUP_TYPES.CONFIRM,
+            title: 'Import Versions',
+            message: 'Select a JSON file exported from cli_debrid. If a version name already exists you can choose to: <b>Rename</b> (import as a copy), <b>Overwrite</b>, or <b>Skip</b>.',
+            confirmText: 'Choose File',
+            cancelText: 'Cancel',
+            onConfirm: () => {
+                document.getElementById('import-versions-file').click();
+            }
+        });
+    }
+
+    function doImportVersions(file, conflictAction) {
+        window.Loading.show('Importing versions...', 'Please wait.', true);
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('conflict_action', conflictAction);
+        fetch('/settings/versions/import', { method: 'POST', body: fd })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    window.reloadTabContent('scraping', () => {
+                        window.Loading.hide();
+                        window.initializeExpandCollapse();
+                        initializeScrapingFunctionality();
+                        window.showPopup({
+                            type: POPUP_TYPES.SUCCESS,
+                            message: data.message || 'Import complete.'
+                        });
+                    });
+                } else {
+                    window.Loading.hide();
+                    window.showPopup({ type: POPUP_TYPES.ERROR, message: 'Import failed: ' + (data.error || 'Unknown error') });
+                }
+            })
+            .catch(err => {
+                window.Loading.hide();
+                window.showPopup({ type: POPUP_TYPES.ERROR, message: 'Import error: ' + err.message });
+            });
+    }
+
+    // Wire up Import button and hidden file input
+    (function() {
+        const importBtn = document.getElementById('import-versions-btn');
+        const fileInput = document.getElementById('import-versions-file');
+        if (importBtn) {
+            importBtn.addEventListener('click', showImportVersionsDialog);
+        }
+        if (fileInput) {
+            fileInput.addEventListener('change', function() {
+                const file = this.files[0];
+                if (!file) return;
+                this.value = '';
+                window.showPopup({
+                    type: POPUP_TYPES.CONFIRM,
+                    title: 'Conflict Resolution',
+                    message: 'If a version with the same name already exists, what should happen?\n\n• <b>Rename</b> — import with "(imported)" suffix\n• <b>Overwrite</b> — replace the existing version\n\nClick Cancel to skip duplicates.',
+                    confirmText: 'Rename',
+                    cancelText: 'Overwrite',
+                    onConfirm: () => doImportVersions(file, 'rename'),
+                    onCancel: () => doImportVersions(file, 'overwrite')
+                });
+            });
+        }
+    })();
+
     function showAddVersionPopup() {
         window.showPopup({
             type: POPUP_TYPES.PROMPT,
@@ -228,6 +307,7 @@
 
     function initializeVersionButtons() {
         const buttons = {
+            '.export-version-btn': exportVersion,
             '.rename-version-btn': renameVersion,
             '.duplicate-version-btn': duplicateVersion,
             '.delete-version-btn': deleteVersion
@@ -504,13 +584,18 @@
 
         if (filterType.startsWith('preferred_')) {
             newItem.innerHTML = `
-                <input type="text" id="${uniqueId}-term" name="filter-term" class="filter-term" placeholder="Term">
-                <input type="number" id="${uniqueId}-weight" name="filter-weight" class="filter-weight" min="1" value="1" placeholder="Weight">
+                <input type="text" id="${uniqueId}-term" class="filter-term" placeholder="Term">
+                <input type="number" id="${uniqueId}-weight" class="filter-weight" min="1" value="1" placeholder="Weight">
                 <button type="button" class="remove-filter">Remove</button>
             `;
         } else {
             newItem.innerHTML = `
-                <input type="text" id="${uniqueId}" name="filter-term" class="filter-term" placeholder="Term">
+                <input type="text" id="${uniqueId}" class="filter-term" placeholder="Term">
+                <select class="filter-source">
+                    <option value="both" selected>Both</option>
+                    <option value="nzb">NZB</option>
+                    <option value="debrid">Debrid</option>
+                </select>
                 <button type="button" class="remove-filter">Remove</button>
             `;
         }
@@ -784,13 +869,20 @@ document.addEventListener('scrapingContentLoaded', function() {
             <h4>{{ version }}</h4>
         </div>
         <div class="version-buttons version-actions">
+            <button type="button" class="export-version-btn btn-secondary" data-version-id="{{ version }}">
+                <i class="fa-solid fa-file-export"></i>
+                <span class="btn-text">Export</span>
+            </button>
             <button type="button" class="rename-version-btn btn-secondary" data-version-id="{{ version }}">
+                <i class="fa-solid fa-pen"></i>
                 <span class="btn-text">Rename</span>
             </button>
             <button type="button" class="duplicate-version-btn btn-secondary" data-version-id="{{ version }}">
+                <i class="fa-solid fa-copy"></i>
                 <span class="btn-text">Duplicate</span>
             </button>
             <button type="button" class="delete-version-btn btn-danger" data-version-id="{{ version }}">
+                <i class="fa-solid fa-trash"></i>
                 <span class="btn-text">Delete</span>
             </button>
         </div>
@@ -815,15 +907,17 @@ document.addEventListener('scrapingContentLoaded', function() {
             'wake_count',
             'require_physical_release',
             'language_code',
-            'anime_filter_mode'
+            'anime_filter_mode',
+            'enable_spanish_episode_parsing',
+            'use_alternative_titles'
         ] %}
-        
+
         {# Sort config items based on settings_order #}
         {% set sorted_keys = (settings_order + config.keys()|list)|unique|list %}
         {# Get list of scraper IDs to exclude from automatic rendering #}
         {% set scraper_ids = settings.Scrapers.keys()|list %}
         {% for key in sorted_keys %}
-            {% if key in config and key not in ['filter_in', 'filter_out', 'preferred_filter_in', 'preferred_filter_out', 'hybrid_mode', 'jackett_seeders_only', 'fallback_version', 'enable_scraper_priorities', 'scraper_priorities'] and key not in scraper_ids %}
+            {% if key in config and key not in ['filter_in', 'filter_out', 'preferred_filter_in', 'preferred_filter_out', 'hybrid_mode', 'jackett_seeders_only', 'fallback_version', 'enable_scraper_priorities', 'scraper_priorities', 'preferred-filter-out-term', 'preferred-filter-out-weight', 'preferred-filter-in-term', 'preferred-filter-in-weight'] and key not in scraper_ids %}
                 {% set value = config[key] %}
                 <div class="settings-form-group" {% if key == 'hybrid_mode' or key == 'jackett_seeders_only' %}style="display: none !important;"{% endif %}>
                     {% if value is boolean %}
@@ -835,14 +929,20 @@ document.addEventListener('scrapingContentLoaded', function() {
                                    {% if key == 'hybrid_mode' %}data-hybrid-mode="true"{% endif %}
                                    {% if key == 'jackett_seeders_only' %}data-jackett-seeders-only="true"{% endif %}
                                    {% if value %}checked{% endif %}>
-                            {{ key|replace('_', ' ')|title }}
+                            {% if key == 'enable_spanish_episode_parsing' %}Enable Spanish Episode/Movie Parsing
+                            {% elif key == 'use_alternative_titles' %}Use Alternative Titles
+                            {% else %}{{ key|replace('_', ' ')|title }}{% endif %}
                         </label>
                         {% if key == 'enable_upgrading' %}
                             <p class="settings-description">Enable upgrading of items in the queue.</p>
                         {% elif key == 'enable_upgrading_cleanup' %}
-                            <p class="settings-description">Enable cleanup of original items after successful upgrade (removes original item from Plex and Real-Debrid).</p>
+                            <p class="settings-description">Enable cleanup of original items after successful upgrade (removes original item from Plex and the configured debrid provider).</p>
                         {% elif key == 'require_physical_release' %}
                             <p class="settings-description">Only mark as Wanted after physical release date is available.</p>
+                        {% elif key == 'enable_spanish_episode_parsing' %}
+                            <p class="settings-description">Parse Spanish Cap.XXYY episode format (e.g. Cap.701 → S07E01) and match parenthesized alternative titles (e.g. 'El renacido (The Revenant)'). Enable for Spanish content.</p>
+                        {% elif key == 'use_alternative_titles' %}
+                            <p class="settings-description">Include alternative title aliases (filtered by Language Code) when checking title similarity.</p>
                         {% endif %}
                     {% elif key == 'max_resolution' %}
                         <label for="scraping-{{ version }}-{{ key }}" class="settings-title">Resolution Value:</label>
@@ -978,10 +1078,15 @@ document.addEventListener('scrapingContentLoaded', function() {
             <button type="button" class="add-filter-btn" data-version-id="{{ version }}" data-filter-type="filter_in">Add Filter In</button>
             <div class="filter-list" data-version="{{ version }}" data-filter-type="filter_in">
                 {% for filter in config.filter_in %}
+                {% set pattern = filter.pattern if filter is mapping else filter %}
+                {% set source = filter.source if filter is mapping else 'both' %}
                 <div class="filter-item">
-                    <input type="text" class="filter-term" value="{{ filter }}"
-                            data-section="Scraping"
-                            data-key="versions.{{ version }}.filter_in.{{ loop.index0 }}">
+                    <input type="text" class="filter-term" value="{{ pattern }}">
+                    <select class="filter-source">
+                        <option value="both" {% if source == 'both' %}selected{% endif %}>Both</option>
+                        <option value="nzb" {% if source == 'nzb' %}selected{% endif %}>NZB</option>
+                        <option value="debrid" {% if source == 'debrid' %}selected{% endif %}>Debrid</option>
+                    </select>
                     <button type="button" class="remove-filter">Remove</button>
                 </div>
                 {% endfor %}
@@ -989,10 +1094,15 @@ document.addEventListener('scrapingContentLoaded', function() {
             <button type="button" class="add-filter-btn" data-version-id="{{ version }}" data-filter-type="filter_out">Add Filter Out</button>
             <div class="filter-list" data-version="{{ version }}" data-filter-type="filter_out">
                 {% for filter in config.filter_out %}
+                {% set pattern = filter.pattern if filter is mapping else filter %}
+                {% set source = filter.source if filter is mapping else 'both' %}
                 <div class="filter-item">
-                    <input type="text" class="filter-term" value="{{ filter }}"
-                            data-section="Scraping"
-                            data-key="versions.{{ version }}.filter_out.{{ loop.index0 }}">
+                    <input type="text" class="filter-term" value="{{ pattern }}">
+                    <select class="filter-source">
+                        <option value="both" {% if source == 'both' %}selected{% endif %}>Both</option>
+                        <option value="nzb" {% if source == 'nzb' %}selected{% endif %}>NZB</option>
+                        <option value="debrid" {% if source == 'debrid' %}selected{% endif %}>Debrid</option>
+                    </select>
                     <button type="button" class="remove-filter">Remove</button>
                 </div>
                 {% endfor %}
@@ -1118,10 +1228,10 @@ document.addEventListener('scrapingContentLoaded', function() {
         <div class="settings-subsection">
             <!-- Debug: environment_mode = {{ environment_mode }} -->
             {% for key, value in settings_schema.Scraping.items() %}
-                {% if key not in ['versions', 'tab', 'upgrade_similarity_threshold', 'hybrid_mode', 'jackett_seeders_only', 'ultimate_sort_order', 'soft_max_size_gb', 'enable_upgrading_cleanup'] %}
+                {% if key not in ['versions', 'tab', 'upgrade_similarity_threshold', 'hybrid_mode', 'jackett_seeders_only', 'ultimate_sort_order', 'soft_max_size_gb'] %}
                     <!-- Debug: Processing key "{{ key }}" -->
                     {% if environment_mode is not defined or environment_mode == 'full' or key not in ['uncached_content_handling', 'accept_uncached_within_hours'] %}
-                    <div class="settings-form-group" {% if key == 'hybrid_mode' or key == 'jackett_seeders_only' or key == 'ultimate_sort_order' or key == 'soft_max_size_gb' or key == 'enable_upgrading_cleanup' %}style="display: none !important;"{% endif %}>
+                    <div class="settings-form-group" {% if key == 'hybrid_mode' or key == 'jackett_seeders_only' or key == 'ultimate_sort_order' or key == 'soft_max_size_gb' %}style="display: none !important;"{% endif %}>
                         <label for="scraping-{{ key }}" class="settings-title">{{ key|replace('_', ' ')|title }}:</label>
                         {% if value.type == 'boolean' %}
                             <input type="checkbox" id="scraping-{{ key }}" name="Scraping.{{ key }}"

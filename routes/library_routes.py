@@ -6,12 +6,13 @@ from flask import Blueprint, render_template, jsonify, request, Response
 from flask_login import current_user
 from .models import user_required, onboarding_required, admin_required
 from database.core import get_db_connection
-from utilities.settings import get_setting
+from utilities.settings import get_setting, get_nas_paths
 from debrid import get_debrid_provider
 import logging
 import requests
 from datetime import datetime
-from .discover_routes import get_digital_release_date
+from .discover_routes import get_digital_release_date, get_certification
+from .poster_cache import load_cache, save_cache
 
 library_bp = Blueprint('library', __name__, url_prefix='/library')
 
@@ -43,7 +44,8 @@ def index():
     return render_template('library.html',
                          plex_configured=plex_configured,
                          tmdb_configured=tmdb_configured,
-                         has_admin_permissions=has_admin_permissions)
+                         has_admin_permissions=has_admin_permissions,
+                         nas_paths=get_nas_paths())
 
 @library_bp.route('/plex_image/<path:plex_path>')
 @user_required
@@ -297,7 +299,7 @@ def fetch_poster(tmdb_id, media_type):
         return jsonify({
             'success': False,
             'error': 'No poster found in TMDB'
-        }), 404
+        })
 
     except Exception as e:
         logging.error(f"Error fetching poster for {tmdb_id} ({media_type}): {e}")
@@ -326,7 +328,7 @@ def fetch_poster_imdb(imdb_id, media_type):
             return jsonify({
                 'success': False,
                 'error': f'Could not find TMDB ID for IMDB ID {imdb_id}'
-            }), 404
+            })
 
         # Fetch metadata from TMDB
         media_meta = get_media_meta(tmdb_id, tmdb_media_type)
@@ -357,7 +359,7 @@ def fetch_poster_imdb(imdb_id, media_type):
         return jsonify({
             'success': False,
             'error': 'No poster found in TMDB'
-        }), 404
+        })
 
     except Exception as e:
         logging.error(f"Error fetching poster for IMDB {imdb_id} ({media_type}): {e}")
@@ -393,13 +395,14 @@ def get_library_data():
         status_filter = request.args.get('status', default='all', type=str)
         duplicates_state = request.args.get('duplicates_state', default='all', type=str)
         media_type_filter = request.args.get('media_type', default='all', type=str)
+        resolution_filter = request.args.get('resolution', default='all', type=str)
         sort_by = request.args.get('sort', default='title_asc', type=str)
 
         # Enforce limits
         limit = max(1, min(limit, MAX_BATCH_SIZE))
         offset = max(0, offset)
 
-        logging.info(f"Library data request: limit={limit}, offset={offset}, search='{search_term}', status={status_filter}, duplicates_state={duplicates_state}, type={media_type_filter}, sort={sort_by}")
+        logging.info(f"Library data request: limit={limit}, offset={offset}, search='{search_term}', status={status_filter}, duplicates_state={duplicates_state}, type={media_type_filter}, resolution={resolution_filter}, sort={sort_by}")
 
         # Build SQL query - do everything at database level for speed
         query_start = time.time()
@@ -440,9 +443,10 @@ def get_library_data():
             count_query += " AND state IN ('Collected', 'Upgrading') AND state != 'Unreleased'"
         elif status_filter == 'missing':
             # For movies: No collected/upgrading files AND not ANY duplicates (all duplicates shown in Duplicates filter)
-            # For TV shows: Partially collected (at least 1 collected/upgrading, but not all episodes)
+            # For TV shows: Partially collected (at least 1 collected/upgrading, but not all RELEASED episodes)
             # Also exclude Unreleased items (they belong in Upcoming filter) and queue states
             # Note: Upgrading is treated as Collected (we have it, just getting better version)
+            # Fixed: Only count released episodes in total (exclude Unreleased from denominator)
             query += """ AND state NOT IN ('Unreleased', 'Final Scrape', 'Scraping', 'Wanted') AND (
                 (type = 'movie' AND state NOT IN ('Collected', 'Upgrading') AND imdb_id NOT IN (
                     SELECT imdb_id
@@ -457,9 +461,10 @@ def get_library_data():
                     FROM media_items
                     WHERE type = 'episode'
                     AND (ghostlisted = 0 OR ghostlisted IS NULL)
+                    AND (season_number IS NULL OR season_number != 0)
                     GROUP BY tmdb_id
                     HAVING COUNT(DISTINCT CASE WHEN state IN ('Collected', 'Upgrading') THEN season_number || '-' || episode_number END) > 0
-                    AND COUNT(DISTINCT CASE WHEN state IN ('Collected', 'Upgrading') THEN season_number || '-' || episode_number END) < COUNT(DISTINCT season_number || '-' || episode_number)
+                    AND COUNT(DISTINCT CASE WHEN state IN ('Collected', 'Upgrading') THEN season_number || '-' || episode_number END) < COUNT(DISTINCT CASE WHEN state != 'Unreleased' THEN season_number || '-' || episode_number END)
                 ))
             )"""
             count_query += """ AND state NOT IN ('Unreleased', 'Final Scrape', 'Scraping', 'Wanted') AND (
@@ -476,9 +481,10 @@ def get_library_data():
                     FROM media_items
                     WHERE type = 'episode'
                     AND (ghostlisted = 0 OR ghostlisted IS NULL)
+                    AND (season_number IS NULL OR season_number != 0)
                     GROUP BY tmdb_id
                     HAVING COUNT(DISTINCT CASE WHEN state IN ('Collected', 'Upgrading') THEN season_number || '-' || episode_number END) > 0
-                    AND COUNT(DISTINCT CASE WHEN state IN ('Collected', 'Upgrading') THEN season_number || '-' || episode_number END) < COUNT(DISTINCT season_number || '-' || episode_number)
+                    AND COUNT(DISTINCT CASE WHEN state IN ('Collected', 'Upgrading') THEN season_number || '-' || episode_number END) < COUNT(DISTINCT CASE WHEN state != 'Unreleased' THEN season_number || '-' || episode_number END)
                 ))
             )"""
         elif status_filter == 'blacklist':
@@ -609,6 +615,24 @@ def get_library_data():
             count_query += " AND upgraded = ? AND state NOT IN ('Unreleased', 'Final Scrape', 'Scraping', 'Upgrading', 'Wanted')"
             params.append(1)
             count_params.append(1)
+        elif status_filter == 'broken':
+            # Collected/Upgrading items with no Plex match (ms_item_id is NULL)
+            query += " AND state IN ('Collected', 'Upgrading') AND (ms_item_id IS NULL OR ms_item_id = '')"
+            count_query += " AND state IN ('Collected', 'Upgrading') AND (ms_item_id IS NULL OR ms_item_id = '')"
+        elif status_filter == 'nas':
+            # Collected items stored on NAS/network drives (location_on_disk matches configured NAS prefixes)
+            nas_paths = get_nas_paths()
+            if nas_paths:
+                nas_conditions = " OR ".join(["location_on_disk LIKE ?" for _ in nas_paths])
+                query += f" AND state IN ('Collected', 'Upgrading') AND ({nas_conditions})"
+                count_query += f" AND state IN ('Collected', 'Upgrading') AND ({nas_conditions})"
+                for p in nas_paths:
+                    params.append(p.rstrip('/') + '/%')
+                    count_params.append(p.rstrip('/') + '/%')
+            else:
+                # No NAS paths configured — return nothing
+                query += " AND 1=0"
+                count_query += " AND 1=0"
         else:
             # Default to Collected and Partial for unknown filter values
             query += " AND state IN (?, ?)"
@@ -627,6 +651,17 @@ def get_library_data():
             count_query += " AND type IN (?, ?)"
             params.extend(['episode', 'show'])
             count_params.extend(['episode', 'show'])
+
+        # Resolution filter
+        if resolution_filter != 'all':
+            if resolution_filter == 'unknown':
+                query += " AND (resolution IS NULL OR resolution = '')"
+                count_query += " AND (resolution IS NULL OR resolution = '')"
+            else:
+                query += " AND resolution = ?"
+                count_query += " AND resolution = ?"
+                params.append(resolution_filter)
+                count_params.append(resolution_filter)
 
         # Search filter
         if search_term:
@@ -660,9 +695,9 @@ def get_library_data():
         else:
             query += " ORDER BY title COLLATE NOCASE ASC"
 
-        # Pagination
+        # Pagination — fetch one extra row to detect has_more without a separate COUNT query
         query += " LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
+        params.extend([limit + 1, offset])
 
         # Execute query
         query_exec_start = time.time()
@@ -670,14 +705,19 @@ def get_library_data():
         items = [dict(row) for row in cursor.fetchall()]
         query_exec_time = time.time() - query_exec_start
 
-        # Get total count
-        count_start = time.time()
-        count_cursor = conn.execute(count_query, count_params)
-        total_count = count_cursor.fetchone()[0]
-        count_time = time.time() - count_start
+        # Determine has_more and total using the n+1 trick (no separate COUNT query)
+        has_more = len(items) > limit
+        if has_more:
+            items = items[:limit]  # Drop the sentinel row
 
-        # Check if there are more items
-        has_more = (offset + len(items)) < total_count
+        # On the first page (offset=0), run the count query once so the UI can show "X/Y" from the start.
+        # On subsequent pages keep total_count=None to avoid repeated COUNT queries.
+        if offset == 0:
+            total_count = conn.execute(count_query, count_params).fetchone()[0]
+        elif not has_more:
+            total_count = offset + len(items)  # Exact total on the last page
+        else:
+            total_count = None  # Still paginating — total already known from first page
 
         # Batch-fetch episode counts for all shows in one query (PERFORMANCE OPTIMIZATION)
         episode_start = time.time()
@@ -778,7 +818,7 @@ def get_library_data():
 
         total_time = time.time() - start_time
         logging.info(f"Returning {len(formatted_items)} items (has_more={has_more}, total={total_count})")
-        logging.info(f"Performance: total={total_time:.3f}s, db_connect={db_connect_time:.3f}s, query={query_exec_time:.3f}s, count={count_time:.3f}s, episodes={episode_time:.3f}s, upcoming_release={upcoming_release_time:.3f}s, poster_cache_load={poster_cache_load_time:.3f}s, format={format_time:.3f}s")
+        logging.info(f"Performance: total={total_time:.3f}s, db_connect={db_connect_time:.3f}s, query={query_exec_time:.3f}s, episodes={episode_time:.3f}s, upcoming_release={upcoming_release_time:.3f}s, poster_cache_load={poster_cache_load_time:.3f}s, format={format_time:.3f}s")
 
         return jsonify({
             'success': True,
@@ -1106,6 +1146,7 @@ def show_detail_data(media_id):
                 state,
                 version,
                 filled_by_file,
+                filled_by_magnet,
                 collected_at,
                 release_date,
                 airtime,
@@ -1116,7 +1157,11 @@ def show_detail_data(media_id):
                 location_basename,
                 location_on_disk,
                 ghostlisted,
-                size
+                size,
+                manual_replace,
+                ms_item_id,
+                ms_audio_track,
+                ms_subtitle_track
             FROM media_items
             WHERE {id_field} = ? AND type = 'episode' AND (ghostlisted = 0 OR ghostlisted IS NULL)
             ORDER BY season_number ASC, episode_number ASC
@@ -1161,6 +1206,7 @@ def show_detail_data(media_id):
                 'state': ep['state'],
                 'version': ep['version'],
                 'filled_by_file': ep['filled_by_file'],
+                'filled_by_magnet': ep['filled_by_magnet'],
                 'collected_at': ep['collected_at'],
                 'release_date': ep['release_date'],
                 'airtime': ep['airtime'],
@@ -1169,31 +1215,34 @@ def show_detail_data(media_id):
                 'location_basename': ep['location_basename'],
                 'location_on_disk': ep['location_on_disk'],
                 'ghostlisted': ep['ghostlisted'],
-                'size': ep['size']
+                'size': ep['size'],
+                'manual_replace': bool(ep['manual_replace']),
+                'ms_item_id': ep['ms_item_id'],
+                'ms_audio_track': ep['ms_audio_track'],
+                'ms_subtitle_track': ep['ms_subtitle_track'],
             }
 
             seasons[season_num]['episodes'].append(episode_data)
 
         # Convert seasons dict to list and sort
+        # Add has_pending_replace flag to each season
+        for season in seasons.values():
+            season['has_pending_replace'] = any(ep.get('manual_replace') for ep in season['episodes'])
         seasons_list = sorted(seasons.values(), key=lambda x: x['season_number'])
 
-        # Get poster and backdrop from cache
-        from routes.poster_cache import get_cached_poster_url
-        # Use tmdb_id from show_data if available, otherwise use the media_id we queried with
-        cache_id = show_data['tmdb_id'] or media_id
-        poster_url = get_cached_poster_url(cache_id, 'tv')
-        backdrop_url = get_cached_poster_url(f"{cache_id}_backdrop", 'tv')
-
-        # Fetch TMDB metadata if tmdb_id is available
-        # If no tmdb_id but imdb_id exists, try to look up tmdb_id from imdb_id
+        # Initialize metadata variables
         overview = None
         genres = None
         network = None
         status = None
         rating = None
         vote_count = None
+        tmdb_poster_path = None
+        tmdb_backdrop_path = None
         tmdb_id = show_data['tmdb_id']
         tvdb_id = None  # TODO: Extract from database if available
+        tvdb_slug = None  # TVDB slug for correct URL format
+        number_of_seasons = 0  # Total seasons from TMDB for phantom season detection
 
         # If no TMDB ID but IMDB ID exists, try to look it up
         if not tmdb_id and show_data['imdb_id']:
@@ -1203,40 +1252,172 @@ def show_detail_data(media_id):
             if tmdb_id:
                 logging.info(f"Found TMDB ID {tmdb_id} for show {show_data['title']} via IMDB lookup")
 
+        # Try Battery first for basic metadata (overview, genres, network, status)
+        battery_metadata = None
+        if show_data['imdb_id']:
+            try:
+                from cli_battery.app.direct_api import DirectAPI
+                logging.info(f"Fetching metadata from Battery for show {show_data['imdb_id']}")
+                battery_metadata, source = DirectAPI.get_show_metadata(show_data['imdb_id'])
+                if battery_metadata:
+                    logging.info(f"Battery metadata retrieved from {source}")
+                    overview = battery_metadata.get('overview', '')
+                    genres_list = battery_metadata.get('genres', [])
+                    if isinstance(genres_list, list):
+                        genres = ', '.join(genres_list) if genres_list else None
+                    else:
+                        genres = genres_list
+                    network = battery_metadata.get('network', '')
+                    status = battery_metadata.get('status', '')
+                    # Get TVDB ID and slug from Battery metadata
+                    battery_ids = battery_metadata.get('ids', {})
+                    if isinstance(battery_ids, dict):
+                        tvdb_id = battery_ids.get('tvdb')
+                        tvdb_slug = battery_ids.get('slug')  # Get TVDB slug for proper URL format
+                    logging.info(f"Battery metadata - overview: {len(overview) if overview else 0} chars, genres: {genres}, network: {network}, status: {status}, tvdb_slug: {tvdb_slug}")
+            except Exception as e:
+                logging.warning(f"Battery metadata fetch failed for {show_data['imdb_id']}: {e}")
+
+        # Always fetch TMDB for ratings and vote counts (not available from Battery)
+        # Also used as fallback if Battery didn't provide basic metadata
         if tmdb_id:
             tmdb_api_key = get_setting('TMDB', 'api_key')
             if tmdb_api_key:
                 try:
                     details_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={tmdb_api_key}&language=en-US"
-                    logging.info(f"Fetching TMDB metadata for show {tmdb_id}")
-                    details_response = requests.get(details_url)
+                    if battery_metadata:
+                        logging.info(f"Fetching TMDB ratings for show {tmdb_id} (to supplement Battery data)")
+                    else:
+                        logging.info(f"Fetching TMDB metadata for show {tmdb_id} (Battery unavailable)")
+                    details_response = requests.get(details_url, timeout=15, headers={'Accept-Encoding': 'identity'})
                     details_response.raise_for_status()
                     details_data = details_response.json()
 
-                    overview = details_data.get('overview', '')
-                    genres_list = details_data.get('genres', [])
-                    genres = ', '.join([g['name'] for g in genres_list]) if genres_list else None
-
-                    # Get network (first network if multiple)
-                    networks_list = details_data.get('networks', [])
-                    if networks_list:
-                        network = networks_list[0].get('name', '')
-
-                    status = details_data.get('status', '')
+                    # Always get ratings from TMDB
                     rating = details_data.get('vote_average')  # TMDB rating (0-10)
                     vote_count = details_data.get('vote_count')  # Number of votes
 
-                    # Get TVDB ID if available in external_ids
-                    tvdb_id = details_data.get('external_ids', {}).get('tvdb_id')
+                    # Get poster and backdrop paths from TMDB
+                    tmdb_poster_path = details_data.get('poster_path')
+                    tmdb_backdrop_path = details_data.get('backdrop_path')
 
-                    logging.info(f"TMDB metadata fetched - overview: {len(overview) if overview else 0} chars, genres: {genres}, network: {network}, status: {status}, rating: {rating}, vote_count: {vote_count}")
+                    # Get total number of seasons for phantom season detection
+                    number_of_seasons = details_data.get('number_of_seasons', 0)
+
+                    # If Battery didn't provide data, use TMDB for everything
+                    if not battery_metadata:
+                        overview = details_data.get('overview', '')
+                        genres_list = details_data.get('genres', [])
+                        genres = ', '.join([g['name'] for g in genres_list]) if genres_list else None
+
+                        # Get network (first network if multiple)
+                        networks_list = details_data.get('networks', [])
+                        if networks_list:
+                            network = networks_list[0].get('name', '')
+
+                        status = details_data.get('status', '')
+
+                    # Get TVDB ID if not already from Battery
+                    if not tvdb_id:
+                        tvdb_id = details_data.get('external_ids', {}).get('tvdb_id')
+
+                    logging.info(f"TMDB data: rating: {rating}, vote_count: {vote_count}, poster: {tmdb_poster_path}, backdrop: {tmdb_backdrop_path}")
 
                 except Exception as e:
                     logging.error(f"Error fetching TMDB metadata for show {tmdb_id}: {e}")
             else:
-                logging.warning(f"TMDB API key not configured, skipping metadata fetch for show {tmdb_id}")
-        else:
-            logging.warning(f"No TMDB ID available for show {show_data['title']}, skipping metadata fetch")
+                logging.warning(f"TMDB API key not configured, skipping ratings fetch for show {tmdb_id}")
+        elif not battery_metadata:
+            logging.warning(f"No TMDB ID or IMDb ID available for show {show_data['title']}, skipping metadata fetch")
+
+        # Add phantom seasons for missing seasons if TMDB data is available
+        if number_of_seasons > 0 and tmdb_id and tmdb_api_key:
+            try:
+                existing_season_numbers = set(s['season_number'] for s in seasons_list)
+                missing_seasons = []
+
+                # Find missing seasons (1 to number_of_seasons, excluding Season 0/Specials)
+                for season_num in range(1, number_of_seasons + 1):
+                    if season_num not in existing_season_numbers:
+                        missing_seasons.append(season_num)
+
+                if missing_seasons:
+                    logging.info(f"Found {len(missing_seasons)} missing season(s): {missing_seasons}")
+
+                    # Fetch episode counts for missing seasons from TMDB
+                    for season_num in missing_seasons:
+                        try:
+                            season_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season_num}?api_key={tmdb_api_key}&language=en-US"
+                            logging.info(f"Fetching phantom season {season_num} details from TMDB")
+                            season_response = requests.get(season_url, timeout=10)
+                            season_response.raise_for_status()
+                            season_data = season_response.json()
+
+                            # Get episode count for this season
+                            episodes_in_season = season_data.get('episodes', [])
+                            episode_count = len(episodes_in_season)
+
+                            if episode_count > 0:
+                                # Create phantom season with phantom episodes
+                                phantom_episodes = []
+                                for ep_num in range(1, episode_count + 1):
+                                    phantom_episodes.append({
+                                        'id': None,
+                                        'episode_number': ep_num,
+                                        'episode_title': f'Episode {ep_num}',
+                                        'state': 'Missing',
+                                        'version': None,
+                                        'filled_by_file': None,
+                                        'collected_at': None,
+                                        'release_date': None,
+                                        'airtime': None,
+                                        'imdb_id': None,
+                                        'tmdb_id': None,
+                                        'location_basename': None,
+                                        'location_on_disk': None,
+                                        'ghostlisted': None,
+                                        'size': None,
+                                        'is_phantom': True
+                                    })
+
+                                phantom_season = {
+                                    'season_number': season_num,
+                                    'is_phantom_season': True,
+                                    'episodes': phantom_episodes
+                                }
+
+                                seasons_list.append(phantom_season)
+                                logging.info(f"Created phantom season {season_num} with {episode_count} episodes")
+                            else:
+                                logging.warning(f"Season {season_num} has no episodes according to TMDB, skipping")
+
+                        except requests.exceptions.RequestException as e:
+                            logging.error(f"Failed to fetch TMDB data for phantom season {season_num}: {e}")
+                            continue
+                        except Exception as e:
+                            logging.error(f"Error creating phantom season {season_num}: {e}")
+                            continue
+
+                    # Re-sort seasons list after adding phantom seasons
+                    seasons_list = sorted(seasons_list, key=lambda x: x['season_number'])
+
+            except Exception as e:
+                logging.error(f"Error in phantom season creation: {e}")
+                # Continue without phantom seasons if there's an error
+
+        # Get poster and backdrop URLs from cache, with TMDB fallback
+        from routes.poster_cache import get_cached_poster_url
+        cache_id = tmdb_id or show_data['imdb_id'] or media_id
+        poster_url = get_cached_poster_url(cache_id, 'tv')
+        backdrop_url = get_cached_poster_url(f"{cache_id}_backdrop", 'tv')
+
+        # If not in cache, use TMDB paths directly
+        if not poster_url and tmdb_poster_path:
+            poster_url = f"https://image.tmdb.org/t/p/w500{tmdb_poster_path}"
+            logging.info(f"Using TMDB poster path directly (cache empty): {poster_url}")
+        if not backdrop_url and tmdb_backdrop_path:
+            backdrop_url = f"https://image.tmdb.org/t/p/original{tmdb_backdrop_path}"
+            logging.info(f"Using TMDB backdrop path directly (cache empty): {backdrop_url}")
 
         # Extract storage path from first episode's filled_by_file or use location_on_disk
         storage_path = show_data['location_on_disk'] if show_data['location_on_disk'] else None
@@ -1330,6 +1511,12 @@ def show_detail_data(media_id):
         # Get auto-ghostlist setting
         auto_ghostlist_enabled = get_setting('Library Manager', 'ghostlist_mode', False)
 
+        # Fetch certification based on user's preferred region
+        certification = ''
+        if show_data['tmdb_id'] and tmdb_api_key:
+            certification_region = get_setting('TMDB', 'certification_region', 'US')
+            certification = get_certification(show_data['tmdb_id'], 'tv', tmdb_api_key, certification_region)
+
         return jsonify({
             'success': True,
             'show': {
@@ -1338,11 +1525,13 @@ def show_detail_data(media_id):
                 'tmdb_id': show_data['tmdb_id'],
                 'imdb_id': show_data['imdb_id'],
                 'tvdb_id': tvdb_id,
+                'tvdb_slug': tvdb_slug,
                 'version': show_data['version'],
                 'poster_url': poster_url,
                 'backdrop_url': backdrop_url,
                 'overview': overview,
                 'genres': genres,
+                'certification': certification,
                 'network': network,
                 'status': status,
                 'rating': rating,
@@ -1545,8 +1734,8 @@ def refresh_show_metadata(media_id):
 
         imdb_id, tmdb_id, title, media_type = show
 
-        # Get fresh metadata from DirectAPI (includes episode data)
-        metadata, source = DirectAPI.get_show_metadata(imdb_id)
+        # Force fresh metadata from TVDB/Trakt (not cached - ensures English titles)
+        metadata, source = DirectAPI.force_refresh_metadata(imdb_id)
 
         if not metadata:
             cursor.close()
@@ -1556,19 +1745,50 @@ def refresh_show_metadata(media_id):
                 'error': f'Could not fetch metadata from {source or "API"}'
             }), 500
 
-        # Update episode titles from fresh metadata
+        # Extract show-level metadata from DirectAPI results (Source of Truth)
+        show_title = metadata.get('title', title)
+        show_year = str(metadata.get('year', '')) if metadata.get('year') else None
+        show_status = metadata.get('status', '')
+
+        # Format genres from list to comma-separated string
+        genres_list = metadata.get('genres', [])
+        if isinstance(genres_list, list):
+            show_genres = ', '.join(genres_list) if genres_list else None
+        else:
+            show_genres = str(genres_list) if genres_list else None
+
+        # Update episode titles and air dates from fresh metadata
         updated_count = 0
         if 'seasons' in metadata:
             for season_number, season_data in metadata['seasons'].items():
                 if 'episodes' in season_data:
                     for episode_number, episode_data in season_data['episodes'].items():
                         episode_title = episode_data.get('title', f"Episode {episode_number}")
+                        first_aired = episode_data.get('first_aired')
+
+                        # Extract date and time from first_aired
+                        release_date = None
+                        airtime = None
+                        if first_aired:
+                            try:
+                                # Handle both space and T separator formats
+                                first_aired_str = str(first_aired).replace('T', ' ')
+                                if ' ' in first_aired_str:
+                                    date_part, time_part = first_aired_str.split(' ', 1)
+                                    release_date = date_part[:10]  # YYYY-MM-DD
+                                    airtime = time_part[:5]  # HH:MM
+                                else:
+                                    release_date = first_aired_str[:10]
+                            except Exception as e:
+                                logging.warning(f"Could not parse first_aired '{first_aired}' for S{season_number}E{episode_number}: {e}")
 
                         if episode_title and season_number is not None and episode_number is not None:
-                            # Update episode title in database
+                            # Update episode metadata in database
                             cursor.execute("""
                                 UPDATE media_items
                                 SET episode_title = ?,
+                                    release_date = COALESCE(?, release_date),
+                                    airtime = COALESCE(?, airtime),
                                     metadata_updated = ?,
                                     last_updated = ?
                                 WHERE imdb_id = ?
@@ -1577,6 +1797,8 @@ def refresh_show_metadata(media_id):
                                   AND episode_number = ?
                             """, (
                                 episode_title,
+                                release_date,
+                                airtime,
                                 datetime.now(),
                                 datetime.now(),
                                 imdb_id,
@@ -1585,6 +1807,77 @@ def refresh_show_metadata(media_id):
                             ))
                             if cursor.rowcount > 0:
                                 updated_count += cursor.rowcount
+
+        # Fetch fresh show-level metadata from TMDB (Optional fallback/supplement)
+        tmdb_updated = False
+        if tmdb_id:
+            try:
+                tmdb_api_key = get_setting('TMDB', 'api_key')
+                if tmdb_api_key:
+                    import requests
+                    # Fetch show details from TMDB
+                    tmdb_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={tmdb_api_key}"
+                    response = requests.get(tmdb_url, timeout=10)
+                    response.raise_for_status()
+                    tmdb_data = response.json()
+
+                    # Only update fields from TMDB if they are missing from DirectAPI/Battery
+                    if not show_year:
+                        show_year = tmdb_data.get('first_air_date', '')[:4] if tmdb_data.get('first_air_date') else None
+                    if not show_genres:
+                        show_genres = ', '.join([g['name'] for g in tmdb_data.get('genres', [])])
+                    if not show_status:
+                        show_status = tmdb_data.get('status', '')
+
+                    tmdb_updated = True
+                    logging.info(f"Updated supplementary TMDB metadata for {show_title}")
+            except Exception as e:
+                logging.warning(f"Failed to fetch supplementary TMDB metadata: {e}")
+
+        # Update show-level metadata in media_items (title and genres for episodes)
+        cursor.execute("""
+            UPDATE media_items
+            SET title = ?,
+                genres = ?
+            WHERE imdb_id = ? AND type = 'episode'
+        """, (
+            show_title,
+            show_genres,
+            imdb_id
+        ))
+        try:
+            # Calculate total_seasons from fresh metadata
+            total_seasons_refresh = None
+            if 'seasons' in metadata:
+                total_seasons_refresh = 0
+                for k in metadata['seasons'].keys():
+                    try:
+                        if int(k) != 0:
+                            total_seasons_refresh += 1
+                    except (ValueError, TypeError):
+                        pass
+            # Update show-level metadata in tv_shows table (title, year, status, total_seasons)
+            cursor.execute("""
+                UPDATE tv_shows
+                SET title = ?,
+                    year = ?,
+                    status = ?,
+                    total_seasons = COALESCE(?, total_seasons),
+                    last_updated = ?
+                WHERE imdb_id = ?
+            """, (
+                show_title,
+                show_year,
+                show_status,
+                total_seasons_refresh,
+                datetime.now(),
+                imdb_id
+            ))
+
+            tmdb_updated = True
+            logging.info(f"Updated metadata for {show_title} in both media_items and tv_shows tables")
+        except Exception as e:
+            logging.warning(f"Failed to update show metadata: {e}")
 
         # Also update timestamps for all episodes (even if title didn't change)
         cursor.execute(f"""
@@ -1598,17 +1891,115 @@ def refresh_show_metadata(media_id):
             media_id
         ))
 
+        # Add any episodes that are in the refreshed metadata but not yet in the DB.
+        # This handles the case where new episodes have been announced/released since the
+        # show was first requested (e.g. "3 of 8 episodes" becoming "8 of 8").
+        new_episodes_added = 0
+        try:
+            from metadata.metadata import process_metadata
+            from database.wanted_items import add_wanted_items
+
+            # Get the versions used by existing episodes of this show
+            cursor.execute(
+                "SELECT versions FROM media_items WHERE imdb_id = ? AND type = 'episode' AND versions IS NOT NULL LIMIT 1",
+                (imdb_id,)
+            )
+            versions_row = cursor.fetchone()
+            import json as _json
+            existing_versions = {}
+            if versions_row and versions_row[0]:
+                try:
+                    existing_versions = _json.loads(versions_row[0])
+                except Exception:
+                    pass
+
+            wanted_item = {
+                'imdb_id': imdb_id,
+                'tmdb_id': tmdb_id,
+                'media_type': 'tv',
+                'title': title,
+                'versions': existing_versions,
+                'content_source': 'content_requester',
+                'content_source_detail': 'Metadata-Refresh',
+            }
+            db_content.commit()  # Commit current updates before process_metadata reads the DB
+
+            processed = process_metadata([wanted_item])
+            if processed:
+                new_items = processed.get('episodes', [])
+                if new_items:
+                    for ep in new_items:
+                        ep['content_source'] = 'content_requester'
+                        ep['content_source_detail'] = 'Metadata-Refresh'
+                    added = add_wanted_items(new_items, existing_versions)
+                    new_episodes_added = added or 0
+                    if new_episodes_added:
+                        logging.info(f"Metadata refresh for {title}: added {new_episodes_added} previously-missing episode(s) to the queue.")
+        except Exception as e_add:
+            logging.warning(f"Could not add missing episodes during metadata refresh for {imdb_id}: {e_add}")
+
         db_content.commit()
         cursor.close()
         db_content.close()
 
-        logging.info(f"Refreshed metadata for {title} (IMDb: {imdb_id}): Updated {updated_count} episode titles from {source}")
+        # Clear poster/backdrop cache then immediately re-fetch so library page
+        # shows the updated poster without requiring a full page reload
+        new_poster_url = None
+        if tmdb_id:
+            try:
+                cache = load_cache()
+                poster_key = f"{tmdb_id}_tv"
+                backdrop_key = f"{tmdb_id}_backdrop_tv"
+                cache.pop(poster_key, None)
+                cache.pop(backdrop_key, None)
+                save_cache(cache)
+                logging.info(f"Cleared poster/backdrop cache for show {tmdb_id}")
+                # Re-fetch fresh poster and cache it immediately
+                from routes.poster_cache import cache_poster_url, get_cached_poster_url
+                from utilities.settings import get_setting as _gs
+                import requests as _req
+                _api_key = _gs('TMDB', 'api_key', default='')
+                if _api_key:
+                    _resp = _req.get(
+                        f"https://api.themoviedb.org/3/tv/{tmdb_id}/images"
+                        f"?api_key={_api_key}&include_image_language=en",
+                        timeout=10
+                    )
+                    if _resp.status_code == 200:
+                        _posters = _resp.json().get('posters', [])
+                        # Fall back to en+null if no English-only results
+                        if not _posters:
+                            _resp2 = _req.get(
+                                f"https://api.themoviedb.org/3/tv/{tmdb_id}/images"
+                                f"?api_key={_api_key}&include_image_language=en,null",
+                                timeout=10
+                            )
+                            if _resp2.status_code == 200:
+                                # Only keep English (iso_639_1='en') posters from fallback
+                                _all = _resp2.json().get('posters', [])
+                                _posters = [p for p in _all if p.get('iso_639_1') == 'en'] or _all
+                        if _posters:
+                            _best = sorted(_posters, key=lambda p: p.get('vote_average', 0), reverse=True)[0]
+                            new_poster_url = f"https://image.tmdb.org/t/p/w300{_best['file_path']}"
+                            cache_poster_url(tmdb_id, 'tv', new_poster_url)
+            except Exception as e:
+                logging.warning(f"Failed to clear/refresh poster cache: {e}")
+
+        logging.info(f"Refreshed metadata for {title} (IMDb: {imdb_id}): Updated {updated_count} episode titles from {source}, added {new_episodes_added} missing episode(s){', TMDB data updated' if tmdb_updated else ''}")
+
+        msg = f'Metadata refreshed for {title}'
+        if new_episodes_added:
+            msg += f' — added {new_episodes_added} previously-missing episode(s) to the queue'
 
         return jsonify({
             'success': True,
-            'message': f'Metadata refreshed for {title}',
+            'message': msg,
             'updated_episodes': updated_count,
-            'source': source
+            'new_episodes_added': new_episodes_added,
+            'tmdb_updated': tmdb_updated,
+            'source': source,
+            'cache_cleared': tmdb_id is not None,
+            'new_poster_url': new_poster_url
         })
 
     except Exception as e:
@@ -1714,6 +2105,35 @@ def refresh_movie_metadata(media_id):
             update_fields.append('runtime = ?')
             update_values.append(metadata['runtime'])
 
+        # Also fetch fresh TMDB data if we have tmdb_id to update additional fields
+        tmdb_updated = False
+        if tmdb_id:
+            try:
+                tmdb_api_key = get_setting('TMDB', 'api_key')
+                if tmdb_api_key:
+                    import requests
+                    # Fetch movie details from TMDB
+                    tmdb_url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={tmdb_api_key}"
+                    response = requests.get(tmdb_url, timeout=10)
+                    response.raise_for_status()
+                    tmdb_data = response.json()
+
+                    # Update genres from TMDB (this column exists)
+                    if tmdb_data.get('genres'):
+                        genres_str = ', '.join([g['name'] for g in tmdb_data['genres']])
+                        update_fields.append('genres = ?')
+                        update_values.append(genres_str)
+
+                    # Update runtime from TMDB if not already set
+                    if tmdb_data.get('runtime') and 'runtime = ?' not in update_fields:
+                        update_fields.append('runtime = ?')
+                        update_values.append(tmdb_data['runtime'])
+
+                    tmdb_updated = True
+                    logging.info(f"Updated TMDB metadata for {title}")
+            except Exception as e:
+                logging.warning(f"Failed to update TMDB metadata: {e}")
+
         # Always update timestamps
         update_fields.extend(['metadata_updated = ?', 'last_updated = ?'])
         update_values.extend([datetime.now(), datetime.now()])
@@ -1735,13 +2155,59 @@ def refresh_movie_metadata(media_id):
         cursor.close()
         db_content.close()
 
-        logging.info(f"Refreshed metadata for {title} (IMDb: {imdb_id}, TMDB: {tmdb_id}): Updated {updated_count} records from {source}")
+        # Clear poster/backdrop cache then immediately re-fetch so library page
+        # shows the updated poster without requiring a full page reload
+        new_poster_url = None
+        if tmdb_id:
+            try:
+                cache = load_cache()
+                poster_key = f"{tmdb_id}_movie"
+                backdrop_key = f"{tmdb_id}_backdrop_movie"
+                cache.pop(poster_key, None)
+                cache.pop(backdrop_key, None)
+                save_cache(cache)
+                logging.info(f"Cleared poster/backdrop cache for movie {tmdb_id}")
+                # Re-fetch fresh poster and cache it immediately
+                from routes.poster_cache import cache_poster_url
+                from utilities.settings import get_setting as _gs
+                import requests as _req
+                _api_key = _gs('TMDB', 'api_key', default='')
+                if _api_key:
+                    _resp = _req.get(
+                        f"https://api.themoviedb.org/3/movie/{tmdb_id}/images"
+                        f"?api_key={_api_key}&include_image_language=en",
+                        timeout=10
+                    )
+                    if _resp.status_code == 200:
+                        _posters = _resp.json().get('posters', [])
+                        # Fall back to en+null if no English-only results
+                        if not _posters:
+                            _resp2 = _req.get(
+                                f"https://api.themoviedb.org/3/movie/{tmdb_id}/images"
+                                f"?api_key={_api_key}&include_image_language=en,null",
+                                timeout=10
+                            )
+                            if _resp2.status_code == 200:
+                                # Only keep English (iso_639_1='en') posters from fallback
+                                _all = _resp2.json().get('posters', [])
+                                _posters = [p for p in _all if p.get('iso_639_1') == 'en'] or _all
+                        if _posters:
+                            _best = sorted(_posters, key=lambda p: p.get('vote_average', 0), reverse=True)[0]
+                            new_poster_url = f"https://image.tmdb.org/t/p/w300{_best['file_path']}"
+                            cache_poster_url(tmdb_id, 'movie', new_poster_url)
+            except Exception as e:
+                logging.warning(f"Failed to clear/refresh poster cache: {e}")
+
+        logging.info(f"Refreshed metadata for {title} (IMDb: {imdb_id}, TMDB: {tmdb_id}): Updated {updated_count} records from {source}{', TMDB data updated' if tmdb_updated else ''}")
 
         return jsonify({
             'success': True,
             'message': f'Metadata refreshed for {title}',
             'updated_count': updated_count,
-            'source': source
+            'tmdb_updated': tmdb_updated,
+            'source': source,
+            'cache_cleared': tmdb_id is not None,
+            'new_poster_url': new_poster_url
         })
 
     except Exception as e:
@@ -1949,12 +2415,14 @@ def check_deletion_impact():
                 }
 
             if 'debrid' in layers:
-                # Check debrid impact
-                debrid_hash = item.get('filled_by_magnet_hash')
+                torrent_id = item.get('filled_by_torrent_id', '') or ''
+                is_nzb = str(torrent_id).startswith('nzb:')
+                debrid_hash = item.get('filled_by_magnet_hash') if not is_nzb else torrent_id
                 item_impact['layers']['debrid'] = {
-                    'will_delete': bool(debrid_hash),
-                    'description': 'Debrid torrent',
-                    'hash': debrid_hash
+                    'will_delete': bool(is_nzb or debrid_hash),
+                    'description': 'Usenet NZB (cli_mount)' if is_nzb else 'Debrid torrent',
+                    'hash': debrid_hash,
+                    'is_nzb': is_nzb,
                 }
 
             if 'symlinks' in layers and deletion_manager.using_symlinks:
@@ -1998,6 +2466,8 @@ def check_deletion_impact():
                 layer_stats['files_count'] = layer_stats['affected_count']
             elif layer == 'debrid':
                 layer_stats['torrents_count'] = layer_stats['affected_count']
+                layer_stats['nzb_count'] = sum(1 for ii in impact['items'] if ii['layers'].get('debrid', {}).get('is_nzb'))
+                layer_stats['torrent_only_count'] = layer_stats['torrents_count'] - layer_stats['nzb_count']
             elif layer == 'symlinks':
                 layer_stats['symlinks_count'] = layer_stats['affected_count']
 
@@ -2202,6 +2672,26 @@ def delete_items():
 
                     auto_ghostlisted = True
                     logging.info(f"[DELETE_ITEMS] Ghostlisted {updated_count} item(s)")
+
+                    # Also add each unique imdb_id to manual blacklist
+                    try:
+                        from database.manual_blacklist import add_to_manual_blacklist
+                        seen_imdb = {}
+                        for item in items:
+                            iid = item.get('imdb_id')
+                            if iid and iid not in seen_imdb:
+                                seen_imdb[iid] = item
+                        for iid, item in seen_imdb.items():
+                            media_type = 'episode' if item.get('type') == 'episode' else 'movie'
+                            add_to_manual_blacklist(
+                                imdb_id=iid,
+                                media_type=media_type,
+                                title=item.get('title', ''),
+                                year=str(item.get('year', ''))
+                            )
+                            logging.info(f"[DELETE_ITEMS] Added {iid} to manual blacklist")
+                    except Exception as mb_err:
+                        logging.warning(f"[DELETE_ITEMS] Could not add to manual blacklist: {mb_err}")
 
                 except Exception as e:
                     logging.error(f"[DELETE_ITEMS] Failed to ghostlist: {e}")
@@ -2419,13 +2909,16 @@ def delete_show(imdb_id):
             logging.error(f"[DELETE_SHOW] Errors: {result.get('errors', [])}")
 
             errors_list = result.get('errors', ['Physical cleanup failed'])
-            return jsonify({
+            response_data = {
                 'success': False,
                 'error': errors_list[0] if errors_list else 'Physical cleanup failed',
                 'errors': errors_list,
                 'deleted_count': 0,
                 'failed_count': result.get('failed_count', 0)
-            }), 500
+            }
+            if result.get('plex_not_found'):
+                response_data['plex_not_found'] = True
+            return jsonify(response_data), 500
 
         # NOW handle database (LAST step) - ghostlist OR delete based on setting
         logging.info(f"[DELETE_SHOW] DATABASE LAYER - auto_ghostlist={auto_ghostlist}")
@@ -2457,6 +2950,20 @@ def delete_show(imdb_id):
 
                 auto_ghostlisted = True
                 logging.info(f"[DELETE_SHOW] Ghostlisted {updated_count} episodes for show {imdb_id} - ghostlisted=1, state=Blacklisted")
+
+                # Also add to manual blacklist to block future episodes
+                try:
+                    from database.manual_blacklist import add_to_manual_blacklist
+                    first_ep = episodes[0]
+                    add_to_manual_blacklist(
+                        imdb_id=imdb_id,
+                        media_type='episode',
+                        title=first_ep.get('title', ''),
+                        year=str(first_ep.get('year', ''))
+                    )
+                    logging.info(f"[DELETE_SHOW] Added {imdb_id} to manual blacklist")
+                except Exception as mb_err:
+                    logging.warning(f"[DELETE_SHOW] Could not add to manual blacklist: {mb_err}")
 
             except sqlite3.OperationalError as e:
                 # Rollback and check for database lock
@@ -2560,33 +3067,45 @@ def delete_show(imdb_id):
                 else:
                     layers_skipped.append({'layer': 'Media Server', 'reason': 'No items found on server'})
 
+        # Check file collection management mode for appropriate deletion messages
+        file_management = get_setting('File Management', 'file_collection_management', default='Plex')
+
         # Filesystem - only if files actually deleted
         if delete_files:
             if file_count > 0:
                 layers_executed.append('Filesystem')
             else:
-                layers_skipped.append({'layer': 'Filesystem', 'reason': 'No files found'})
+                # In Plex mode, filesystem layer is not applicable since Plex manages files
+                if file_management == 'Plex':
+                    layers_skipped.append({'layer': 'Filesystem', 'reason': 'Not applicable in Plex mode'})
+                else:
+                    layers_skipped.append({'layer': 'Filesystem', 'reason': 'No files found'})
 
         # Debrid - check for batch removal (debrid_removed flag) or per-item removal
         debrid_removed = result.get('debrid_removed', False) or any(r.get('debrid_removed', False) for r in result.get('results', []))
         if delete_from_debrid:
             if debrid_removed:
-                # Show count if available from batch removal
                 torrent_count = result.get('debrid_torrents_removed', 0)
-                if torrent_count > 0:
-                    layers_executed.append(f'Debrid ({torrent_count} torrent{"s" if torrent_count != 1 else ""})')
-                else:
-                    layers_executed.append('Debrid')
+                nzb_count = result.get('debrid_nzb_removed', 0) or sum(r.get('debrid_nzb_removed', 0) for r in result.get('results', []))
+                if nzb_count == 0 and torrent_count == 0:
+                    # single-item path: infer from per-item results
+                    for r in result.get('results', []):
+                        if r.get('debrid_removed'):
+                            if r.get('debrid_nzb_removed', 0): nzb_count += 1
+                            else: torrent_count += 1
+                _parts = []
+                if torrent_count > 0: _parts.append(f'{torrent_count} torrent{"s" if torrent_count != 1 else ""}')
+                if nzb_count > 0: _parts.append(f'{nzb_count} NZB{"s" if nzb_count != 1 else ""}')
+                layers_executed.append(f'Debrid/Usenet ({", ".join(_parts)})' if _parts else 'Debrid/Usenet')
             else:
                 # Check if debrid provider is available
                 debrid_provider = get_debrid_provider()
                 if not debrid_provider:
-                    layers_skipped.append({'layer': 'Debrid', 'reason': 'Provider not configured'})
+                    layers_skipped.append({'layer': 'Debrid/Usenet', 'reason': 'Provider not configured'})
                 else:
-                    layers_skipped.append({'layer': 'Debrid', 'reason': 'No torrents found'})
+                    layers_skipped.append({'layer': 'Debrid/Usenet', 'reason': 'No torrents/NZBs found'})
 
         # Symlinks - check if deleted or cleaned up (only show in Symlink mode)
-        file_management = get_setting('File Management', 'file_collection_management', default='Plex')
         symlink_count = sum(len(r.get('deleted_symlinks', [])) for r in result.get('results', []))
         if delete_symlinks and file_management != 'Plex':
             # If symlinks were found and deleted, or if operation succeeded (cleanup happened)
@@ -2669,7 +3188,7 @@ def delete_movie(imdb_id):
         # Get ALL movie files from database (movies can have multiple files/versions)
         conn = get_db_connection()
         movie_query = """
-            SELECT id, title, tmdb_id, imdb_id, type
+            SELECT id, title, year, tmdb_id, imdb_id, type
             FROM media_items
             WHERE (tmdb_id = ? OR imdb_id = ?) AND type = 'movie'
         """
@@ -2764,13 +3283,16 @@ def delete_movie(imdb_id):
             logging.error(f"[DELETE_MOVIE] Errors: {result.get('errors', [])}")
 
             errors_list = result.get('errors', ['Physical cleanup failed'])
-            return jsonify({
+            response_data = {
                 'success': False,
                 'error': errors_list[0] if errors_list else 'Physical cleanup failed',
                 'errors': errors_list,
                 'deleted_count': 0,
                 'failed_count': result.get('failed_count', 0)
-            }), 500
+            }
+            if result.get('plex_not_found'):
+                response_data['plex_not_found'] = True
+            return jsonify(response_data), 500
 
         # Handle database (LAST step) - ghostlist OR delete based on setting
         logging.info(f"[DELETE_MOVIE] DATABASE LAYER - auto_ghostlist={auto_ghostlist}")
@@ -2800,6 +3322,19 @@ def delete_movie(imdb_id):
 
                 auto_ghostlisted = True
                 logging.info(f"[DELETE_MOVIE] Ghostlisted movie {imdb_id} - ghostlisted=1, state=Blacklisted")
+
+                # Also add to manual blacklist to prevent re-addition
+                try:
+                    from database.manual_blacklist import add_to_manual_blacklist
+                    add_to_manual_blacklist(
+                        imdb_id=imdb_id,
+                        media_type='movie',
+                        title=movie.get('title', ''),
+                        year=str(movie.get('year', ''))
+                    )
+                    logging.info(f"[DELETE_MOVIE] Added {imdb_id} to manual blacklist")
+                except Exception as mb_err:
+                    logging.warning(f"[DELETE_MOVIE] Could not add to manual blacklist: {mb_err}")
 
             except Exception as e:
                 logging.error(f"[DELETE_MOVIE] Failed to ghostlist: {e}")
@@ -2859,32 +3394,44 @@ def delete_movie(imdb_id):
                 else:
                     layers_skipped.append({'layer': 'Media Server', 'reason': 'No items found on server'})
 
+        # Check file collection management mode for appropriate deletion messages
+        file_management = get_setting('File Management', 'file_collection_management', default='Plex')
+
         # Filesystem - only if files actually deleted
         if delete_files:
             if file_count > 0:
                 layers_executed.append('Filesystem')
             else:
-                layers_skipped.append({'layer': 'Filesystem', 'reason': 'No files found'})
+                # In Plex mode, filesystem layer is not applicable since Plex manages files
+                if file_management == 'Plex':
+                    layers_skipped.append({'layer': 'Filesystem', 'reason': 'Not applicable in Plex mode'})
+                else:
+                    layers_skipped.append({'layer': 'Filesystem', 'reason': 'No files found'})
 
         # Debrid - check for batch removal (debrid_removed flag) or per-item removal
         debrid_removed = result.get('debrid_removed', False) or any(r.get('debrid_removed', False) for r in result.get('results', []))
         if delete_from_debrid:
             if debrid_removed:
-                # Show count if available from batch removal
                 torrent_count = result.get('debrid_torrents_removed', 0)
-                if torrent_count > 0:
-                    layers_executed.append(f'Debrid ({torrent_count} torrent{"s" if torrent_count != 1 else ""})')
-                else:
-                    layers_executed.append('Debrid')
+                nzb_count = result.get('debrid_nzb_removed', 0) or sum(r.get('debrid_nzb_removed', 0) for r in result.get('results', []))
+                if nzb_count == 0 and torrent_count == 0:
+                    # single-item path: infer from per-item results
+                    for r in result.get('results', []):
+                        if r.get('debrid_removed'):
+                            if r.get('debrid_nzb_removed', 0): nzb_count += 1
+                            else: torrent_count += 1
+                _parts = []
+                if torrent_count > 0: _parts.append(f'{torrent_count} torrent{"s" if torrent_count != 1 else ""}')
+                if nzb_count > 0: _parts.append(f'{nzb_count} NZB{"s" if nzb_count != 1 else ""}')
+                layers_executed.append(f'Debrid/Usenet ({", ".join(_parts)})' if _parts else 'Debrid/Usenet')
             else:
                 debrid_provider = get_debrid_provider()
                 if not debrid_provider:
-                    layers_skipped.append({'layer': 'Debrid', 'reason': 'Provider not configured'})
+                    layers_skipped.append({'layer': 'Debrid/Usenet', 'reason': 'Provider not configured'})
                 else:
-                    layers_skipped.append({'layer': 'Debrid', 'reason': 'No torrents found'})
+                    layers_skipped.append({'layer': 'Debrid/Usenet', 'reason': 'No torrents/NZBs found'})
 
         # Symlinks - check if deleted or cleaned up (only show in Symlink mode)
-        file_management = get_setting('File Management', 'file_collection_management', default='Plex')
         symlink_count = sum(len(r.get('deleted_symlinks', [])) for r in result.get('results', []))
         if delete_symlinks and file_management != 'Plex':
             # If symlinks were found and deleted, or if operation succeeded (cleanup happened)
@@ -3146,15 +3693,16 @@ def delete_movie_files():
             if debrid_removed:
                 # Show count if available from batch removal
                 torrent_count = result.get('debrid_torrents_removed', 0)
-                if torrent_count > 0:
-                    layers_executed.append(f'Debrid ({torrent_count} torrent{"s" if torrent_count != 1 else ""})')
-                else:
-                    layers_executed.append('Debrid')
+                nzb_count = result.get('debrid_nzb_removed', 0)
+                _parts = []
+                if torrent_count > 0: _parts.append(f'{torrent_count} torrent{"s" if torrent_count != 1 else ""}')
+                if nzb_count > 0: _parts.append(f'{nzb_count} NZB{"s" if nzb_count != 1 else ""}')
+                layers_executed.append(f'Debrid/Usenet ({", ".join(_parts)})' if _parts else 'Debrid/Usenet')
             else:
                 if not debrid_provider:
-                    layers_skipped.append({'layer': 'Debrid', 'reason': 'Debrid provider not configured'})
+                    layers_skipped.append({'layer': 'Debrid/Usenet', 'reason': 'Provider not configured'})
                 else:
-                    layers_skipped.append({'layer': 'Debrid', 'reason': 'No torrents found'})
+                    layers_skipped.append({'layer': 'Debrid/Usenet', 'reason': 'No torrents/NZBs found'})
 
         # Symlinks - check if deleted or cleaned up
         symlink_count = sum(len(r.get('deleted_symlinks', [])) for r in result.get('results', []))
@@ -3307,13 +3855,16 @@ def delete_season(imdb_id, season_number):
             logging.error(f"[DELETE_SEASON] Errors: {result.get('errors', [])}")
 
             errors_list = result.get('errors', ['Physical cleanup failed'])
-            return jsonify({
+            response_data = {
                 'success': False,
                 'error': errors_list[0] if errors_list else 'Physical cleanup failed',
                 'errors': errors_list,
                 'deleted_count': 0,
                 'failed_count': result.get('failed_count', 0)
-            }), 500
+            }
+            if result.get('plex_not_found'):
+                response_data['plex_not_found'] = True
+            return jsonify(response_data), 500
 
         # NOW handle database (LAST step) - ghostlist OR delete based on setting
         #logging.info(f"[DELETE_SEASON] DATABASE LAYER - auto_ghostlist={auto_ghostlist}")
@@ -3411,19 +3962,25 @@ def delete_season(imdb_id, season_number):
         debrid_removed = result.get('debrid_removed', False) or any(r.get('debrid_removed', False) for r in result.get('results', []))
         if delete_from_debrid:
             if debrid_removed:
-                # Show count if available from batch removal
                 torrent_count = result.get('debrid_torrents_removed', 0)
-                if torrent_count > 0:
-                    layers_executed.append(f'Debrid ({torrent_count} torrent{"s" if torrent_count != 1 else ""})')
-                else:
-                    layers_executed.append('Debrid')
+                nzb_count = result.get('debrid_nzb_removed', 0) or sum(r.get('debrid_nzb_removed', 0) for r in result.get('results', []))
+                if nzb_count == 0 and torrent_count == 0:
+                    # single-item path: infer from per-item results
+                    for r in result.get('results', []):
+                        if r.get('debrid_removed'):
+                            if r.get('debrid_nzb_removed', 0): nzb_count += 1
+                            else: torrent_count += 1
+                _parts = []
+                if torrent_count > 0: _parts.append(f'{torrent_count} torrent{"s" if torrent_count != 1 else ""}')
+                if nzb_count > 0: _parts.append(f'{nzb_count} NZB{"s" if nzb_count != 1 else ""}')
+                layers_executed.append(f'Debrid/Usenet ({", ".join(_parts)})' if _parts else 'Debrid/Usenet')
             else:
                 # Check if debrid provider is available
                 debrid_provider = get_debrid_provider()
                 if not debrid_provider:
-                    layers_skipped.append({'layer': 'Debrid', 'reason': 'Provider not configured'})
+                    layers_skipped.append({'layer': 'Debrid/Usenet', 'reason': 'Provider not configured'})
                 else:
-                    layers_skipped.append({'layer': 'Debrid', 'reason': 'No torrents found'})
+                    layers_skipped.append({'layer': 'Debrid/Usenet', 'reason': 'No torrents/NZBs found'})
 
         # Symlinks - check if deleted or cleaned up
         symlink_count = sum(r.get('symlinks_deleted', 0) for r in result.get('results', []))
@@ -3464,6 +4021,111 @@ def delete_season(imdb_id, season_number):
             'success': False,
             'error': str(e)
         }), 500
+
+@library_bp.route('/mark_season_replace/<imdb_id>/<int:season_number>', methods=['POST'])
+@admin_required
+def mark_season_replace(imdb_id, season_number):
+    """
+    Mark all collected episodes in a season for replacement.
+    Sets manual_replace=1 on each Collected episode so the collection hook
+    can clean them up after the new season pack is collected.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.execute(
+            """UPDATE media_items SET manual_replace = 1, last_updated = ?
+               WHERE imdb_id = ? AND season_number = ? AND type = 'episode'
+               AND state NOT IN ('Blacklisted') AND (ghostlisted = 0 OR ghostlisted IS NULL)""",
+            (datetime.now(), imdb_id, season_number)
+        )
+        marked_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        logging.info(f"[REPLACE_SEASON] Marked {marked_count} episodes for replacement: {imdb_id} S{season_number:02d}")
+        return jsonify({'success': True, 'marked_count': marked_count})
+    except Exception as e:
+        logging.error(f"Error marking season {season_number} of {imdb_id} for replace: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@library_bp.route('/cancel_season_replace/<imdb_id>/<int:season_number>', methods=['POST'])
+@admin_required
+def cancel_season_replace(imdb_id, season_number):
+    """
+    Cancel a pending season replacement by clearing the manual_replace flag.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.execute(
+            """UPDATE media_items SET manual_replace = 0, last_updated = ?
+               WHERE imdb_id = ? AND season_number = ? AND type = 'episode'
+               AND manual_replace = 1""",
+            (datetime.now(), imdb_id, season_number)
+        )
+        cleared_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        logging.info(f"[REPLACE_SEASON] Cancelled replacement for {cleared_count} episodes: {imdb_id} S{season_number:02d}")
+        return jsonify({'success': True, 'cleared_count': cleared_count})
+    except Exception as e:
+        logging.error(f"Error cancelling season replace for {imdb_id} S{season_number}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@library_bp.route('/mark_movie_replace', methods=['POST'])
+@admin_required
+def mark_movie_replace():
+    """
+    Mark specific movie file entries for replacement.
+    Sets manual_replace=1 on each provided file ID so the collection hook
+    can clean them up after a new version is collected.
+    """
+    try:
+        data = request.get_json()
+        file_ids = data.get('file_ids', [])
+        if not file_ids:
+            return jsonify({'success': False, 'error': 'No file IDs provided'}), 400
+        conn = get_db_connection()
+        placeholders = ','.join(['?'] * len(file_ids))
+        cursor = conn.execute(
+            f"UPDATE media_items SET manual_replace = 1, last_updated = ? WHERE id IN ({placeholders}) AND type = 'movie'",
+            [datetime.now()] + list(file_ids)
+        )
+        marked_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        logging.info(f"[REPLACE_MOVIE] Marked {marked_count} movie file(s) for replacement. IDs: {file_ids}")
+        return jsonify({'success': True, 'marked_count': marked_count})
+    except Exception as e:
+        logging.error(f"Error marking movie files for replace: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@library_bp.route('/cancel_movie_replace', methods=['POST'])
+@admin_required
+def cancel_movie_replace():
+    """
+    Cancel a pending movie replacement by clearing the manual_replace flag.
+    """
+    try:
+        data = request.get_json()
+        imdb_id = data.get('imdb_id')
+        if not imdb_id:
+            return jsonify({'success': False, 'error': 'No imdb_id provided'}), 400
+        conn = get_db_connection()
+        cursor = conn.execute(
+            "UPDATE media_items SET manual_replace = 0, last_updated = ? WHERE imdb_id = ? AND type = 'movie' AND manual_replace = 1",
+            (datetime.now(), imdb_id)
+        )
+        cleared_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        logging.info(f"[REPLACE_MOVIE] Cancelled replacement for {cleared_count} movie file(s): {imdb_id}")
+        return jsonify({'success': True, 'cleared_count': cleared_count})
+    except Exception as e:
+        logging.error(f"Error cancelling movie replace for {imdb_id}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @library_bp.route('/delete_episode/<imdb_id>/<int:season_number>/<int:episode_number>', methods=['POST'])
 @admin_required
@@ -3522,6 +4184,9 @@ def delete_episode(imdb_id, season_number, episode_number):
         from utilities.settings import get_setting
         auto_ghostlist = get_setting('Library Manager', 'ghostlist_mode', False)
         auto_ghostlisted = False
+
+        # Check file collection management mode for appropriate deletion messages
+        file_management_mode = get_setting('File Management', 'file_collection_management', default='Plex')
 
         #logging.info(f"[DELETE_EPISODE] Auto-ghostlist setting: {auto_ghostlist}")
 
@@ -3656,33 +4321,44 @@ def delete_episode(imdb_id, season_number, episode_number):
             if file_count > 0:
                 layers_executed.append('Filesystem')
             else:
-                layers_skipped.append({'layer': 'Filesystem', 'reason': 'No files found'})
+                # In Plex mode, filesystem layer is not applicable since Plex manages files
+                if file_management_mode == 'Plex':
+                    layers_skipped.append({'layer': 'Filesystem', 'reason': 'Not applicable in Plex mode'})
+                else:
+                    layers_skipped.append({'layer': 'Filesystem', 'reason': 'No files found'})
 
         # Debrid - check for batch removal (debrid_removed flag) or per-item removal
         debrid_removed = result.get('debrid_removed', False) or any(r.get('debrid_removed', False) for r in result.get('results', []))
         if delete_from_debrid:
             if debrid_removed:
-                # Show count if available from batch removal
                 torrent_count = result.get('debrid_torrents_removed', 0)
-                if torrent_count > 0:
-                    layers_executed.append(f'Debrid ({torrent_count} torrent{"s" if torrent_count != 1 else ""})')
-                else:
-                    layers_executed.append('Debrid')
+                nzb_count = result.get('debrid_nzb_removed', 0) or sum(r.get('debrid_nzb_removed', 0) for r in result.get('results', []))
+                if nzb_count == 0 and torrent_count == 0:
+                    # single-item path: infer from per-item results
+                    for r in result.get('results', []):
+                        if r.get('debrid_removed'):
+                            if r.get('debrid_nzb_removed', 0): nzb_count += 1
+                            else: torrent_count += 1
+                _parts = []
+                if torrent_count > 0: _parts.append(f'{torrent_count} torrent{"s" if torrent_count != 1 else ""}')
+                if nzb_count > 0: _parts.append(f'{nzb_count} NZB{"s" if nzb_count != 1 else ""}')
+                layers_executed.append(f'Debrid/Usenet ({", ".join(_parts)})' if _parts else 'Debrid/Usenet')
             else:
                 debrid_provider = get_debrid_provider()
                 if not debrid_provider:
-                    layers_skipped.append({'layer': 'Debrid', 'reason': 'Provider not configured'})
+                    layers_skipped.append({'layer': 'Debrid/Usenet', 'reason': 'Provider not configured'})
                 else:
-                    layers_skipped.append({'layer': 'Debrid', 'reason': 'No torrents found'})
+                    layers_skipped.append({'layer': 'Debrid/Usenet', 'reason': 'No torrents/NZBs found'})
 
-        # Symlinks - check if deleted or cleaned up
-        symlink_count = sum(r.get('symlinks_deleted', 0) for r in result.get('results', []))
-        if delete_symlinks:
-            # If symlinks were found and deleted, or if operation succeeded (cleanup happened)
-            if symlink_count > 0 or result['success']:
-                layers_executed.append('Symlinks')
-            else:
-                layers_skipped.append({'layer': 'Symlinks', 'reason': 'No symlinks found'})
+        # Symlinks - check if deleted or cleaned up (only relevant in Symlinked/Local mode)
+        if file_management_mode != 'Plex':
+            symlink_count = sum(r.get('symlinks_deleted', 0) for r in result.get('results', []))
+            if delete_symlinks:
+                # If symlinks were found and deleted, or if operation succeeded (cleanup happened)
+                if symlink_count > 0 or result['success']:
+                    layers_executed.append('Symlinks')
+                else:
+                    layers_skipped.append({'layer': 'Symlinks', 'reason': 'No symlinks found'})
 
         # Cache
         if clear_cache:
@@ -3829,13 +4505,18 @@ def movie_detail_data(media_id):
             SELECT
                 id,
                 filled_by_file,
+                filled_by_magnet,
                 location_basename,
                 state,
                 collected_at,
                 release_date,
                 version,
                 ghostlisted,
-                size
+                size,
+                manual_replace,
+                ms_item_id,
+                ms_audio_track,
+                ms_subtitle_track
             FROM media_items
             WHERE {id_field} = ? AND type = 'movie'
             ORDER BY
@@ -3870,13 +4551,15 @@ def movie_detail_data(media_id):
             if tmdb_id:
                 logging.info(f"Found TMDB ID {tmdb_id} for movie {movie_data['title']} via IMDB lookup")
 
+        # Always use TMDB API for complete metadata (posters, backdrops, ratings)
+        # This ensures all display fields are populated correctly
         if tmdb_id:
             tmdb_api_key = get_setting('TMDB', 'api_key')
             if tmdb_api_key:
                 try:
                     details_url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={tmdb_api_key}&language=en-US"
-                    logging.info(f"Fetching TMDB metadata for movie {tmdb_id}")
-                    details_response = requests.get(details_url)
+                    logging.info(f"Fetching TMDB metadata for movie {tmdb_id} (Battery fallback)")
+                    details_response = requests.get(details_url, timeout=15, headers={'Accept-Encoding': 'identity'})
                     details_response.raise_for_status()
                     details_data = details_response.json()
 
@@ -3896,8 +4579,8 @@ def movie_detail_data(media_id):
                     logging.error(f"Error fetching TMDB metadata for movie {tmdb_id}: {e}")
             else:
                 logging.warning(f"TMDB API key not configured, skipping metadata fetch for movie {tmdb_id}")
-        else:
-            logging.warning(f"No TMDB ID available for movie {movie_data['title']}, skipping metadata fetch")
+        elif not battery_metadata:
+            logging.warning(f"No TMDB ID or IMDb ID available for movie {movie_data['title']}, skipping metadata fetch")
 
         # Get content source display name
         content_sources = []
@@ -3938,7 +4621,12 @@ def movie_detail_data(media_id):
                 'release_date': file_release_date,
                 'version': file_row['version'],
                 'ghostlisted': file_row['ghostlisted'],
-                'size': file_row['size']
+                'size': file_row['size'],
+                'manual_replace': bool(file_row['manual_replace']),
+                'ms_item_id': file_row['ms_item_id'],
+                'ms_audio_track': file_row['ms_audio_track'],
+                'ms_subtitle_track': file_row['ms_subtitle_track'],
+                'filled_by_magnet': file_row['filled_by_magnet']
             })
 
         # Fetch poster and backdrop URLs from cache, fallback to TMDB if not cached
@@ -3972,7 +4660,13 @@ def movie_detail_data(media_id):
         elif movie_data['release_date']:
             # No TMDB, use database date
             clean_release_date = str(movie_data['release_date']).split('T')[0].split(' ')[0]
-        
+
+        # Fetch certification based on user's preferred region
+        certification = ''
+        if movie_data['tmdb_id'] and tmdb_api_key:
+            certification_region = get_setting('TMDB', 'certification_region', 'US')
+            certification = get_certification(movie_data['tmdb_id'], 'movie', tmdb_api_key, certification_region)
+
         response_data = {
             'success': True,
             'movie': {
@@ -3994,6 +4688,7 @@ def movie_detail_data(media_id):
                 'backdrop_url': backdrop_url,
                 'overview': overview,
                 'genres': genres,
+                'certification': certification,
                 'runtime': runtime,
                 'rating': rating,
                 'vote_count': vote_count,
@@ -4001,7 +4696,8 @@ def movie_detail_data(media_id):
                 'size': largest_size,
                 'auto_ghostlist_enabled': auto_ghostlist_enabled
             },
-            'files': files
+            'files': files,
+            'has_pending_replace': any(f['manual_replace'] for f in files)
         }
 
         return jsonify(response_data)
@@ -4071,4 +4767,217 @@ def get_cast(media_type, tmdb_id):
         return jsonify({'success': False, 'error': 'Failed to fetch cast data'}), 500
     except Exception as e:
         logging.error(f"Error processing cast for {media_type}/{tmdb_id}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@library_bp.route('/add_not_wanted_magnet', methods=['POST'])
+@admin_required
+def add_not_wanted_magnet():
+    """Add magnet(s) from given item IDs to the not-wanted magnets list."""
+    req = request.get_json(silent=True) or {}
+    item_ids = req.get('item_ids', [])
+    if not item_ids or not isinstance(item_ids, list):
+        return jsonify({'success': False, 'error': 'item_ids list required'}), 400
+
+    try:
+        from database.not_wanted_magnets import add_to_not_wanted
+        conn = get_db_connection()
+        added = []
+        skipped = []
+        for item_id in item_ids:
+            row = conn.execute(
+                'SELECT filled_by_magnet, title, type FROM media_items WHERE id = ?',
+                (item_id,)
+            ).fetchone()
+            if not row or not row['filled_by_magnet']:
+                skipped.append(item_id)
+                continue
+            add_to_not_wanted(row['filled_by_magnet'])
+            added.append({'id': item_id, 'magnet': row['filled_by_magnet'][:60]})
+            logging.info(f"[NotWanted] Added magnet for item {item_id} ({row['title']}) to not-wanted list")
+        conn.close()
+        return jsonify({'success': True, 'added': len(added), 'skipped': len(skipped)})
+    except Exception as e:
+        logging.error(f"[NotWanted] Error adding to not-wanted: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@library_bp.route('/download_subtitles/item/<int:item_id>', methods=['POST'])
+def download_subtitles_item(item_id):
+    """Download subtitles for a single movie or episode."""
+    try:
+        from database.core import get_db_connection
+        from utilities.settings import get_setting
+        conn = get_db_connection()
+        row = conn.execute(
+            'SELECT id, title, type, location_on_disk, filled_by_file FROM media_items WHERE id = ? AND state IN ("Collected", "Upgrading")',
+            (item_id,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({'success': False, 'error': 'Item not found or not collected'}), 404
+
+        location = row['location_on_disk'] or ''
+        filled_by_file = row['filled_by_file'] or ''
+        if not location or not filled_by_file:
+            return jsonify({'success': False, 'error': 'No file path available'}), 400
+
+        is_plex = get_setting('File Management', 'file_collection_management', 'Plex') == 'Plex'
+        if is_plex:
+            from utilities.downsub import download_subtitles_for_video
+            import os
+            # Remap /debrid/ to actual mount path
+            from utilities.settings import load_config
+            import json as _json
+            cfg = load_config()
+            data_path = (cfg.get('Usenet Provider', {}).get('data_path') or '').strip()
+            mount_base = ''
+            if data_path:
+                try:
+                    with open(os.path.join(data_path, 'config.json')) as f:
+                        dc_cfg = _json.load(f)
+                    mount_base = (dc_cfg.get('mount', {}).get('mount_path') or '').rstrip('/')
+                except Exception:
+                    pass
+            if mount_base:
+                parts = location.split('/', 3)
+                if len(parts) >= 3 and parts[1] == 'debrid':
+                    location = mount_base + '/' + '/'.join(parts[2:])
+            full_path = os.path.join(location, filled_by_file) if not location.endswith(filled_by_file) else location
+        else:
+            full_path = location
+
+        from utilities.downsub import download_subtitles_for_video
+        found = download_subtitles_for_video(full_path)
+        if found:
+            return jsonify({'success': True, 'message': f'Subtitles downloaded for {row["title"]}'})
+        else:
+            return jsonify({'success': False, 'message': f'No subtitles found for {row["title"]}'})
+    except Exception as e:
+        logging.error(f"[DownSub] Error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@library_bp.route('/download_subtitles/season', methods=['POST'])
+def download_subtitles_season():
+    """Download subtitles for all episodes in a season."""
+    try:
+        from database.core import get_db_connection
+        from utilities.settings import get_setting, load_config
+        import os, json as _json, threading
+        data = request.get_json() or {}
+        imdb_id = data.get('imdb_id')
+        season_number = data.get('season_number')
+        if not imdb_id or season_number is None:
+            return jsonify({'success': False, 'error': 'imdb_id and season_number required'}), 400
+
+        conn = get_db_connection()
+        rows = conn.execute(
+            'SELECT location_on_disk, filled_by_file FROM media_items WHERE imdb_id = ? AND season_number = ? AND state IN ("Collected", "Upgrading") AND type = "episode"',
+            (imdb_id, season_number)
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            return jsonify({'success': False, 'error': 'No collected episodes found'}), 404
+
+        is_plex = get_setting('File Management', 'file_collection_management', 'Plex') == 'Plex'
+        mount_base = ''
+        if is_plex:
+            cfg = load_config()
+            data_path = (cfg.get('Usenet Provider', {}).get('data_path') or '').strip()
+            if data_path:
+                try:
+                    with open(os.path.join(data_path, 'config.json')) as f:
+                        dc_cfg = _json.load(f)
+                    mount_base = (dc_cfg.get('mount', {}).get('mount_path') or '').rstrip('/')
+                except Exception:
+                    pass
+
+        paths = []
+        for row in rows:
+            loc = row['location_on_disk'] or ''
+            fbf = row['filled_by_file'] or ''
+            if not loc or not fbf:
+                continue
+            if is_plex:
+                if mount_base:
+                    parts = loc.split('/', 3)
+                    if len(parts) >= 3 and parts[1] == 'debrid':
+                        loc = mount_base + '/' + '/'.join(parts[2:])
+                paths.append(os.path.join(loc, fbf) if not loc.endswith(fbf) else loc)
+            else:
+                # Symlink mode: location_on_disk is already the full path to the symlink file
+                paths.append(loc)
+
+        def _run():
+            from utilities.downsub import download_subtitles_for_video
+            found = sum(1 for p in paths if download_subtitles_for_video(p))
+            logging.info(f"[DownSub] Season done: {found}/{len(paths)} subtitles downloaded")
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({'success': True, 'message': f'Searching subtitles for {len(paths)} episodes (check logs for results)'})
+    except Exception as e:
+        logging.error(f"[DownSub] Season error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@library_bp.route('/download_subtitles/show', methods=['POST'])
+def download_subtitles_show():
+    """Download subtitles for all collected episodes in a show."""
+    try:
+        from database.core import get_db_connection
+        from utilities.settings import get_setting, load_config
+        import os, json as _json, threading
+        data = request.get_json() or {}
+        imdb_id = data.get('imdb_id')
+        if not imdb_id:
+            return jsonify({'success': False, 'error': 'imdb_id required'}), 400
+
+        conn = get_db_connection()
+        rows = conn.execute(
+            'SELECT location_on_disk, filled_by_file FROM media_items WHERE imdb_id = ? AND state IN ("Collected", "Upgrading") AND type = "episode"',
+            (imdb_id,)
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            return jsonify({'success': False, 'error': 'No collected episodes found'}), 404
+
+        is_plex = get_setting('File Management', 'file_collection_management', 'Plex') == 'Plex'
+        mount_base = ''
+        if is_plex:
+            cfg = load_config()
+            data_path = (cfg.get('Usenet Provider', {}).get('data_path') or '').strip()
+            if data_path:
+                try:
+                    with open(os.path.join(data_path, 'config.json')) as f:
+                        dc_cfg = _json.load(f)
+                    mount_base = (dc_cfg.get('mount', {}).get('mount_path') or '').rstrip('/')
+                except Exception:
+                    pass
+
+        paths = []
+        for row in rows:
+            loc = row['location_on_disk'] or ''
+            fbf = row['filled_by_file'] or ''
+            if not loc or not fbf:
+                continue
+            if is_plex:
+                if mount_base:
+                    parts = loc.split('/', 3)
+                    if len(parts) >= 3 and parts[1] == 'debrid':
+                        loc = mount_base + '/' + '/'.join(parts[2:])
+                paths.append(os.path.join(loc, fbf) if not loc.endswith(fbf) else loc)
+            else:
+                # Symlink mode: location_on_disk is already the full path to the symlink file
+                paths.append(loc)
+
+        def _run():
+            from utilities.downsub import download_subtitles_for_video
+            found = sum(1 for p in paths if download_subtitles_for_video(p))
+            logging.info(f"[DownSub] Show done: {found}/{len(paths)} subtitles downloaded")
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({'success': True, 'message': f'Searching subtitles for {len(paths)} episodes (check logs for results)'})
+    except Exception as e:
+        logging.error(f"[DownSub] Show error: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
