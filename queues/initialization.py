@@ -107,21 +107,10 @@ def reset_queued_item_status():
     # lives in media_items.next_retry_at, so a Sleeping row is durable across
     # restarts by design -- flushing it to Wanted here would discard a rung that
     # may be up to 7 days long and re-scrape immediately.
-    states_to_reset = []
-    total_reset = 0
-    
-    from database import update_media_item_state, get_all_media_items
-    for state in states_to_reset:
-        items = list(get_all_media_items(state=state))
-        if items:
-            update_initialization_step("Reset Items", f"Processing {len(items)} items in {state} state", is_substep=True)
-            for item in items:
-                
-                update_media_item_state(item['id'], 'Wanted')
-                total_reset += 1
-                logging.info(f"Reset item {format_item_log(item)} (ID: {item['id']}) from {state} to Wanted")
-    
-    update_initialization_step("Reset Items", f"Reset {total_reset} items to Wanted state", is_substep=True)
+    # Nothing is reset at startup any more. Add a state here only if its queue
+    # holds its scheduling in memory; anything persisted (as the retry ladder now
+    # is) must survive a restart untouched.
+    update_initialization_step("Reset Items", "Reset 0 items to Wanted state", is_substep=True)
 
 def plex_collection_update(skip_initial_plex_update):
     from queues.run_program import get_and_add_all_collected_from_plex, get_and_add_recent_collected_from_plex

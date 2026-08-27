@@ -784,9 +784,14 @@ class QueueManager:
             from queues.retry_ladder import get_ladder, next_rung, deadline_for_rung
             ladder = get_ladder(item.get('version'))
             rung = next_rung(item)
-            next_retry_at = deadline_for_rung(rung, ladder) or (
-                datetime.now() + timedelta(minutes=(ladder[-1] if ladder else 30))
-            )
+            next_retry_at = deadline_for_rung(rung, ladder)
+            if next_retry_at is None:
+                # Ladder exhausted. Re-sleeping at the last rung here would let
+                # sleep_cycles climb without bound and the item could never reach
+                # Dormant, which is the only state that gets the long re-check
+                # cycle. Route it the same way advance_retry_ladder does.
+                self.move_to_dormant(item, from_queue, failure_record=failure_record)
+                return
 
         logging.debug(
             f"Moving item {item_identifier} to Sleeping queue "
