@@ -379,8 +379,12 @@
         }
 
         if (queueName === 'Sleeping' || queueName === 'Dormant') {
+            // next_retry_at is written with a naive datetime.now(), i.e. LOCAL wall
+            // clock, so it must not be flagged as a UTC string - that appends 'Z'
+            // and shifts the displayed deadline by the local offset. Only the
+            // space -> 'T' swap is needed to make it parseable.
             let retryTime = item.next_retry_display_time && item.next_retry_display_time !== 'Due now'
-                ? formatDateTimeToYMD_HMS(item.next_retry_display_time, true)
+                ? formatDateTimeToYMD_HMS(String(item.next_retry_display_time).replace(' ', 'T'))
                 : 'Due now';
             itemContent += `<span class="item-separator"> - </span><span class="item-wake-count"><span class="item-label">Retry Rung:</span> ${item.retry_rung !== undefined ? item.retry_rung : 'N/A'}</span>`;
             itemContent += `<span class="item-separator"> - </span><span class="item-time"><span class="item-label">Next Retry:</span> ${retryTime}</span>`;

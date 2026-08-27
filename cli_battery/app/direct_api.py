@@ -671,7 +671,13 @@ def _metadata_age(item: Item, session: SqlAlchemySession, key: str) -> Optional[
         return None
     last_updated = row.last_updated
     if last_updated.tzinfo is None:
-        last_updated = last_updated.replace(tzinfo=timezone.utc)
+        # These rows are written with datetime.now(_get_local_tz()) and SQLite
+        # drops the offset, so what comes back is a LOCAL wall clock reading.
+        # Labelling it UTC skews every age by the local offset: at UTC+6 or more
+        # the 6h empty TTLs below never expire (the permanent negative this code
+        # exists to prevent), and at UTC-6 or less they expire instantly, so every
+        # scrape re-fetches Cinemeta over the network inside this DB session.
+        last_updated = last_updated.replace(tzinfo=_get_local_tz())
     return datetime.now(timezone.utc) - last_updated
 
 
