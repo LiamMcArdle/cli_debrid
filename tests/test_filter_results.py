@@ -1050,6 +1050,16 @@ class TestFilterResultsAnimeXEM(unittest.TestCase):
         )
         self.assertEqual(len(kept), 1)
 
+    def test_other_adaptation_complete_range_is_rejected_by_known_extent(self):
+        result = self._coord_result(
+            "[Erai-raws] Test Anime - 01 ~ 148 [1080p][Multiple Subtitle]",
+            [1], list(range(1, 149)), id_based=False)
+        result['target_abs_episode'] = 81
+
+        kept = self._filter_with_coords(
+            [result], (4, 3), (4, 3), max_absolute_episode=92)
+        self.assertEqual(kept, [])
+
     def test_id_pack_rejects_wrong_selected_filename(self):
         """The observed HxH failure selected episode 03 for absolute 81."""
         result = self._coord_result(

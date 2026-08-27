@@ -147,6 +147,7 @@ IDENTITY_ABSOLUTE = 'file names the requested absolute episode'
 IDENTITY_DATE = 'file airdate identifies the requested episode'
 IDENTITY_TITLE = TITLE_MATCH
 IDENTITY_EXPLICIT_CONFLICT = 'file explicitly names a conflicting coordinate'
+IDENTITY_BEYOND_SERIES = 'episode range exceeds the known series extent'
 IDENTITY_MISSING = 'file does not identify the requested episode'
 
 MIN_TITLE_CHARS = 12
@@ -306,6 +307,7 @@ def episode_identity_verdict(
     file_numbers: Optional[List[int]],
     filename: Optional[str] = None,
     absolute_episode: Optional[int] = None,
+    max_absolute_episode: Optional[int] = None,
     container_season: Optional[int] = None,
     is_anime: bool = False,
     target_air_date: Optional[str] = None,
@@ -353,6 +355,20 @@ def episode_identity_verdict(
             if number not in numbers:
                 numbers.append(number)
     seasons = [s for s in (file_seasons or []) if isinstance(s, int)]
+
+    # A complete/batch range can contain both the requested in-season number
+    # and its absolute number while still belonging to a different adaptation.
+    # Hunter x Hunter (2011) batches advertise 01-148, which used to satisfy
+    # HxH (1999) S04E03 because that list contains both 3 and 81.  Metadata's
+    # show-global absolute maximum distinguishes them: the 1999 series ends at
+    # 92.  Apply this only to multi-number results; a single selected file is
+    # already checked against the exact target below.
+    if is_anime and max_absolute_episode is not None and len(set(numbers)) > 1:
+        try:
+            if max(numbers) > int(max_absolute_episode):
+                return False, IDENTITY_BEYOND_SERIES
+        except (TypeError, ValueError):
+            pass
 
     for target_season, target_episode in coordinates:
         season_ok, _ = season_verdict(

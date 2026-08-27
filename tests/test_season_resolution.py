@@ -358,13 +358,14 @@ class TestTitleMatchingDoesNotReopenTheOriginalBug(unittest.TestCase):
 
 class TestEpisodeIdentityVerdict(unittest.TestCase):
     def verdict(self, filename, seasons, episodes, coordinates=None, absolute=81,
-                episode_title=None, other_titles=None):
+                episode_title=None, other_titles=None, max_absolute=None):
         return episode_identity_verdict(
             target_coordinates=coordinates or [(4, 3)],
             file_seasons=seasons,
             file_numbers=episodes,
             filename=filename,
             absolute_episode=absolute,
+            max_absolute_episode=max_absolute,
             is_anime=True,
             episode_title=episode_title,
             other_episode_titles=other_titles or [],
@@ -397,6 +398,20 @@ class TestEpisodeIdentityVerdict(unittest.TestCase):
             '[VEGETA] Hunter X Hunter (1999) - 03 - Wrong Episode.mkv', [], [])
         self.assertFalse(ok)
         self.assertEqual(reason, _sr.IDENTITY_MISSING)
+
+    def test_other_adaptation_batch_beyond_known_series_is_rejected(self):
+        ok, reason = self.verdict(
+            '[Erai-raws] Hunter X Hunter - 01 ~ 148 [1080p]',
+            [1], list(range(1, 149)), max_absolute=92)
+        self.assertFalse(ok)
+        self.assertEqual(reason, _sr.IDENTITY_BEYOND_SERIES)
+
+    def test_batch_ending_at_known_series_extent_is_still_eligible(self):
+        ok, reason = self.verdict(
+            'Hunter X Hunter (1999) - 01 ~ 92 [1080p]',
+            [1], list(range(1, 93)), max_absolute=92)
+        self.assertTrue(ok)
+        self.assertEqual(reason, _sr.IDENTITY_COORDINATE)
 
     def test_s01e_absolute_notation_is_accepted_for_later_anime_season(self):
         ok, reason = self.verdict(

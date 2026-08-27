@@ -106,6 +106,7 @@ def filter_results(
     id_episode: Optional[int] = None,
     episode_title: Optional[str] = None,
     other_episode_titles: Optional[List[str]] = None,
+    max_absolute_episode: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
 
     # --- START Logging for season_episode_counts ---
@@ -1381,6 +1382,7 @@ def filter_results(
                             file_numbers=result_episodes,
                             filename=identity_text,
                             absolute_episode=target_absolute,
+                            max_absolute_episode=max_absolute_episode,
                             is_anime=is_anime,
                             target_air_date=target_air_date,
                             file_air_date=parsed_date,

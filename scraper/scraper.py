@@ -134,6 +134,29 @@ def get_absolute_episode_from_database(imdb_id: str, season: int, episode: int) 
         logging.warning(f"Error getting absolute episode from database: {e}")
         return None
 
+
+def get_max_absolute_episode_from_database(imdb_id: str) -> Optional[int]:
+    """Return the metadata battery's known show-global absolute maximum."""
+    if not imdb_id:
+        return None
+    try:
+        from sqlalchemy import func
+        from cli_battery.app.database import Session, Item, Season, Episode
+
+        with Session() as session:
+            maximum = (
+                session.query(func.max(Episode.absolute_episode))
+                .join(Season, Episode.season_id == Season.id)
+                .join(Item, Season.item_id == Item.id)
+                .filter(Item.imdb_id == imdb_id)
+                .scalar()
+            )
+            return int(maximum) if maximum is not None else None
+    except Exception as e:
+        logging.warning(
+            f"Error getting maximum absolute episode from database: {e}")
+        return None
+
 def convert_anime_episode_format(season: int, episode: int, season_episode_counts: Dict[int, int], xem_mapping: Optional[List[Dict]] = None, tmdb_id: Optional[str] = None, imdb_id: Optional[str] = None, multi: bool = False) -> Dict[str, str]:
     """Convert anime episode numbers into different formats using XEM mapping when available.
     
@@ -355,9 +378,11 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
     # identity gate can use that evidence without making it ambiguous.
     target_episode_title = None
     other_episode_titles = []
+    max_absolute_episode = None
     if content_type.lower() == 'episode':
         target_episode_title, other_episode_titles = get_episode_title_context(
             imdb_id, original_season, original_episode)
+        max_absolute_episode = get_max_absolute_episode_from_database(imdb_id)
 
     # NEW: Fetch show's season episode structure for accurate num_items calculation in ranking
     show_season_episode_counts_for_query = {} # Default to empty
@@ -1396,6 +1421,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 id_episode=id_episode_map,
                 episode_title=target_episode_title,
                 other_episode_titles=other_episode_titles,
+                max_absolute_episode=max_absolute_episode,
             )
             filtered_out_results = [result for result in normalized_results if result not in filtered_results]
             task_timings['filtering'] = time.time() - task_start
