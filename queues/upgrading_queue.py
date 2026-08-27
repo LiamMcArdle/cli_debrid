@@ -419,7 +419,17 @@ class UpgradingQueue:
                     self._run_daily_delayed_upgrade_scrape(delayed_days)
                 finally:
                     self._last_delayed_upgrade_run_date = today
-        for item in self.items[:]:  # Create a copy of the list to iterate over
+        # Least-recently-scraped first. The pass still visits every item (the DB
+        # state check and the timeout check must run for all of them), but
+        # UPGRADE_SCRAPES_PER_PASS is spent in this order -- iterating self.items
+        # as-is would hand the whole budget to the same head-of-list items on
+        # every hourly pass and starve everything behind them of any scrape at all.
+        _epoch = datetime.min
+        _ordered_items = sorted(
+            self.items[:],  # Copy of the list to iterate over
+            key=lambda it: self.last_scrape_times.get(it.get('id'), _epoch)
+        )
+        for item in _ordered_items:
             try:
                 item_id = item['id']
 

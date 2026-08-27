@@ -9097,7 +9097,13 @@ class ProgramRunner:
             for ids in pack_slots:
                 if pack_budget < 1:
                     break
-                if len(ids) > pack_budget:
+                # A pack larger than the WHOLE budget must still be queueable, or
+                # it is skipped on every run forever: with the default
+                # max_upgrades_per_run of 10, every season of more than ten
+                # episodes would never be auto-queued again. Let the first pack
+                # through regardless of size and hold every later one to the
+                # remaining budget.
+                if len(ids) > pack_budget and pack_slots_q:
                     continue
                 pack_slots_q.append((ids, 'pack'))
                 pack_budget -= len(ids)
