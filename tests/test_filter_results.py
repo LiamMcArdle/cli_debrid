@@ -998,6 +998,50 @@ class TestFilterResultsAnimeXEM(unittest.TestCase):
             len(kept), 0,
             "A title-based result must be judged at the stored coordinate only")
 
+    def test_id_pack_uses_selected_absolute_filename(self):
+        """Torrentio's pack label is not the selected episode's identity."""
+        result = self._coord_result(
+            "Test Anime Complete DVD 576p Multi Subs", [1], [38], id_based=True)
+        result['additional_metadata']['filename'] = (
+            "Test Anime - 81 - An Encounter in the Dark.mkv")
+        result['match_coordinate'] = {
+            'season': 4, 'episode': 3, 'provenance': 'stored',
+            'scraper_mode': 'id',
+        }
+        result['target_abs_episode'] = 81
+
+        kept = self._filter_with_coords([result], (4, 3), (4, 3))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].get('identity_filename'),
+                         "Test Anime - 81 - An Encounter in the Dark.mkv")
+
+    def test_id_pack_rejects_wrong_selected_filename(self):
+        """The observed HxH failure selected episode 03 for absolute 81."""
+        result = self._coord_result(
+            "Test Anime Complete 1080x720", [1], [38], id_based=True)
+        result['additional_metadata']['filename'] = "Test Anime - 03.mkv"
+        result['match_coordinate'] = {
+            'season': 4, 'episode': 3, 'provenance': 'stored',
+            'scraper_mode': 'id',
+        }
+        result['target_abs_episode'] = 81
+
+        kept = self._filter_with_coords([result], (4, 3), (4, 3))
+        self.assertEqual(kept, [])
+
+    def test_coordinate_alternatives_are_not_mixed(self):
+        """Mapped S02E01 plus stored S01E25 must never admit S02E25."""
+        result = self._coord_result(
+            "Test.Anime.S02E25.1080p.WEB-DL.AAC.H.264-Group",
+            [2], [25], id_based=True)
+        result['match_coordinate'] = {
+            'season': 2, 'episode': 1, 'provenance': 'cinemeta',
+            'scraper_mode': 'id',
+        }
+
+        kept = self._filter_with_coords([result], (1, 25), (2, 1))
+        self.assertEqual(kept, [])
+
 
 if __name__ == '__main__':
     unittest.main()

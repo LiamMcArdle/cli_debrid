@@ -252,6 +252,31 @@ class ScraperManager:
                             return True
             
             return False
+
+        def mark_framework_unavailable(instance, scraper_type, status, count_timeout=False):
+            """Record failures imposed by the manager rather than a scraper."""
+            record_unavailable(instance, unavailable_scope)
+            if count_timeout:
+                _circuit_record_timeout(instance)
+            instance_summary[instance] = {
+                'type': scraper_type,
+                'count': status,
+                'season': id_season if scraper_type in ID_BASED_SCRAPER_TYPES
+                          and id_season is not None else season,
+                'episode': id_episode if scraper_type in ID_BASED_SCRAPER_TYPES
+                           and id_episode is not None else episode,
+            }
+
+        def summarize_completed(instance, scraper_type, results):
+            unavailable_now = instance in (unavailable_scope or set())
+            instance_summary[instance] = {
+                'type': scraper_type,
+                'count': 'Unavailable' if unavailable_now else len(results),
+                'season': id_season if scraper_type in ID_BASED_SCRAPER_TYPES
+                          and id_season is not None else season,
+                'episode': id_episode if scraper_type in ID_BASED_SCRAPER_TYPES
+                           and id_episode is not None else episode,
+            }
         
         # Helper function to run a scraper and handle exceptions
         def run_scraper(instance, scraper_type, settings, is_translated):
@@ -410,13 +435,19 @@ class ScraperManager:
                 future_instance_map = {}
                 try:
                     if old_nyaa_enabled:
-                        fut = executor.submit(run_scraper, 'OldNyaa', 'OldNyaa', old_nyaa_settings, is_translated_search)
-                        anime_scraper_tasks.append(fut)
-                        future_instance_map[fut] = ('OldNyaa', 'OldNyaa')
+                        if _circuit_is_open('OldNyaa'):
+                            mark_framework_unavailable('OldNyaa', 'OldNyaa', 'Circuit Open')
+                        else:
+                            fut = executor.submit(run_scraper, 'OldNyaa', 'OldNyaa', old_nyaa_settings, is_translated_search)
+                            anime_scraper_tasks.append(fut)
+                            future_instance_map[fut] = ('OldNyaa', 'OldNyaa')
                     if nyaa_enabled:
-                        fut = executor.submit(run_scraper, 'Nyaa', 'Nyaa', nyaa_settings, is_translated_search)
-                        anime_scraper_tasks.append(fut)
-                        future_instance_map[fut] = ('Nyaa', 'Nyaa')
+                        if _circuit_is_open('Nyaa'):
+                            mark_framework_unavailable('Nyaa', 'Nyaa', 'Circuit Open')
+                        else:
+                            fut = executor.submit(run_scraper, 'Nyaa', 'Nyaa', nyaa_settings, is_translated_search)
+                            anime_scraper_tasks.append(fut)
+                            future_instance_map[fut] = ('Nyaa', 'Nyaa')
 
                     # Collect results as they complete with timeout
                     try:
@@ -434,19 +465,25 @@ class ScraperManager:
                         for future in done:
                             try:
                                 instance, scraper_type, results = future.result(timeout=self.scraper_timeout)
+                                summarize_completed(instance, scraper_type, results)
                                 if results:
                                     logging.info(f"Found {len(results)} results from {instance}")
                                     all_results.extend(results)
-                                    instance_summary[instance] = {'type': scraper_type, 'count': len(results)}
                             except TimeoutError:
                                 inst, stype = future_instance_map.get(future, ('Unknown', 'Unknown'))
                                 logging.error(f"Individual anime scraper '{inst}' timed out after {self.scraper_timeout} seconds")
+                                mark_framework_unavailable(
+                                    inst, stype, 'Timed Out', count_timeout=True)
                             except Exception as e:
                                 logging.error(f"Error in anime scraper: {str(e)}")
 
                         if not_done:
                             logging.error(
                                 f"Cancelled {len(not_done)} anime scrapers that exceeded the {self.batch_timeout} second timeout")
+                            for future in not_done:
+                                inst, stype = future_instance_map.get(future, ('Unknown', 'Unknown'))
+                                mark_framework_unavailable(
+                                    inst, stype, 'Cancelled (Timeout)', count_timeout=True)
 
                     except Exception as e:
                         logging.error(f"Error during anime batch scraping: {str(e)}")
@@ -499,6 +536,7 @@ class ScraperManager:
 
             # Circuit-breaker: skip scrapers that are in backoff due to repeated timeouts
             if _circuit_is_open(instance):
+                mark_framework_unavailable(instance, scraper_type, 'Circuit Open')
                 continue
 
             scraper_tasks.append((instance, scraper_type, current_settings))
@@ -529,15 +567,16 @@ class ScraperManager:
                 for future in done:
                     try:
                         instance, scraper_type, results = future.result(timeout=self.scraper_timeout)
+                        summarize_completed(instance, scraper_type, results)
                         if results:
                             all_results.extend(results)
-                            instance_summary[instance] = {'type': scraper_type, 'count': len(results)}
                     except TimeoutError:
                         inst, stype = future_instance_map.get(future, ('Unknown', 'Unknown'))
                         if self.use_timeout:
                             logging.error(
                                 f"Individual scraper '{inst}' timed out after {self.scraper_timeout} seconds")
                         _circuit_record_timeout(inst)
+                        record_unavailable(inst, unavailable_scope)
                         if inst not in instance_summary:
                             instance_summary[inst] = {'type': stype, 'count': 'Timed Out'}
                     except Exception as e:
@@ -552,6 +591,7 @@ class ScraperManager:
                     for future in not_done:
                         inst, stype = future_instance_map.get(future, ('Unknown', 'Unknown'))
                         _circuit_record_timeout(inst)
+                        record_unavailable(inst, unavailable_scope)
                         if inst not in instance_summary:
                             instance_summary[inst] = {'type': stype, 'count': 'Cancelled (Timeout)'}
 
@@ -680,7 +720,12 @@ class ScraperManager:
             for instance, summary in sorted_instances:
                 scraper_type = summary.get('type', 'Unknown')
                 count = summary.get('count', 'N/A')
-                report_lines.append(f"  - {instance} ({scraper_type}): Found {count} results.")
+                coordinate = ''
+                if summary.get('season') is not None:
+                    coordinate = f" at S{summary.get('season')}E{summary.get('episode')}"
+                report_lines.append(
+                    f"  - {instance} ({scraper_type}){coordinate}: {count}."
+                )
         
         logging.info("\n".join(report_lines))
 

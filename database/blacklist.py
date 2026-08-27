@@ -3,6 +3,21 @@ import logging
 from typing import List
 from datetime import datetime
 
+
+def is_restorable_blacklist_item(item) -> bool:
+    """Whether automatic/manual restoration may return this row to Wanted."""
+    if not item or item.get('state') not in (None, 'Blacklisted'):
+        return False
+    if item.get('ghostlisted') in (1, True):
+        return False
+
+    from database.manual_blacklist import is_blacklisted as is_manually_blacklisted
+    season = item.get('season_number')
+    return not (
+        is_manually_blacklisted(item.get('imdb_id'), season)
+        or is_manually_blacklisted(item.get('tmdb_id'), season)
+    )
+
 def get_blacklisted_items():
     conn = get_db_connection()
     try:
@@ -25,15 +40,13 @@ def remove_from_blacklist(item_ids: List[int]):
     WantedQueue.move_blacklisted_items on the next pass -- an oscillation, plus
     a notification each cycle.
     """
-    from database.manual_blacklist import is_blacklisted as is_manually_blacklisted
-
     conn = get_db_connection()
     restored = 0
     skipped = 0
     try:
         for item_id in item_ids:
             row = conn.execute(
-                "SELECT imdb_id, tmdb_id, season_number FROM media_items "
+                "SELECT state, imdb_id, tmdb_id, season_number, ghostlisted FROM media_items "
                 "WHERE id = ? AND state = 'Blacklisted' "
                 "AND (ghostlisted IS NULL OR ghostlisted = 0)",
                 (item_id,)
@@ -42,9 +55,7 @@ def remove_from_blacklist(item_ids: List[int]):
                 skipped += 1
                 continue
 
-            season = row['season_number'] if 'season_number' in row.keys() else None
-            if (is_manually_blacklisted(row['imdb_id'], season)
-                    or is_manually_blacklisted(row['tmdb_id'], season)):
+            if not is_restorable_blacklist_item(dict(row)):
                 skipped += 1
                 continue
 

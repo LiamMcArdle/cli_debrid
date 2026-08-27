@@ -32,6 +32,7 @@ ABSOLUTE_UNKNOWN = _sr.ABSOLUTE_UNKNOWN
 episode_title_verdict = _sr.episode_title_verdict
 episode_title_is_usable = _sr.episode_title_is_usable
 normalize_title_text = _sr.normalize_title_text
+episode_identity_verdict = _sr.episode_identity_verdict
 TITLE_MATCH = _sr.TITLE_MATCH
 TITLE_NOT_DISTINCTIVE = _sr.TITLE_NOT_DISTINCTIVE
 TITLE_ABSENT = _sr.TITLE_ABSENT
@@ -353,6 +354,74 @@ class TestTitleMatchingDoesNotReopenTheOriginalBug(unittest.TestCase):
         self.assertFalse(episode_title_verdict(
             'Ultimate Lifeform', 'One Punch Man S01E02 - Strategy Meeting.mkv',
             other_episode_titles=['Strategy Meeting'])[0])
+
+
+class TestEpisodeIdentityVerdict(unittest.TestCase):
+    def verdict(self, filename, seasons, episodes, coordinates=None, absolute=81,
+                episode_title=None, other_titles=None):
+        return episode_identity_verdict(
+            target_coordinates=coordinates or [(4, 3)],
+            file_seasons=seasons,
+            file_numbers=episodes,
+            filename=filename,
+            absolute_episode=absolute,
+            is_anime=True,
+            episode_title=episode_title,
+            other_episode_titles=other_titles or [],
+            series_title='Hunter x Hunter',
+        )
+
+    def test_hunter_x_hunter_wrong_season_one_file_is_rejected(self):
+        ok, reason = self.verdict(
+            '[VEGETA] Hunter X Hunter (1999) - S01E03 [720p].mp4', [1], [3])
+        self.assertFalse(ok)
+        self.assertEqual(reason, _sr.IDENTITY_EXPLICIT_CONFLICT)
+
+    def test_hunter_x_hunter_absolute_81_is_accepted(self):
+        ok, reason = self.verdict(
+            '[Samir755] Hunter x Hunter - 81 - An Encounter x Chrollo.mkv',
+            [], [81])
+        self.assertTrue(ok)
+        self.assertEqual(reason, _sr.IDENTITY_ABSOLUTE)
+
+    def test_s01e_absolute_notation_is_accepted_for_later_anime_season(self):
+        ok, reason = self.verdict(
+            '[Judas] Hunter x Hunter (2011) - S01E112.mkv',
+            [1], [112], coordinates=[(2, 112)], absolute=112)
+        self.assertTrue(ok)
+        self.assertEqual(reason, _sr.IDENTITY_ABSOLUTE)
+
+    def test_s01e_wrong_absolute_notation_is_rejected(self):
+        ok, reason = self.verdict(
+            '[Judas] Hunter x Hunter (1999) - S01E03.mkv',
+            [1], [3], coordinates=[(4, 3)], absolute=81)
+        self.assertFalse(ok)
+        self.assertEqual(reason, _sr.IDENTITY_EXPLICIT_CONFLICT)
+
+    def test_selected_episode_title_can_identify_unreconciled_numbering(self):
+        ok, reason = self.verdict(
+            '[WIP] Hunter x Hunter - 03 - An Encounter x Kuroro x The Gold Dust Girl.mkv',
+            [], [3],
+            episode_title='An Encounter x Kuroro x The Gold Dust Girl',
+            other_titles=['Masadora x Big Strides x Mad Bomber'])
+        self.assertTrue(ok)
+        self.assertEqual(reason, _sr.IDENTITY_TITLE)
+
+    def test_coordinate_alternatives_are_atomic(self):
+        # Stored S01E25 and mapped S02E01 are both legitimate pairs.  S02E25
+        # is the Cartesian combination the old independent fallbacks admitted.
+        ok, reason = self.verdict(
+            'Example.Show.S02E25.mkv', [2], [25],
+            coordinates=[(2, 1), (1, 25)], absolute=None)
+        self.assertFalse(ok)
+        self.assertEqual(reason, _sr.IDENTITY_EXPLICIT_CONFLICT)
+
+    def test_complete_stored_pair_remains_a_legacy_compatible_alternative(self):
+        ok, reason = self.verdict(
+            'Example.Show.S01E25.mkv', [1], [25],
+            coordinates=[(2, 1), (1, 25)], absolute=None)
+        self.assertTrue(ok)
+        self.assertEqual(reason, _sr.IDENTITY_COORDINATE)
 
 
 if __name__ == '__main__':

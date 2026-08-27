@@ -13,7 +13,8 @@ from PTT import parse_title
 from scraper.functions.anime_utils import detect_absolute_numbering
 from scraper.functions.season_resolution import (
     season_verdict, container_season_from_path, log_verdict,
-    episode_title_verdict, episode_title_is_usable)
+    episode_title_verdict, episode_title_is_usable,
+    episode_identity_verdict)
 from scraper.functions.similarity_checks import (
     title_verdict, title_is_asserted, MIN_TITLE_MATCH)
 
@@ -570,6 +571,61 @@ class MediaMatcher:
         if isinstance(genres, str):
             genres = [genres]
         is_anime = any('anime' in genre.lower() for genre in genres)
+
+        # Formula 1 has a bespoke year/event matcher below.  Every ordinary TV
+        # episode uses the same pair-atomic identity authority as scrape-time
+        # filtering, so the selected torrent file cannot reintroduce a result
+        # that the scraper correctly rejected.
+        is_formula_1 = ('formula 1' in series_title.lower()
+                        and 'drive to survive' not in series_title.lower())
+        if not is_formula_1:
+            file_numbers = list(ptt_result.get('episodes') or [])
+            if not file_numbers and ptt_result.get('fallback_episode') is not None:
+                file_numbers = [ptt_result['fallback_episode']]
+
+            stored_season = item.get('season')
+            if stored_season is None:
+                stored_season = item.get('season_number')
+            stored_episode = item.get('episode')
+            if stored_episode is None:
+                stored_episode = item.get('episode_number')
+            coordinates = [(target_season, target_episode)]
+            if (stored_season, stored_episode) != (target_season, target_episode):
+                coordinates.append((stored_season, stored_episode))
+
+            show_titles = self._get_episode_titles_cached(item.get('imdb_id'))
+            own_coordinate = (stored_season, stored_episode)
+            other_titles = [value for key, value in show_titles.items()
+                            if key != own_coordinate]
+            filename = (parsed_file_info.get('path')
+                        or ptt_result.get('original_filename') or '')
+            identity_match, identity_reason = episode_identity_verdict(
+                target_coordinates=coordinates,
+                file_seasons=ptt_result.get('seasons'),
+                file_numbers=file_numbers,
+                filename=filename,
+                absolute_episode=self._compute_absolute_episode_for_item(item)
+                if is_anime else None,
+                container_season=container_season_from_path(filename),
+                is_anime=is_anime,
+                target_air_date=item.get('release_date'),
+                file_air_date=ptt_result.get('date'),
+                episode_title=item.get('episode_title'),
+                other_episode_titles=other_titles,
+                series_title=series_title,
+                allow_bare_season_one=use_relaxed_matching,
+            )
+            if identity_match:
+                logging.debug(
+                    f"Episode identity accepted '{filename}' for "
+                    f"{coordinates}: {identity_reason}"
+                )
+                return True
+            logging.info(
+                f"Episode identity REJECTED '{filename}' for "
+                f"{coordinates}: {identity_reason}"
+            )
+            return False
 
         # --- Relaxed Matching Logic ---
         if use_relaxed_matching:

@@ -33,7 +33,6 @@ ABSOLUTE_MISMATCH = 'number is an in-season number, not the absolute'
 ABSOLUTE_UNKNOWN = 'absolute episode unknown, refusing to guess for S2+'
 NO_TARGET = 'no target season to check against'
 
-
 def season_verdict(
     file_seasons: Optional[List[int]],
     target_season: Optional[int],
@@ -143,6 +142,13 @@ TITLE_NOT_DISTINCTIVE = 'episode title too generic to identify an episode'
 TITLE_ABSENT = 'episode title not present in filename'
 TITLE_AMBIGUOUS = 'another episode of this show also fits this filename'
 
+IDENTITY_COORDINATE = 'file names the requested coordinate'
+IDENTITY_ABSOLUTE = 'file names the requested absolute episode'
+IDENTITY_DATE = 'file airdate identifies the requested episode'
+IDENTITY_TITLE = TITLE_MATCH
+IDENTITY_EXPLICIT_CONFLICT = 'file explicitly names a conflicting coordinate'
+IDENTITY_MISSING = 'file does not identify the requested episode'
+
 MIN_TITLE_CHARS = 12
 MIN_TITLE_WORDS = 2
 
@@ -240,6 +246,120 @@ def episode_title_verdict(
             return False, TITLE_AMBIGUOUS
 
     return True, TITLE_MATCH
+
+
+_EXPLICIT_COORD_RE = re.compile(
+    r'(?<![A-Za-z0-9])S(?P<season>\d{1,2})\s*[._ -]*E(?P<episode>\d{1,4})(?!\d)',
+    re.IGNORECASE,
+)
+_EXPLICIT_X_RE = re.compile(
+    r'(?<![A-Za-z0-9])(?P<season>\d{1,2})x(?P<episode>\d{1,4})(?!\d)',
+    re.IGNORECASE,
+)
+_EXPLICIT_ANIME_SEASON_RE = re.compile(
+    r'(?<![A-Za-z0-9])S(?P<season>\d{1,2})\s*[-–—]\s*'
+    r'(?P<episode>\d{1,4})(?!\d)',
+    re.IGNORECASE,
+)
+
+
+def explicit_coordinates(text: Optional[str]) -> List[Tuple[int, int]]:
+    """Return complete S/E claims written by a filename.
+
+    PTT frequently reports season 1 for bare anime numbers.  Reading the
+    literal coordinate from the text lets identity checks distinguish that
+    parser default from an actual ``S01E03`` claim.
+    """
+    found = []
+    for pattern in (_EXPLICIT_COORD_RE, _EXPLICIT_X_RE, _EXPLICIT_ANIME_SEASON_RE):
+        for match in pattern.finditer(text or ''):
+            pair = (int(match.group('season')), int(match.group('episode')))
+            if pair not in found:
+                found.append(pair)
+    return found
+
+
+def episode_identity_verdict(
+    *,
+    target_coordinates: List[Tuple[Optional[int], Optional[int]]],
+    file_seasons: Optional[List[int]],
+    file_numbers: Optional[List[int]],
+    filename: Optional[str] = None,
+    absolute_episode: Optional[int] = None,
+    container_season: Optional[int] = None,
+    is_anime: bool = False,
+    target_air_date: Optional[str] = None,
+    file_air_date: Optional[str] = None,
+    episode_title: Optional[str] = None,
+    other_episode_titles: Optional[List[str]] = None,
+    series_title: Optional[str] = None,
+    allow_bare_season_one: bool = True,
+) -> Tuple[bool, str]:
+    """Decide whether one file identifies one requested episode.
+
+    Coordinate alternatives are evaluated as pairs.  This deliberately does
+    not offer separate "original season" and "original episode" fallbacks;
+    doing so admitted Cartesian combinations such as mapped S02 + stored E25.
+    Explicit coordinates in the filename outrank all softer evidence.
+    """
+    coordinates = []
+    for season, episode in target_coordinates or []:
+        try:
+            pair = (int(season) if season is not None else None,
+                    int(episode) if episode is not None else None)
+        except (TypeError, ValueError):
+            continue
+        if pair[1] is not None and pair not in coordinates:
+            coordinates.append(pair)
+    if not coordinates:
+        return False, IDENTITY_MISSING
+
+    explicit = explicit_coordinates(filename)
+    if explicit:
+        if any(pair in coordinates for pair in explicit):
+            return True, IDENTITY_COORDINATE
+        # Anime pack filenames commonly encode an absolute episode as
+        # S01E112 even when metadata stores it in a later logical season.
+        # This is still exact evidence, but only when BOTH the conventional
+        # season-one marker and the known absolute number agree.
+        if is_anime and absolute_episode is not None \
+                and (1, int(absolute_episode)) in explicit:
+            return True, IDENTITY_ABSOLUTE
+        return False, IDENTITY_EXPLICIT_CONFLICT
+
+    numbers = [n for n in (file_numbers or []) if isinstance(n, int)]
+    seasons = [s for s in (file_seasons or []) if isinstance(s, int)]
+
+    for target_season, target_episode in coordinates:
+        season_ok, _ = season_verdict(
+            file_seasons=seasons,
+            target_season=target_season,
+            file_numbers=numbers,
+            absolute_episode=absolute_episode,
+            container_season=container_season,
+            is_anime=is_anime,
+            allow_bare_season_one=allow_bare_season_one,
+        )
+        if season_ok and target_episode in numbers:
+            return True, IDENTITY_COORDINATE
+
+    # Absolute numbering is one show-global identity, independent of which
+    # legitimate S/E coordinate was used to reach the result.
+    if is_anime and absolute_episode is not None and absolute_episode in numbers:
+        return True, IDENTITY_ABSOLUTE
+
+    if target_air_date and file_air_date and target_air_date == file_air_date:
+        return True, IDENTITY_DATE
+
+    title_ok, title_reason = episode_title_verdict(
+        episode_title,
+        filename,
+        other_episode_titles=other_episode_titles,
+        series_title=series_title,
+    )
+    if title_ok:
+        return True, IDENTITY_TITLE
+    return False, title_reason if episode_title else IDENTITY_MISSING
 
 
 def container_season_from_path(file_path: str) -> Optional[int]:

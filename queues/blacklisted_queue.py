@@ -84,7 +84,8 @@ class BlacklistedQueue:
 
             # Build the base query
             query = """
-                SELECT id, title, type, imdb_id, tmdb_id, season_number, episode_number, version, blacklisted_date, release_date
+                SELECT id, title, type, imdb_id, tmdb_id, season_number, episode_number,
+                       version, state, ghostlisted, blacklisted_date, release_date
                 FROM media_items
                 WHERE state = 'Blacklisted'
                   AND blacklisted_date IS NOT NULL
@@ -125,8 +126,8 @@ class BlacklistedQueue:
                     release_date_str = item.get('release_date', 'Unknown')
                     logging.info(f"Item {item_identifier} (release: {release_date_str}) blacklisted on {blacklisted_date_str} is eligible for unblacklisting (cutoff: {cutoff_date.isoformat()}).")
 
-                    self.unblacklist_item(queue_manager, item)
-                    unblacklisted_count += 1
+                    if self.unblacklist_item(queue_manager, item):
+                        unblacklisted_count += 1
                 except Exception as e_unblacklist:
                     logging.error(f"Error during unblacklist_item call for {item_identifier}: {e_unblacklist}", exc_info=True)
                     continue
@@ -138,11 +139,19 @@ class BlacklistedQueue:
 
     def unblacklist_item(self, queue_manager, item: Dict[str, Any]):
         item_identifier = queue_manager.generate_identifier(item)
+        from database.blacklist import is_restorable_blacklist_item
+        if not is_restorable_blacklist_item(item):
+            logging.info(
+                f"Keeping {item_identifier} blacklisted: protected by the "
+                f"manual blacklist or ghostlist."
+            )
+            return False
         logging.info(f"Unblacklisting item: {item_identifier}")
 
         update_blacklisted_date(item['id'], None)
 
         queue_manager.move_to_wanted(item, "Blacklisted")
+        return True
 
     def blacklist_item(self, item: Dict[str, Any], queue_manager):
         item_id = item['id']

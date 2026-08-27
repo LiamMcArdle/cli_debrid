@@ -255,6 +255,17 @@ def migrate_schema():
         if 'delayed_upgrade_eligible' not in columns:
             conn.execute('ALTER TABLE media_items ADD COLUMN delayed_upgrade_eligible BOOLEAN DEFAULT TRUE')
             logging.info("Successfully added delayed_upgrade_eligible column to media_items table (default TRUE).")
+        if 'partial_scrape_sources' not in columns:
+            conn.execute('ALTER TABLE media_items ADD COLUMN partial_scrape_sources TEXT')
+            logging.info("Added partial_scrape_sources column to media_items table.")
+        if 'partial_scrape_retry_at' not in columns:
+            conn.execute('ALTER TABLE media_items ADD COLUMN partial_scrape_retry_at TIMESTAMP')
+            logging.info("Added partial_scrape_retry_at column to media_items table.")
+        conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_media_items_partial_scrape_retry
+            ON media_items(partial_scrape_retry_at)
+            WHERE partial_scrape_sources IS NOT NULL
+        ''')
         if 'verification_failed' not in columns:
             conn.execute('ALTER TABLE media_items ADD COLUMN verification_failed BOOLEAN DEFAULT FALSE')
             logging.info("Successfully added verification_failed column to media_items table.")
@@ -1044,6 +1055,8 @@ def create_tables():
                 theatrical_release_date DATE,
                 theatrical_release_date_checked BOOLEAN DEFAULT FALSE,
                 delayed_upgrade_eligible BOOLEAN DEFAULT TRUE,
+                partial_scrape_sources TEXT,
+                partial_scrape_retry_at TIMESTAMP,
                 plex_labels TEXT,
                 content_sources TEXT,
                 verification_failed BOOLEAN DEFAULT FALSE,

@@ -1,6 +1,6 @@
 from .core import get_db_connection, retry_on_db_lock
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import pickle
 from pathlib import Path
@@ -209,6 +209,8 @@ def update_media_item_state(item_id, state, **kwargs):
         # hundreds of MB if left on collected/blacklisted items.
         if state in ('Collected', 'Blacklisted', 'Ghostlisted', 'Unreleased', 'Dormant') and 'scrape_results' not in kwargs:
             query += ", scrape_results = NULL"
+        if state in ('Blacklisted', 'Ghostlisted', 'Unreleased', 'Dormant'):
+            query += ", partial_scrape_sources = NULL, partial_scrape_retry_at = NULL"
 
         # A successful add ends the current failure streak, so the retry ladder
         # resets. 'Adding' is deliberately NOT in this list — an item whose adds
@@ -513,6 +515,31 @@ def update_media_item(item_id: int, **kwargs):
     finally:
         if conn:
             conn.close()
+
+
+@retry_on_db_lock()
+def update_partial_scrape(item_id: int, unavailable_sources=None, retry_minutes: int = 30):
+    """Persist or clear a partial-source search marker for later upgrades."""
+    conn = get_db_connection()
+    try:
+        sources = sorted({str(source) for source in (unavailable_sources or []) if source})
+        if sources:
+            retry_at = datetime.now() + timedelta(minutes=max(1, int(retry_minutes)))
+            conn.execute(
+                "UPDATE media_items SET partial_scrape_sources = ?, "
+                "partial_scrape_retry_at = ?, last_updated = ? WHERE id = ?",
+                (json.dumps(sources), retry_at, datetime.now(), item_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE media_items SET partial_scrape_sources = NULL, "
+                "partial_scrape_retry_at = NULL, last_updated = ? WHERE id = ?",
+                (datetime.now(), item_id),
+            )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
 
 @retry_on_db_lock()
 def update_blacklisted_date(item_id: int, blacklisted_date: datetime | None):

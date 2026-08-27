@@ -666,8 +666,15 @@ class AddingQueue:
                     current_score = score_breakdown_debug.get('total_score', 0)
                     original_scraped_torrent_title = chosen_result_info.get('original_scraped_torrent_title') or chosen_result_info.get('original_title')
                     resolution = chosen_result_info.get('resolution')
-                    xem_mapping = chosen_result_info.get('xem_scene_mapping') # Extract XEM mapping directly
-                    logging.info(f"Using chosen result: Score {current_score:.2f}, XEM mapping {xem_mapping}")
+                    # New results carry the exact coordinate used for this
+                    # scraper.  Fall back to the legacy XEM field for in-flight
+                    # scrape_results created by an older process.
+                    xem_mapping = (chosen_result_info.get('match_coordinate')
+                                   or chosen_result_info.get('xem_scene_mapping'))
+                    logging.info(
+                        f"Using chosen result: Score {current_score:.2f}, "
+                        f"match coordinate {xem_mapping}"
+                    )
                 else:
                     # This fallback should ideally not be needed if _process_results returns None on failure
                     # But keep it as a safeguard, although XEM mapping won't be available here

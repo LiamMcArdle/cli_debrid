@@ -109,6 +109,18 @@ def fetch_data(url: str) -> Dict:
                 # the retry ladder instead, which waits 30 minutes and — via
                 # the unavailable set — does not spend a rung on it.
                 raise ScraperUnavailable(f"torrentio rate limited (429) for {url}")
+            if 500 <= response.status_code <= 599:
+                last_error = f"HTTP {response.status_code}"
+                if attempt < max_retries - 1:
+                    sleep_seconds = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.25)
+                    logging.warning(
+                        f"Torrentio server error {response.status_code} "
+                        f"(attempt {attempt + 1}/{max_retries}) for {url}. "
+                        f"Retrying in {sleep_seconds:.2f}s"
+                    )
+                    time.sleep(sleep_seconds)
+                    continue
+                break
             logging.warning(f"Non-200 status ({response.status_code}) for URL {url}")
             return {}
         except ScraperUnavailable:

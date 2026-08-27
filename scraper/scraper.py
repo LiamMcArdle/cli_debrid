@@ -1011,14 +1011,17 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                         # Override the episode_formats to use absolute episode formats
                         episode_formats = absolute_episode_formats
                         
-                        # Mark that we're using absolute episode numbering
-                        xem_applied = True  # This will trigger the format regeneration logic
-                        season = 1  # Use season 1 for absolute episodes
-                        episode = original_episode  # Keep the original episode number as absolute
-                        # Set the scene mapping variables for absolute episode numbering
-                        scene_season = 1  # Use season 1 for absolute episodes
-                        scene_episode = original_episode  # Use original episode as absolute
-                        logging.info(f"Set absolute episode mapping: scene_season={scene_season}, scene_episode={scene_episode}")
+                        # Absolute formats are search aliases, not a coordinate
+                        # mapping.  In particular an empty XEM list used to turn
+                        # stored S04E03 into S01E03 here and mark XEM as applied,
+                        # which also skipped Cinemeta below.  Preserve the stored
+                        # coordinate unless an actual XEM entry supplied a pair.
+                        season = original_season
+                        episode = original_episode
+                        logging.info(
+                            f"No confirmed XEM coordinate; preserving stored "
+                            f"S{season}E{episode} while searching absolute formats."
+                        )
                 else:
                     # Episode is in XEM mapping, use original season/episode
                     season = original_season
@@ -1216,6 +1219,23 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 id_episode=id_episode_map,
                 unavailable_scope=unavailable_scope
             )
+            # Every result carries the exact coordinate used to query its
+            # scraper.  Downstream code must not infer this from a batch-wide
+            # flag: ID and title scrapers can deliberately use different pairs.
+            for result in all_results:
+                if result.get('id_based_scraper') and id_season_map is not None \
+                        and id_episode_map is not None:
+                    match_season, match_episode = id_season_map, id_episode_map
+                    provenance = 'cinemeta'
+                else:
+                    match_season, match_episode = season, episode
+                    provenance = 'xem' if scene_season_map is not None else 'stored'
+                result['match_coordinate'] = {
+                    'season': match_season,
+                    'episode': match_episode,
+                    'provenance': provenance,
+                    'scraper_mode': 'id' if result.get('id_based_scraper') else 'title',
+                }
             task_timings['scraping'] = time.time() - task_start
             logging.debug(f"[_do_scrape] scraper_manager.scrape_all for '{search_title}' returned: {len(all_results)} raw items.")
 
@@ -1369,25 +1389,17 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             comprehensive_filtered_out_list = filtered_out_results + items_that_failed_normalization
             logging.debug(f"[_do_scrape] For '{search_title}', comprehensive_filtered_out_list length: {len(comprehensive_filtered_out_list)}")
 
-            # --- Attach scene mapping info to results --- 
-            if scene_season_map is not None and scene_episode_map is not None:
-                logging.debug(f"Attaching scene mapping S{scene_season_map}E{scene_episode_map} to {len(filtered_results)} results.")
-                for result in filtered_results:
-                    result['xem_scene_mapping'] = {'season': scene_season_map, 'episode': scene_episode_map}
-            elif id_season_map is not None and id_episode_map is not None:
-                # ID-based scrapers only: those results are named in the upstream
-                # numbering, so the matcher needs the mapping to find the file.
-                # Title-based results keep the stored/absolute numbering their
-                # release names actually use and must NOT be remapped.
-                id_based = [r for r in filtered_results if r.get('id_based_scraper')]
-                if id_based:
-                    logging.debug(
-                        f"Attaching resolved coordinate S{id_season_map}E{id_episode_map} "
-                        f"to {len(id_based)} ID-based result(s)."
-                    )
-                    for result in id_based:
-                        result['xem_scene_mapping'] = {'season': id_season_map, 'episode': id_episode_map}
-            # --- End attaching scene mapping --- 
+            # Preserve the legacy field for in-flight queue consumers while the
+            # new per-result coordinate is rolled out.  Only emit it when the
+            # result was actually matched at a different pair.
+            for result in filtered_results:
+                coordinate = result.get('match_coordinate') or {}
+                if (coordinate.get('season'), coordinate.get('episode')) != \
+                        (original_season, original_episode):
+                    result['xem_scene_mapping'] = {
+                        'season': coordinate.get('season'),
+                        'episode': coordinate.get('episode'),
+                    }
 
             return filtered_results, comprehensive_filtered_out_list, task_timings # Return the comprehensive list
 
@@ -1626,14 +1638,14 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             # For anime, use normalized episode format for deduplication
             if is_anime and episode_formats:
                 # Create a more sophisticated key that includes title and normalized episode format
-                title = result.get('parsed_title', result.get('original_title', ''))
+                result_title = result.get('parsed_title', result.get('original_title', ''))
                 episode_info = result.get('parsed_info', {})
                 
                 # Try to extract episode number from parsed info
                 episode_num = episode_info.get('episode')
                 if episode_num:
                     normalized_ep = normalize_episode_format_for_dedup(str(episode_num))
-                    result_key = f"{title.lower()}_{normalized_ep}"
+                    result_key = f"{result_title.lower()}_{normalized_ep}"
                 else:
                     # Fallback to original title if no episode info
                     result_key = result.get('original_title', '')

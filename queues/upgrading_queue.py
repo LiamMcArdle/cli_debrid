@@ -419,6 +419,38 @@ class UpgradingQueue:
                     self._run_daily_delayed_upgrade_scrape(delayed_days)
                 finally:
                     self._last_delayed_upgrade_run_date = today
+
+        # Items collected from an incomplete source search remain usable, but
+        # they must be revisited even if general upgrading is disabled or their
+        # ordinary 24-hour upgrade window has elapsed.  Use the same bounded
+        # budget as normal upgrades so a recovering source cannot create a
+        # thundering herd.
+        if scrapes_remaining > 0:
+            try:
+                conn = get_db_connection()
+                due_rows = conn.execute(
+                    "SELECT * FROM media_items WHERE state = 'Collected' "
+                    "AND partial_scrape_sources IS NOT NULL "
+                    "AND (partial_scrape_retry_at IS NULL OR partial_scrape_retry_at <= ?) "
+                    "ORDER BY partial_scrape_retry_at ASC LIMIT ?",
+                    (current_time, scrapes_remaining),
+                ).fetchall()
+                conn.close()
+                for row in due_rows:
+                    due_item = dict(row)
+                    logging.info(
+                        f"Rechecking partial source search for item "
+                        f"{due_item.get('id')}: {due_item.get('partial_scrape_sources')}"
+                    )
+                    self.hourly_scrape(due_item, queue_manager)
+                    scrapes_remaining -= 1
+                    if scrapes_remaining <= 0:
+                        break
+            except Exception as partial_recheck_error:
+                logging.error(
+                    f"Partial-source recheck sweep failed: {partial_recheck_error}",
+                    exc_info=True,
+                )
         # Least-recently-scraped first. The pass still visits every item (the DB
         # state check and the timeout check must run for all of them), but
         # UPGRADE_SCRAPES_PER_PASS is spent in this order -- iterating self.items
@@ -509,7 +541,7 @@ class UpgradingQueue:
                         self.last_scrape_times[item_id] = now
                         if not any(i['id'] == item_id for i in self.items):
                             logging.info(f"Item {item_id} was removed during hub-magnet processing (likely upgraded).")
-                        elif time_in_queue > max_duration:
+                        elif time_in_queue > max_duration and not item.get('partial_scrape_sources'):
                             logging.info(f"Item {item_id} timed out after hub-magnet attempt (in queue > {queue_duration_hours} hours).")
                             self.remove_item(item)
                             from database import update_media_item_state
@@ -528,7 +560,7 @@ class UpgradingQueue:
 
                         # Nested Check: After scrape, check if item still exists AND has timed out
                         if any(i['id'] == item_id for i in self.items):
-                            if time_in_queue > max_duration:
+                            if time_in_queue > max_duration and not item.get('partial_scrape_sources'):
                                 logging.info(f"Item {item_id} timed out after scrape attempt (in queue > {queue_duration_hours} hours).")
                                 self.remove_item(item)
                                 from database import update_media_item_state
@@ -538,7 +570,7 @@ class UpgradingQueue:
                             logging.info(f"Item {item_id} was removed during hourly scrape (likely upgraded). Skipping timeout check.")
                     else:
                         # Still check timeout even when skipping the hourly scrape
-                        if time_in_queue > max_duration:
+                        if time_in_queue > max_duration and not item.get('partial_scrape_sources'):
                             logging.info(f"Item {item_id} timed out (in queue > {queue_duration_hours} hours) while waiting for next scrape window.")
                             self.remove_item(item)
                             from database import update_media_item_state

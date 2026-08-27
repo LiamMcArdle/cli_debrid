@@ -8,8 +8,11 @@ from scraper.functions.similarity_checks import improved_title_similarity, norma
 from scraper.functions.file_processing import compare_resolutions, parse_size, calculate_bitrate
 from scraper.functions.other_functions import smart_search
 from scraper.functions.adult_terms import adult_terms
-from scraper.functions.season_resolution import season_verdict, log_verdict
+from scraper.functions.season_resolution import (
+    season_verdict, log_verdict, episode_identity_verdict,
+)
 from scraper.functions.common import *
+from scraper.functions.common import detect_season_episode_info
 from datetime import datetime, timezone
 # --- Import DirectAPI if type hinting is desired, ensure it's available in the execution path ---
 # from cli_battery.app.direct_api import DirectAPI # Or adjust path as needed
@@ -227,9 +230,19 @@ def filter_results(
             # releases and, via the season-pack branch, whole-season packs too.
             # A result with no parseable source has no id_based_scraper key, and
             # .get() then yields None, which routes it to the stored coordinate.
-            if id_season is not None and result.get('id_based_scraper'):
-                season, episode = id_season, id_episode
-            else:
+            match_coordinate = result.get('match_coordinate') or {}
+            try:
+                if match_coordinate.get('season') is not None \
+                        and match_coordinate.get('episode') is not None:
+                    season = int(match_coordinate['season'])
+                    episode = int(match_coordinate['episode'])
+                elif id_season is not None and result.get('id_based_scraper'):
+                    # Backward compatibility for scrape_results persisted before
+                    # match_coordinate was introduced.
+                    season, episode = id_season, id_episode
+                else:
+                    season, episode = stored_season, stored_episode
+            except (TypeError, ValueError):
                 season, episode = stored_season, stored_episode
 
             result['filter_reason'] = "Passed all filters"
@@ -281,7 +294,6 @@ def filter_results(
             
             # If season_episode_info is not in parsed_info, detect it
             if 'season_episode_info' not in parsed_info:
-                from scraper.functions.common import detect_season_episode_info
                 parsed_info['season_episode_info'] = detect_season_episode_info(original_title)
                 # logging.debug(f"Detected season_episode_info: {parsed_info['season_episode_info']}")
                 
@@ -1166,6 +1178,39 @@ def filter_results(
                         # logging.debug("Complete pack detected but season_episode_counts is empty. Setting seasons/episodes to empty.")
                     result['parsed_info']['season_episode_info'] = season_episode_info
                 
+                # ID-based services frequently return a pack title while their
+                # behavior hint names the exact selected file.  The selected
+                # filename is the identity evidence; the pack title remains the
+                # release/quality title used by similarity and ranking.
+                identity_text = original_title
+                identity_info = season_episode_info
+                if result.get('id_based_scraper') and filename:
+                    try:
+                        selected_parsed = parse_title(filename) or {}
+                        identity_info = detect_season_episode_info(filename)
+                        if not identity_info.get('seasons'):
+                            identity_info['seasons'] = selected_parsed.get('seasons') or []
+                        if not identity_info.get('episodes'):
+                            identity_info['episodes'] = selected_parsed.get('episodes') or []
+                        identity_text = filename
+                        result['identity_filename'] = filename
+                        # From this point forward, pack/single-episode decisions
+                        # must describe the file Torrentio selected, not the
+                        # parent torrent label (which may say "Complete").
+                        season_episode_info = identity_info
+                        parsed_info['season_episode_info'] = identity_info
+                        parsed_info['seasons'] = identity_info.get('seasons', [])
+                        parsed_info['episodes'] = identity_info.get('episodes', [])
+                        if len(parsed_info['seasons']) == 1:
+                            parsed_info['season'] = parsed_info['seasons'][0]
+                        if len(parsed_info['episodes']) == 1:
+                            parsed_info['episode'] = parsed_info['episodes'][0]
+                    except Exception as identity_parse_error:
+                        logging.debug(
+                            f"Could not parse selected filename '{filename}': "
+                            f"{identity_parse_error}"
+                        )
+
                 if multi:
                     #logging.debug(f"Multi-episode mode: season={season}, season_pack={season_episode_info.get('season_pack')}, seasons={season_episode_info.get('seasons')}")
 
@@ -1299,8 +1344,53 @@ def filter_results(
                 else: # Single episode mode
                     #logging.debug(f"Single episode mode: S{season}E{episode}")
                     
-                    result_seasons = season_episode_info.get('seasons', [])
-                    result_episodes = season_episode_info.get('episodes', [])
+                    result_seasons = identity_info.get('seasons', [])
+                    result_episodes = identity_info.get('episodes', [])
+
+                    # One shared, pair-atomic identity gate.  The detailed checks
+                    # below retain pack/F1 diagnostics, but may no longer rescue a
+                    # file that this gate proves belongs to another episode.
+                    if not is_formula_1:
+                        parsed_date = parsed_info.get('date')
+                        target_coordinates = [(season, episode)]
+                        # Legacy queued results had only a batch-wide XEM field.
+                        # Preserve their old legitimate alternative as a COMPLETE
+                        # pair, never as separate season/episode fallbacks.
+                        if not match_coordinate and original_season is not None \
+                                and original_episode is not None \
+                                and (original_season, original_episode) != (season, episode):
+                            target_coordinates.append((original_season, original_episode))
+                        target_absolute = result.get('target_abs_episode')
+                        if target_absolute is None and is_anime \
+                                and season is not None and episode is not None:
+                            try:
+                                preceding = [int(s) for s in range(1, int(season))]
+                                if all(s in season_episode_counts for s in preceding):
+                                    target_absolute = sum(
+                                        int(season_episode_counts[s]) for s in preceding
+                                    ) + int(episode)
+                            except (TypeError, ValueError):
+                                target_absolute = None
+
+                        identity_ok, identity_reason = episode_identity_verdict(
+                            target_coordinates=target_coordinates,
+                            file_seasons=result_seasons,
+                            file_numbers=result_episodes,
+                            filename=identity_text,
+                            absolute_episode=target_absolute,
+                            is_anime=is_anime,
+                            target_air_date=target_air_date,
+                            file_air_date=parsed_date,
+                            series_title=title,
+                        )
+                        result['identity_verdict'] = identity_reason
+                        if not identity_ok:
+                            result['filter_reason'] = f"Episode identity mismatch: {identity_reason}"
+                            logging.info(
+                                f"Rejected: {result['filter_reason']} for '{identity_text}' "
+                                f"while targeting S{season}E{episode}"
+                            )
+                            continue
 
                     # --- Season Check --- 
                     season_match = False
@@ -1336,12 +1426,6 @@ def filter_results(
                         if season in result_seasons:
                             # Parsed season explicitly matches the target (XEM-mapped) season
                             season_match = True
-                        elif original_season is not None and original_season != season and original_season in result_seasons:
-                            # Torrent uses original TVDB season numbering (e.g. S03) while XEM mapped
-                            # the search to scene season (e.g. S01).  Accept both so that season-by-
-                            # season scene releases aren't rejected purely due to the XEM remap.
-                            season_match = True
-                            logging.debug(f"Season matched via original TVDB season S{original_season} (XEM remapped to S{season}) for '{original_title}'")
                         else:
                             # Same authority as MediaMatcher._check_match -- see
                             # scraper/functions/season_resolution.py. This is a
@@ -1543,18 +1627,6 @@ def filter_results(
                             logging.warning(f"Absolute-fallback error for "
                                             f"'{original_title}': {abs_err}")
                     # -----------------------------------------------------------------
-
-                    # --- Use original episode for final episode matching if available ---
-                    if not episode_match and original_episode is not None and original_episode != episode:
-                        logging.debug(f"Trying original episode fallback: original_episode={original_episode}, xem_episode={episode}, result_episodes={result_episodes} for '{original_title}'")
-                        # Try matching against the original episode number
-                        if original_episode in result_episodes:
-                            episode_match = True
-                            logging.info(f"Episode matched via original episode number {original_episode} for '{original_title}'")
-                        elif re.search(rf'\b{original_episode}\b', original_title):
-                            episode_match = True
-                            logging.info(f"Episode matched via original episode number {original_episode} found in title for '{original_title}'")
-                    # --- End original episode fallback ---
 
                     if not episode_match:
                         # Before rejecting, check if it was identified as a potential single season pack earlier

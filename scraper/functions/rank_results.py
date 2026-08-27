@@ -1,4 +1,5 @@
 import logging
+from scraper.functions.language_quality import english_accessibility_score
 import re
 from typing import List, Dict, Any, Tuple, Optional
 from scraper.functions.similarity_checks import similarity, normalize_title
@@ -366,11 +367,10 @@ def rank_result_key(
     has_language_codes = result.get('has_language_codes', False)
     detected_language_codes = result.get('detected_language_codes', [])
     
-    # If the original title/aliases don't have language codes, prefer items without language codes
+    # A missing language tag is no opinion, not evidence of quality.  The old
+    # +50 here made unknown/unlabelled releases beat explicitly described ones.
     if not has_language_codes:
-        # Original doesn't have language codes - prefer items without language codes
-        language_score += 50  # Bonus for items without language codes
-        language_reason += f" + Bonus for no language codes (original has none)"
+        language_reason += " + No language-code evidence (neutral)"
     else:
         # Original has language codes - this was already handled in filtering
         # But we can still give a small bonus for having the expected language codes
@@ -401,6 +401,15 @@ def rank_result_key(
                 language_score -= 30
                 language_reason += f" - Penalty for missing preferred language '{preferred_language_lower}' (found {detected_release_languages})"
     # --- End Preferred Audio/Sub Language Ranking ---
+
+    accessibility_score, accessibility_reason = english_accessibility_score([
+        torrent_title,
+        filename,
+        binge_group,
+        *(str(value) for value in (parsed_info.get('languages') or [])),
+    ])
+    language_score += accessibility_score
+    language_reason += f" + Accessibility {accessibility_score}: {accessibility_reason}"
 
     normalized_language = language_score # Use the raw score
 

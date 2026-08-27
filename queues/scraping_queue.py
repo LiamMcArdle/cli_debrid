@@ -17,6 +17,7 @@ from routes.notifications import send_upgrade_failed_notification
 class ScrapingQueue:
     def __init__(self):
         self.items = []
+        self.last_unavailable_scrapers = set()
         # Use a set for efficient ID lookup of in-memory items
         self._item_ids = set()
 
@@ -1053,6 +1054,23 @@ class ScrapingQueue:
         original_season = item.get('season_number')
         original_episode = item.get('episode_number')
 
+        def persist_completeness(unavailable):
+            """Remember whether every configured source answered this search."""
+            try:
+                from database.database_writing import update_partial_scrape
+                hold_minutes = int(get_setting(
+                    'Queue', 'retry_unavailable_hold_minutes', 30))
+                update_partial_scrape(
+                    item['id'], unavailable, retry_minutes=hold_minutes)
+                item['partial_scrape_sources'] = (
+                    json.dumps(sorted(unavailable)) if unavailable else None)
+                item['partial_scrape_retry_at'] = None
+            except Exception as partial_error:
+                logging.error(
+                    f"Could not persist scrape completeness for "
+                    f"{item_identifier}: {partial_error}"
+                )
+
         # Get the stored original torrent title for comparison if this is a rescrape
         stored_rescrape_title = item.get('rescrape_original_torrent_title')
 
@@ -1077,6 +1095,8 @@ class ScrapingQueue:
         # Ensure results and filtered_out are lists
         results = results if results is not None else []
         filtered_out = filtered_out if filtered_out is not None else []
+        from scraper.scrape_status import get_unavailable as _get_unavailable_scope
+        unavailable_seen = set(_get_unavailable_scope())
 
         if not skip_filter: # Apply existing filters
             # Filter out unwanted magnets, URLs and NZB guids
@@ -1141,161 +1161,9 @@ class ScrapingQueue:
 
         is_anime = True if item.get('genres') and 'anime' in item['genres'] else False
         
-        # For episodes, filter by exact season/episode match, considering XEM mapping
-        if item['type'] == 'episode' and not is_multi_pack:
-            # Filter results based on scene mapping if available, otherwise original item S/E
-            filtered_results_using_mapping = []
-            for r in results:
-                parsed_info = r.get('parsed_info', {})
-                season_episode_info = parsed_info.get('season_episode_info', {})
-                parsed_seasons = season_episode_info.get('seasons', [])
-                parsed_episodes = season_episode_info.get('episodes', [])
-                
-                scene_mapping = r.get('xem_scene_mapping')
-                
-                target_season = None
-                target_episode = None
-                
-                if scene_mapping: # Use scene mapping if present in result
-                    target_season = scene_mapping.get('season')
-                    target_episode = scene_mapping.get('episode')
-                    # logging.debug(f"Using scene mapping S{target_season}E{target_episode} for result: {r.get('original_title')}")
-                else: # Fallback to original item numbers if no mapping attached
-                    target_season = original_season
-                    target_episode = original_episode
-                    # logging.debug(f"Using original item S{target_season}E{target_episode} for result: {r.get('original_title')}")
-                    
-                # Perform the check using the determined target season/episode
-                season_match = False
-                episode_match = False
-                item_title_for_check = item.get('title', '').lower()
-                is_formula_1_item = "formula 1" in item_title_for_check
-
-                if is_formula_1_item and not scene_mapping: # Apply F1 logic only if not using XEM override
-                    parsed_torrent_year_val = parsed_info.get('year')
-                    actual_torrent_year = None
-                    if isinstance(parsed_torrent_year_val, list):
-                        if parsed_torrent_year_val and str(parsed_torrent_year_val[0]).isdigit():
-                            actual_torrent_year = int(parsed_torrent_year_val[0])
-                    elif parsed_torrent_year_val and str(parsed_torrent_year_val).isdigit():
-                        actual_torrent_year = int(parsed_torrent_year_val)
-
-                    # For F1, target_season is event year. PTT season from torrent is S01 or empty.
-                    season_match = (
-                        (not parsed_seasons or parsed_seasons == [1]) and
-                        (actual_torrent_year is not None and actual_torrent_year == target_season)
-                    )
-                    # Episode match for F1: be lenient if torrent has no parsed episodes, or match if it does.
-                    episode_match = (target_episode is None or not parsed_episodes or parsed_episodes == [target_episode])
-                    
-                    # if not (season_match and episode_match):
-                    #     logging.debug(f"F1 DEBUG (initial scrape): Post-filter mismatch for '{r.get('original_title')}': "
-                    #                   f"Item S{target_season}E{target_episode}. "
-                    #                   f"Torrent ParsedYear: {actual_torrent_year}, ParsedSeasonPTT: {parsed_seasons}, ParsedEpisodePTT: {parsed_episodes}. "
-                    #                   f"Match S:{season_match}, E:{episode_match}")
-                else: # Original logic for non-F1 or F1 with XEM
-                    season_match = (target_season is None or parsed_seasons == [target_season])
-                    episode_match = (target_episode is None or parsed_episodes == [target_episode])
-                
-                # Define original_filename for use in fallback logic
-                original_filename = parsed_info.get('original_filename', '')
-
-                # --- ANIME ABSOLUTE EPISODE MATCHING (similar to media_matcher.py) ---
-                # Check if this is anime content and we need to try absolute episode matching
-                if is_anime and not season_match and not episode_match and target_season is not None and target_episode is not None:
-                    try:
-                        # Get season episode counts for absolute episode calculation
-                        from database.database_reading import get_all_season_episode_counts
-                        tmdb_id = item.get('tmdb_id')
-                        if tmdb_id:
-                            season_episode_counts = get_all_season_episode_counts(tmdb_id)
-
-                            # Calculate target absolute episode number using the same logic as convert_anime_episode_format
-                            # Use XEM-mapped S/E if available, otherwise use original item S/E
-                            base_season = target_season  # This is already XEM-mapped if scene_mapping exists
-                            base_episode = target_episode  # This is already XEM-mapped if scene_mapping exists
-
-                            target_absolute_episode = 0
-                            # Sort seasons to ensure correct order and handle potential non-integer keys from bad metadata
-                            sorted_seasons = sorted([s for s in season_episode_counts.keys() if isinstance(s, int) and 0 < s < base_season])
-                            for s_num in sorted_seasons:
-                                target_absolute_episode += season_episode_counts.get(s_num, 0)
-                            target_absolute_episode += base_episode
-
-                            # Check if torrent uses absolute episode numbering
-                            torrent_seasons = parsed_seasons
-                            torrent_episodes = parsed_episodes
-                            
-                            # Pattern 1: Check if calculated absolute episode number matches torrent episode
-                            if torrent_seasons == [1] and target_absolute_episode in torrent_episodes:
-                                season_match = True
-                                episode_match = True
-                                logging.debug(f"Anime absolute match (initial): S01E{target_absolute_episode} format matched (target S{base_season}E{base_episode} = abs {target_absolute_episode}) for '{r.get('original_title')}'")
-                            
-                            # Pattern 2: E{absolute} or {absolute} format (season might be empty)
-                            elif not torrent_seasons and target_absolute_episode in torrent_episodes:
-                                season_match = True  # Allow missing season for absolute format
-                                episode_match = True
-                                logging.debug(f"Anime absolute match (initial): E{target_absolute_episode} or {target_absolute_episode} format matched (target S{base_season}E{base_episode}) for '{r.get('original_title')}'")
-                            
-                            # Pattern 3: Check if absolute episode appears in the original filename
-                            elif original_filename and re.search(rf'\b{target_absolute_episode}\b', original_filename):
-                                season_match = True
-                                episode_match = True
-                                logging.debug(f"Anime absolute match (initial): Found episode {target_absolute_episode} in filename '{original_filename}' (target S{base_season}E{base_episode}) for '{r.get('original_title')}'")
-                            
-                            # Pattern 4: Check for padded absolute episode formats (E001, E0001, etc.)
-                            else:
-                                # Determine padding for absolute number (same logic as convert_anime_episode_format)
-                                total_show_episodes = sum(season_episode_counts.values()) if season_episode_counts else 0
-                                padding = 4 if total_show_episodes > 999 else 3
-                                
-                                # Check padded formats
-                                padded_absolute = f"{target_absolute_episode:0{padding}d}"
-                                if original_filename:
-                                    # Check E{padded} format
-                                    if re.search(rf'\bE{padded_absolute}\b', original_filename):
-                                        season_match = True
-                                        episode_match = True
-                                        logging.debug(f"Anime absolute match (initial): Found padded E{padded_absolute} in filename '{original_filename}' (target S{base_season}E{base_episode}) for '{r.get('original_title')}'")
-                                    # Check standalone {padded} format
-                                    elif re.search(rf'\b{padded_absolute}\b', original_filename):
-                                        season_match = True
-                                        episode_match = True
-                                        logging.debug(f"Anime absolute match (initial): Found padded {padded_absolute} in filename '{original_filename}' (target S{base_season}E{base_episode}) for '{r.get('original_title')}'")
-                                        
-                    except Exception as e:
-                        logging.warning(f"Error during anime absolute episode matching (initial) for '{r.get('original_title')}': {e}")
-                        # Continue with original season_match/episode_match values
-                        pass
-                
-                # --- ORIGINAL EPISODE FALLBACK (similar to filter_results.py) ---
-                # If we're using XEM mapping and the episode number changed, try the original episode as fallback
-                if not episode_match and scene_mapping:
-                    original_item_season = original_season  # This is the original item season
-                    original_item_episode = original_episode  # This is the original item episode
-                    
-                    # Only try fallback if original episode is different from target episode
-                    if original_item_episode is not None and original_item_episode != target_episode:
-                        logging.debug(f"Trying original episode fallback (initial): original_episode={original_item_episode}, xem_episode={target_episode}, torrent_episodes={parsed_episodes} for '{r.get('original_title')}'")
-                        
-                        # Try matching against the original episode number
-                        if original_item_episode in parsed_episodes:
-                            episode_match = True
-                            logging.info(f"Episode matched via original episode number {original_item_episode} for '{r.get('original_title')}' (initial)")
-                        elif original_filename and re.search(rf'\b{original_item_episode}\b', original_filename):
-                            episode_match = True
-                            logging.info(f"Episode matched via original episode number {original_item_episode} found in filename for '{r.get('original_title')}' (initial)")
-                # --- End original episode fallback ---
-                
-                if season_match and episode_match:
-                    filtered_results_using_mapping.append(r)
-                # else: 
-                #    logging.debug(f"Filtering out result {r.get('original_title')} - Parsed: S{parsed_seasons}E{parsed_episodes}, Target: S{target_season}E{target_episode}")
-            
-            results = filtered_results_using_mapping # Update results list
-
         if results or item['type'] != 'episode':
+            self.last_unavailable_scrapers = unavailable_seen
+            persist_completeness(unavailable_seen)
             return results, filtered_out
 
         logging.info(f"No results for multi-pack {item_identifier}. Falling back to individual episode scraping.")
@@ -1317,6 +1185,7 @@ class ScrapingQueue:
         # Ensure individual results and filtered_out are lists
         individual_results = individual_results if individual_results is not None else []
         individual_filtered_out = individual_filtered_out if individual_filtered_out is not None else []
+        unavailable_seen |= set(_get_unavailable_scope())
         logging.info(f"Individual episode scrape for {item_identifier} initially returned {len(individual_results)} results.")
         if individual_results:
             logging.debug(f"  Initial individual titles: {[r.get('original_title', 'N/A') for r in individual_results]}")
@@ -1331,7 +1200,7 @@ class ScrapingQueue:
                     if is_magnet_not_wanted(r_val.get('magnet') or r_val.get('nzb_url')):
                         logging.info(f"    Filtered out '{r_val.get('original_title')}' due to is_magnet_not_wanted.")
                         continue
-                    if is_url_not_wanted(r_val['magnet']):
+                    if is_url_not_wanted(r_val.get('magnet') or r_val.get('nzb_url')):
                         logging.info(f"    Filtered out '{r_val.get('original_title')}' due to is_url_not_wanted.")
                         continue
                     if r_val.get('nzb_url') and is_nzb_guid_not_wanted(r_val.get('parsed_info', {}).get('guid') or r_val.get('nzb_url')):
@@ -1350,198 +1219,13 @@ class ScrapingQueue:
             if len(individual_results) != len(temp_individual_results):
                 logging.info(f"  After not_wanted/rescrape filters, {len(temp_individual_results)} individual results remain for {item_identifier}.")
             individual_results = temp_individual_results
-
-
-        # For episodes, use the original season/episode numbers from the item for the fallback filtering logic as well
-        # The logic below compares against these original numbers unless overridden by scene_mapping in the result
-        season = original_season # Ensure we use the original item season number here
-        episode = original_episode # Ensure we use the original item episode number here
-        
-        if season is not None and episode is not None:
-            date_based_results = []
-            regular_results = []
-            logging.debug(f"Processing {len(individual_results)} individual results for S/E matching for {item_identifier} (Item S{season}E{episode}).")
-            # Separate date-based and regular results
-            for result_idx, result in enumerate(individual_results):
-                logging.debug(f"  S/E Pre-sort check for individual result #{result_idx + 1} '{result.get('original_title', 'N/A')}': Parsed PTT: {result.get('parsed_info')}")
-                if result.get('parsed_info', {}).get('date'):
-                    result['is_date_based'] = True # Mark it
-                    date_based_results.append(result)
-                    logging.debug(f"    '{result.get('original_title')}' marked as date_based.")
-                else:
-                    regular_results.append(result)
-                    logging.debug(f"    '{result.get('original_title')}' marked as regular (non-date_based PTT).")
-            
-            filtered_regular_results = []
-            logging.debug(f"  Checking {len(regular_results)} regular (non-date PTT) results for S/E match for {item_identifier}.")
-            for r_idx, r in enumerate(regular_results):
-                parsed_info = r.get('parsed_info', {})
-                season_episode_info = parsed_info.get('season_episode_info', {})
-                parsed_seasons = season_episode_info.get('seasons', [])
-                parsed_episodes = season_episode_info.get('episodes', [])
-                
-                scene_mapping = r.get('xem_scene_mapping')
-                
-                target_season = None
-                target_episode = None
-                
-                log_prefix = f"    Regular result #{r_idx+1} ('{r.get('original_title', 'N/A')}'):"
-
-                if scene_mapping: # Use scene mapping if present
-                    target_season = scene_mapping.get('season')
-                    target_episode = scene_mapping.get('episode')
-                    logging.debug(f"{log_prefix} Using XEM S{target_season}E{target_episode}. PTT S{parsed_seasons}E{parsed_episodes}.")
-                else: # Fallback to original item numbers
-                    target_season = season # Uses the original item season from above
-                    target_episode = episode # Uses the original item episode from above
-                    logging.debug(f"{log_prefix} Using Item S{target_season}E{target_episode}. PTT S{parsed_seasons}E{parsed_episodes}Year{parsed_info.get('year')}.")
-                    
-                # Perform the check using the determined target season/episode
-                season_match = False
-                episode_match = False
-                item_title_for_check = item.get('title', '').lower()
-                is_formula_1_item = "formula 1" in item_title_for_check
-
-                if is_formula_1_item and not scene_mapping: # Apply F1 logic only if not using XEM override
-                    logging.debug(f"{log_prefix} Applying F1 matching logic.")
-                    parsed_torrent_year_val = parsed_info.get('year')
-                    actual_torrent_year = None
-                    if isinstance(parsed_torrent_year_val, list):
-                        if parsed_torrent_year_val and str(parsed_torrent_year_val[0]).isdigit():
-                            actual_torrent_year = int(parsed_torrent_year_val[0])
-                    elif parsed_torrent_year_val and str(parsed_torrent_year_val).isdigit():
-                        actual_torrent_year = int(parsed_torrent_year_val)
-
-                    season_match = (
-                        (not parsed_seasons or parsed_seasons == [1]) and
-                        (actual_torrent_year is not None and actual_torrent_year == target_season)
-                    )
-                    episode_match = (target_episode is None or not parsed_episodes or parsed_episodes == [target_episode])
-                    logging.debug(f"{log_prefix} F1 S_match:{season_match} (PTT_S:{parsed_seasons} vs Item_Year(TargetS):{target_season}, Torrent_Year:{actual_torrent_year}), E_match:{episode_match} (PTT_E:{parsed_episodes} vs Item_E:{target_episode}).")
-                else: # Original logic for non-F1 or F1 with XEM
-                    logging.debug(f"{log_prefix} Applying Non-F1/XEM matching logic.")
-                    season_match = (target_season is None or parsed_seasons == [target_season])
-                    episode_match = (target_episode is None or parsed_episodes == [target_episode])
-                    logging.debug(f"{log_prefix} Non-F1/XEM S_match:{season_match} (PTT_S:{parsed_seasons} vs TargetS:{target_season}), E_match:{episode_match} (PTT_E:{parsed_episodes} vs TargetE:{target_episode}).")
-
-                if season_match and episode_match:
-                    logging.debug(f"{log_prefix} PASSED S/E match. Adding to filtered_regular_results.")
-                    filtered_regular_results.append(r)
-                else:
-                    # Define original_filename for use in fallback logic
-                    original_filename = parsed_info.get('original_filename', '')
-
-                    # --- ANIME ABSOLUTE EPISODE MATCHING (similar to media_matcher.py) ---
-                    # Check if this is anime content and we need to try absolute episode matching
-                    is_anime = item.get('genres') and any('anime' in g.lower() for g in item.get('genres', []))
-                    if is_anime and not season_match and not episode_match and target_season is not None and target_episode is not None:
-                        try:
-                            # Get season episode counts for absolute episode calculation
-                            from database.database_reading import get_all_season_episode_counts
-                            tmdb_id = item.get('tmdb_id')
-                            if tmdb_id:
-                                season_episode_counts = get_all_season_episode_counts(tmdb_id)
-
-                                # Calculate target absolute episode number using the same logic as convert_anime_episode_format
-                                # Use XEM-mapped S/E if available, otherwise use original item S/E
-                                base_season = target_season  # This is already XEM-mapped if scene_mapping exists
-                                base_episode = target_episode  # This is already XEM-mapped if scene_mapping exists
-
-                                target_absolute_episode = 0
-                                # Sort seasons to ensure correct order and handle potential non-integer keys from bad metadata
-                                sorted_seasons = sorted([s for s in season_episode_counts.keys() if isinstance(s, int) and 0 < s < base_season])
-                                for s_num in sorted_seasons:
-                                    target_absolute_episode += season_episode_counts.get(s_num, 0)
-                                target_absolute_episode += base_episode
-
-                                # Check if torrent uses absolute episode numbering
-                                torrent_seasons = parsed_seasons
-                                torrent_episodes = parsed_episodes
-                                
-                                # Pattern 1: Check if calculated absolute episode number matches torrent episode
-                                if torrent_seasons == [1] and target_absolute_episode in torrent_episodes:
-                                    season_match = True
-                                    episode_match = True
-                                    logging.debug(f"{log_prefix} Anime absolute match: S01E{target_absolute_episode} format matched (target S{base_season}E{base_episode} = abs {target_absolute_episode})")
-                                
-                                # Pattern 2: E{absolute} or {absolute} format (season might be empty)
-                                elif not torrent_seasons and target_absolute_episode in torrent_episodes:
-                                    season_match = True  # Allow missing season for absolute format
-                                    episode_match = True
-                                    logging.debug(f"{log_prefix} Anime absolute match: E{target_absolute_episode} or {target_absolute_episode} format matched (target S{base_season}E{base_episode})")
-                                
-                                # Pattern 3: Check if absolute episode appears in the original filename
-                                elif original_filename and re.search(rf'\b{target_absolute_episode}\b', original_filename):
-                                    season_match = True
-                                    episode_match = True
-                                    logging.debug(f"{log_prefix} Anime absolute match: Found episode {target_absolute_episode} in filename '{original_filename}' (target S{base_season}E{base_episode})")
-                                
-                                # Pattern 4: Check for padded absolute episode formats (E001, E0001, etc.)
-                                else:
-                                    # Determine padding for absolute number (same logic as convert_anime_episode_format)
-                                    total_show_episodes = sum(season_episode_counts.values()) if season_episode_counts else 0
-                                    padding = 4 if total_show_episodes > 999 else 3
-                                    
-                                    # Check padded formats
-                                    padded_absolute = f"{target_absolute_episode:0{padding}d}"
-                                    if original_filename:
-                                        # Check E{padded} format
-                                        if re.search(rf'\bE{padded_absolute}\b', original_filename):
-                                            season_match = True
-                                            episode_match = True
-                                            logging.debug(f"{log_prefix} Anime absolute match: Found padded E{padded_absolute} in filename '{original_filename}' (target S{base_season}E{base_episode})")
-                                        # Check standalone {padded} format
-                                        elif re.search(rf'\b{padded_absolute}\b', original_filename):
-                                            season_match = True
-                                            episode_match = True
-                                            logging.debug(f"{log_prefix} Anime absolute match: Found padded {padded_absolute} in filename '{original_filename}' (target S{base_season}E{base_episode})")
-                                            
-                        except Exception as e:
-                            logging.warning(f"Error during anime absolute episode matching for {log_prefix}: {e}")
-                            # Continue with original season_match/episode_match values
-                            pass
-                    
-                    # --- ORIGINAL EPISODE FALLBACK (similar to filter_results.py) ---
-                    # If we're using XEM mapping and the episode number changed, try the original episode as fallback
-                    if not episode_match and scene_mapping:
-                        original_item_season = season  # This is the original item season
-                        original_item_episode = episode  # This is the original item episode
-                        
-                        # Only try fallback if original episode is different from target episode
-                        if original_item_episode is not None and original_item_episode != target_episode:
-                            logging.debug(f"{log_prefix} Trying original episode fallback: original_episode={original_item_episode}, xem_episode={target_episode}, torrent_episodes={parsed_episodes}")
-                            
-                            # Try matching against the original episode number
-                            if original_item_episode in parsed_episodes:
-                                episode_match = True
-                                logging.info(f"{log_prefix} Episode matched via original episode number {original_item_episode}")
-                            elif original_filename and re.search(rf'\b{original_item_episode}\b', original_filename):
-                                episode_match = True
-                                logging.info(f"{log_prefix} Episode matched via original episode number {original_item_episode} found in filename")
-                    # --- End original episode fallback ---
-                    
-                    # Final check after all fallback attempts
-                    if season_match and episode_match:
-                        logging.debug(f"{log_prefix} PASSED S/E match after fallback attempts. Adding to filtered_regular_results.")
-                        filtered_regular_results.append(r)
-                    else:
-                        logging.debug(f"{log_prefix} FAILED S/E match after all attempts. Discarding.")
-
-            logging.debug(f"  Finished S/E checks. Date-based: {len(date_based_results)}, Filtered Regular: {len(filtered_regular_results)} for {item_identifier}.")
-            # Combine date-based and filtered regular results
-            individual_results = date_based_results + filtered_regular_results
-            if individual_results:
-                 logging.info(f"  After all S/E filtering, {len(individual_results)} individual results remain for {item_identifier}.")
-                 logging.debug(f"    Final individual titles: {[r.get('original_title', 'N/A') for r in individual_results]}")
-            else:
-                 logging.info(f"  After all S/E filtering, 0 individual results remain for {item_identifier}.")
-
-
         if individual_results:
             logging.info(f"Found results for individual episode scraping of {item_identifier}.")
         else:
             logging.warning(f"No results found even after individual episode scraping for {item_identifier}.")
 
+        self.last_unavailable_scrapers = unavailable_seen
+        persist_completeness(unavailable_seen)
         return individual_results, individual_filtered_out
      
     def handle_no_results(self, item: Dict[str, Any], queue_manager,
