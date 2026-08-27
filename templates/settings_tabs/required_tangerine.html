@@ -34,6 +34,225 @@
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
         </svg>
         <div class="settings-header-left">
+            <h4>File Management</h4>
+        </div>
+    </div>
+    <div class="settings-section-content">
+    <!-- Plex Authentication Section -->
+    <div class="plex-auth-section">
+        <h5>Plex Authentication</h5>
+        <p class="settings-description">Connect to your Plex Media Server by signing in with your Plex account.</p>
+        <button type="button" id="plex-auth-btn" class="plex-auth-btn">
+            <img src="https://www.plex.tv/wp-content/themes/plex/assets/img/plex-logo.svg" alt="Plex Logo">
+            Sign in to Plex
+        </button>
+
+        <div id="plex-auth-failure-note" style="margin-top: 8px; font-size: 11px; color: #e8601c;">
+            If Plex authorization fails to connect using this method, try using your direct IP and Plex token in the section below. Plex cannot always navigate networking automatically.
+        </div>
+
+        <div id="plex-server-select" class="plex-server-select">
+            <h4>Select Your Plex Server</h4>
+            <div id="plex-servers-list"></div>
+        </div>
+        
+        <div id="plex-libraries-section" class="plex-libraries-section">
+            <h4>Select Your Libraries</h4>
+            <div class="plex-library-select">
+                <label for="movie_libraries">Movie Libraries:</label>
+                <select id="movie_libraries" name="movie_libraries" multiple>
+                </select>
+            </div>
+            <div class="plex-library-select">
+                <label for="shows_libraries">TV Show Libraries:</label>
+                <select id="shows_libraries" name="shows_libraries" multiple>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <!-- Plex Modal -->
+    <div id="plex-modal" class="plex-modal">
+        <div class="plex-modal-content">
+            <div class="plex-modal-header">
+                <h3 class="plex-modal-title">Plex Configuration</h3>
+                <span class="plex-modal-close">&times;</span>
+            </div>
+            
+            <div id="plex-modal-step-1" class="plex-modal-step active">
+                <h4>Select Your Plex Server</h4>
+                <div id="plex-servers-list"></div>
+            </div>
+            
+            <div id="plex-modal-step-2" class="plex-modal-step">
+                <h4>Configure Libraries</h4>
+                <div class="plex-library-select">
+                    <label for="modal-movie-libraries">Movie Libraries:</label>
+                    <select id="modal-movie-libraries" multiple>
+                    </select>
+                </div>
+                <div class="plex-library-select">
+                    <label for="modal-shows-libraries">TV Show Libraries:</label>
+                    <select id="modal-shows-libraries" multiple>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="plex-modal-footer">
+                <button id="plex-modal-back" class="plex-modal-btn secondary" style="display: none;">Back</button>
+                <button id="plex-modal-next" class="plex-modal-btn primary">Next</button>
+            </div>
+        </div>
+    </div>
+
+        {% for key, value in settings_schema['File Management'].items() %}
+            {% if key != 'tab' and key != 'symlink_organize_by_type' and key != 'symlink_organize_by_resolution' and key != 'process_non_checking_items' and key != 'symlink_organize_by_version' and key != 'symlink_folder_order' and key != 'media_server_type' %}
+            <div class="settings-form-group {% if key in ['plex_url_for_symlink', 'plex_token_for_symlink'] %}symlink-plex-setting{% endif %}">
+                <label for="file management-{{ key }}" class="settings-title">{{ key|replace('_', ' ')|title }}:</label>
+                {% if value.type == 'boolean' %}
+                    <input type="checkbox" id="file management-{{ key }}" name="File Management.{{ key }}"
+                           data-section="File Management" data-key="{{ key }}"
+                           {% if settings.get('File Management', {}).get(key) %}checked{% endif %}>
+                {% elif value.choices %}
+                    <select id="file management-{{ key }}" name="File Management.{{ key }}" class="settings-input"
+                            data-section="File Management" data-key="{{ key }}"
+                            {% if key == 'file_collection_management' %}data-current-value="{{ settings.get('File Management', {}).get(key, '') }}" 
+                            data-previous-value="{{ settings.get('File Management', {}).get(key, '') }}"
+                            data-is-windows="{{ is_windows | tojson }}" 
+                            data-allow-windows-symlinks="{{ allow_windows_symlinks | tojson }}"
+                            {% endif %}>
+                        {% set current_value = settings.get('File Management', {}).get(key, '') %}
+                        {% for choice in value.choices %}
+                            {% set is_disallowed = is_windows and choice == 'Symlinked/Local' and not allow_windows_symlinks %}
+                            <option value="{{ choice }}" 
+                                    {% if current_value == choice %}selected{% endif %} 
+                                    {% if is_disallowed and current_value != 'Symlinked/Local' %}disabled{% endif %}>{{ choice }}</option>
+                        {% endfor %}
+                    </select>
+                    {% if key == 'file_collection_management' and is_windows and not allow_windows_symlinks %}
+                        {% set current_value = settings.get('File Management', {}).get(key, '') %}
+                            {% if current_value != 'Symlinked/Local' %}
+                            <div class="windows-warning" style="margin-top: 10px; padding: 10px; border-radius: 5px; background-color: #fff3cd; border: 1px solid #ffeeba; color: #856404;">
+                                <strong>Warning:</strong> Selecting Symlinked/Local is disabled on Windows unless the 'Allow Symlinks on Windows' debug setting is enabled.
+                            </div>
+                            {% endif %}
+
+                    {% endif %}
+                {% else %}
+                    <input type="{{ value.type }}" id="file management-{{ key }}" name="File Management.{{ key }}"
+                           value="{{ settings.get('File Management', {}).get(key, '') }}" class="settings-input"
+                           data-section="File Management" data-key="{{ key }}"
+                           {% if value.sensitive %}type="password"{% endif %}>
+                {% endif %}
+                {% if value.description %}
+                    <p class="settings-description">{{ value.description }}</p>
+                {% endif %}
+            </div>
+            
+            <!-- Insert Media Server Selection after symlinked_files_path -->
+            {% if key == 'symlinked_files_path' %}
+            <!-- Media Server Selection for Symlinked/Local -->
+            <div id="media-server-selection" style="display: none;">
+
+                <div class="settings-form-group">
+                    <label for="media-server-type" class="settings-title">Media Server Type:</label>
+                    <select id="media-server-type" name="File Management.media_server_type" class="settings-input">
+                        <option value="plex" {% if settings.get('File Management', {}).get('media_server_type', 'plex') == 'plex' %}selected{% endif %}>Plex</option>
+                        <option value="jellyfin" {% if settings.get('File Management', {}).get('media_server_type', 'plex') == 'jellyfin' %}selected{% endif %}>Jellyfin/Emby</option>
+                    </select>
+                    <p class="settings-description">Select which media server to use for symlink updates.</p>
+                </div>
+            </div>
+            {% endif %}
+            {% endif %}
+        {% endfor %}
+
+        <!-- Plex Library Settings for Symlink Mode -->
+        <div class="settings-form-group symlink-plex-setting" style="display: none;">
+            <label for="plex-movie_libraries_symlink" class="settings-title">Movie Libraries:</label>
+            <input type="text" id="plex-movie_libraries_symlink" name="Plex.movie_libraries"
+                   value="{{ settings.get('Plex', {}).get('movie_libraries', '') }}" class="settings-input"
+                   data-section="Plex" data-key="movie_libraries"
+                   placeholder="Movies, 4K Movies or 1, 5">
+            <p class="settings-description">Comma-separated list of Plex movie library names or IDs (e.g., 'Movies,4K Movies' or '1,5')</p>
+        </div>
+
+        <div class="settings-form-group symlink-plex-setting" style="display: none;">
+            <label for="plex-shows_libraries_symlink" class="settings-title">TV Show Libraries:</label>
+            <input type="text" id="plex-shows_libraries_symlink" name="Plex.shows_libraries"
+                   value="{{ settings.get('Plex', {}).get('shows_libraries', '') }}" class="settings-input"
+                   data-section="Plex" data-key="shows_libraries"
+                   placeholder="TV Shows, Anime or 2, 3">
+            <p class="settings-description">Comma-separated list of Plex TV show library names or IDs (e.g., 'TV Shows,Anime' or '2,3')</p>
+        </div>
+
+
+        <!-- Plex settings included in File Management section -->
+        <div id="plex-settings-in-file-management" style="display: none;">
+            <div class="settings-subheader">
+                <h5>Plex Settings</h5>
+            </div>
+            {% for key, value in settings_schema['Plex'].items() %}
+                {% if key != 'tab' %}
+                <div class="settings-form-group">
+                    <label for="plex-{{ key }}" class="settings-title">{{ key|replace('_', ' ')|title }}:</label>
+                    {% if value.type == 'boolean' %}
+                        <input type="checkbox" id="plex-{{ key }}" name="Plex.{{ key }}"
+                               data-section="Plex" data-key="{{ key }}"
+                               {% if settings.get('Plex', {}).get(key) %}checked{% endif %}>
+                    {% elif value.choices %}
+                        <select id="plex-{{ key }}" name="Plex.{{ key }}" class="settings-input"
+                                data-section="Plex" data-key="{{ key }}">
+                            {% for choice in value.choices %}
+                                <option value="{{ choice }}" {% if settings.get('Plex', {}).get(key) == choice %}selected{% endif %}>{{ choice }}</option>
+                            {% endfor %}
+                        </select>
+                    {% else %}
+                        <input type="{{ value.type }}" id="plex-{{ key }}" name="Plex.{{ key }}"
+                               value="{{ settings.get('Plex', {}).get(key, '') }}" class="settings-input"
+                               data-section="Plex" data-key="{{ key }}"
+                               {% if key in ['movie_libraries', 'shows_libraries'] %}data-plex-required="true"{% endif %}
+                               {% if key == 'disable_plex_library_checks' %}data-plex-required="true"{% endif %}
+                               {% if value.sensitive %}type="password"{% endif %}>
+                    {% endif %}
+                    {% if value.description %}
+                        <p class="settings-description">{{ value.description }}</p>
+                    {% endif %}
+                </div>
+                {% endif %}
+            {% endfor %}
+        </div>
+        
+        <!-- Jellyfin/Emby settings included in File Management section -->
+        <div id="jellyfin-settings-in-file-management" style="display: none;">
+            <div class="settings-form-group">
+                <label for="emby_jellyfin_url" class="settings-title">Jellyfin/Emby URL:</label>
+                <input type="text" id="emby_jellyfin_url" name="Debug.emby_jellyfin_url"
+                       value="{{ settings.get('Debug', {}).get('emby_jellyfin_url', '') }}" class="settings-input"
+                       data-section="Debug" data-key="emby_jellyfin_url"
+                       autocomplete="off">
+                <p class="settings-description">URL for Emby or Jellyfin server (e.g. http://localhost:8096)</p>
+            </div>
+            <div class="settings-form-group">
+                <label for="emby_jellyfin_token" class="settings-title">Jellyfin/Emby Token:</label>
+                <input type="password" id="emby_jellyfin_token" name="Debug.emby_jellyfin_token"
+                       value="{{ settings.get('Debug', {}).get('emby_jellyfin_token', '') }}" class="settings-input"
+                       data-section="Debug" data-key="emby_jellyfin_token"
+                       autocomplete="new-password">
+                <p class="settings-description">Authentication token for Emby or Jellyfin</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if environment_mode == 'full' %}
+<div class="settings-section settings-card">
+    <div class="settings-section-header">
+        <svg class="expand-icon settings-toggle-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+        </svg>
+        <div class="settings-header-left">
             <h4>Debrid Provider</h4>
         </div>
     </div>
@@ -315,6 +534,13 @@
                    {% if settings.get('Usenet Provider', {}).get('disable_nzb_season_packs') %}checked{% endif %}>
             <p class="settings-description">Reject NZB season packs entirely (movies are unaffected). A single damaged article in a season pack repairs the whole pack via a fresh grab; with this enabled, only aggregate/single-episode NZB results are considered, so a bad file only affects that one episode.</p>
         </div>
+        <div class="settings-form-group">
+            <label for="usenet_provider-ffprobe_all_nzbs" class="settings-title">Ffprobe All NZBs:</label>
+            <input type="checkbox" id="usenet_provider-ffprobe_all_nzbs" name="Usenet Provider.ffprobe_all_nzbs"
+                   data-section="Usenet Provider" data-key="ffprobe_all_nzbs"
+                   {% if settings.get('Usenet Provider', {}).get('ffprobe_all_nzbs') %}checked{% endif %}>
+            <p class="settings-description">Before collecting an NZB file, probe it with ffprobe to confirm it's actually playable, on top of the existing missing-article/segment health check. Works in both Symlinked/Local and Plex mode — in Plex mode it runs the moment the file is found on the mount, before cli_debrid tells Plex about it, so a confirmed-broken file is rejected and re-scraped before it ever shows up in Plex. Requires ffprobe to be installed. This will slow down how long it takes NZB items to reach Collected.</p>
+        </div>
         {% if settings.get('File Management', {}).get('file_collection_management', '') != 'Symlinked/Local' %}
         <div class="settings-form-group">
             <label for="usenet_provider-enable_nzb_naming" class="settings-title">Enable NZB File Naming:</label>
@@ -370,224 +596,49 @@
     </div>
 </div>
 
-{% if environment_mode == 'full' %}
 <div class="settings-section settings-card">
     <div class="settings-section-header">
         <svg class="expand-icon settings-toggle-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
         </svg>
         <div class="settings-header-left">
-            <h4>File Management</h4>
+            <h4>Metadata Providers</h4>
         </div>
     </div>
     <div class="settings-section-content">
-    <!-- Plex Authentication Section -->
-    <div class="plex-auth-section">
-        <h5>Plex Authentication</h5>
-        <p class="settings-description">Connect to your Plex Media Server by signing in with your Plex account.</p>
-        <button type="button" id="plex-auth-btn" class="plex-auth-btn">
-            <img src="https://www.plex.tv/wp-content/themes/plex/assets/img/plex-logo.svg" alt="Plex Logo">
-            Sign in to Plex
-        </button>
-
-        <div id="plex-auth-failure-note" style="margin-top: 8px; font-size: 11px; color: #e8601c;">
-            If Plex authorization fails to connect using this method, try using your direct IP and Plex token in the section below. Plex cannot always navigate networking automatically.
-        </div>
-
-        <div id="plex-server-select" class="plex-server-select">
-            <h4>Select Your Plex Server</h4>
-            <div id="plex-servers-list"></div>
-        </div>
-        
-        <div id="plex-libraries-section" class="plex-libraries-section">
-            <h4>Select Your Libraries</h4>
-            <div class="plex-library-select">
-                <label for="movie_libraries">Movie Libraries:</label>
-                <select id="movie_libraries" name="movie_libraries" multiple>
-                </select>
-            </div>
-            <div class="plex-library-select">
-                <label for="shows_libraries">TV Show Libraries:</label>
-                <select id="shows_libraries" name="shows_libraries" multiple>
-                </select>
-            </div>
-        </div>
-    </div>
-
-    <!-- Plex Modal -->
-    <div id="plex-modal" class="plex-modal">
-        <div class="plex-modal-content">
-            <div class="plex-modal-header">
-                <h3 class="plex-modal-title">Plex Configuration</h3>
-                <span class="plex-modal-close">&times;</span>
-            </div>
-            
-            <div id="plex-modal-step-1" class="plex-modal-step active">
-                <h4>Select Your Plex Server</h4>
-                <div id="plex-servers-list"></div>
-            </div>
-            
-            <div id="plex-modal-step-2" class="plex-modal-step">
-                <h4>Configure Libraries</h4>
-                <div class="plex-library-select">
-                    <label for="modal-movie-libraries">Movie Libraries:</label>
-                    <select id="modal-movie-libraries" multiple>
-                    </select>
-                </div>
-                <div class="plex-library-select">
-                    <label for="modal-shows-libraries">TV Show Libraries:</label>
-                    <select id="modal-shows-libraries" multiple>
-                    </select>
-                </div>
-            </div>
-            
-            <div class="plex-modal-footer">
-                <button id="plex-modal-back" class="plex-modal-btn secondary" style="display: none;">Back</button>
-                <button id="plex-modal-next" class="plex-modal-btn primary">Next</button>
-            </div>
-        </div>
-    </div>
-
-        {% for key, value in settings_schema['File Management'].items() %}
-            {% if key != 'tab' and key != 'symlink_organize_by_type' and key != 'symlink_organize_by_resolution' and key != 'process_non_checking_items' and key != 'symlink_organize_by_version' and key != 'symlink_folder_order' and key != 'media_server_type' %}
-            <div class="settings-form-group {% if key in ['plex_url_for_symlink', 'plex_token_for_symlink'] %}symlink-plex-setting{% endif %}">
-                <label for="file management-{{ key }}" class="settings-title">{{ key|replace('_', ' ')|title }}:</label>
-                {% if value.type == 'boolean' %}
-                    <input type="checkbox" id="file management-{{ key }}" name="File Management.{{ key }}"
-                           data-section="File Management" data-key="{{ key }}"
-                           {% if settings.get('File Management', {}).get(key) %}checked{% endif %}>
-                {% elif value.choices %}
-                    <select id="file management-{{ key }}" name="File Management.{{ key }}" class="settings-input"
-                            data-section="File Management" data-key="{{ key }}"
-                            {% if key == 'file_collection_management' %}data-current-value="{{ settings.get('File Management', {}).get(key, '') }}" 
-                            data-previous-value="{{ settings.get('File Management', {}).get(key, '') }}"
-                            data-is-windows="{{ is_windows | tojson }}" 
-                            data-allow-windows-symlinks="{{ allow_windows_symlinks | tojson }}"
-                            {% endif %}>
-                        {% set current_value = settings.get('File Management', {}).get(key, '') %}
-                        {% for choice in value.choices %}
-                            {% set is_disallowed = is_windows and choice == 'Symlinked/Local' and not allow_windows_symlinks %}
-                            <option value="{{ choice }}" 
-                                    {% if current_value == choice %}selected{% endif %} 
-                                    {% if is_disallowed and current_value != 'Symlinked/Local' %}disabled{% endif %}>{{ choice }}</option>
-                        {% endfor %}
-                    </select>
-                    {% if key == 'file_collection_management' and is_windows and not allow_windows_symlinks %}
-                        {% set current_value = settings.get('File Management', {}).get(key, '') %}
-                            {% if current_value != 'Symlinked/Local' %}
-                            <div class="windows-warning" style="margin-top: 10px; padding: 10px; border-radius: 5px; background-color: #fff3cd; border: 1px solid #ffeeba; color: #856404;">
-                                <strong>Warning:</strong> Selecting Symlinked/Local is disabled on Windows unless the 'Allow Symlinks on Windows' debug setting is enabled.
-                            </div>
-                            {% endif %}
-
-                    {% endif %}
-                {% else %}
-                    <input type="{{ value.type }}" id="file management-{{ key }}" name="File Management.{{ key }}"
-                           value="{{ settings.get('File Management', {}).get(key, '') }}" class="settings-input"
-                           data-section="File Management" data-key="{{ key }}"
-                           {% if value.sensitive %}type="password"{% endif %}>
-                {% endif %}
-                {% if value.description %}
-                    <p class="settings-description">{{ value.description }}</p>
-                {% endif %}
-            </div>
-            
-            <!-- Insert Media Server Selection after symlinked_files_path -->
-            {% if key == 'symlinked_files_path' %}
-            <!-- Media Server Selection for Symlinked/Local -->
-            <div id="media-server-selection" style="display: none;">
-
-                <div class="settings-form-group">
-                    <label for="media-server-type" class="settings-title">Media Server Type:</label>
-                    <select id="media-server-type" name="File Management.media_server_type" class="settings-input">
-                        <option value="plex" {% if settings.get('File Management', {}).get('media_server_type', 'plex') == 'plex' %}selected{% endif %}>Plex</option>
-                        <option value="jellyfin" {% if settings.get('File Management', {}).get('media_server_type', 'plex') == 'jellyfin' %}selected{% endif %}>Jellyfin/Emby</option>
-                    </select>
-                    <p class="settings-description">Select which media server to use for symlink updates.</p>
-                </div>
-            </div>
-            {% endif %}
-            {% endif %}
-        {% endfor %}
-
-        <!-- Plex Library Settings for Symlink Mode -->
-        <div class="settings-form-group symlink-plex-setting" style="display: none;">
-            <label for="plex-movie_libraries_symlink" class="settings-title">Movie Libraries:</label>
-            <input type="text" id="plex-movie_libraries_symlink" name="Plex.movie_libraries"
-                   value="{{ settings.get('Plex', {}).get('movie_libraries', '') }}" class="settings-input"
-                   data-section="Plex" data-key="movie_libraries"
-                   placeholder="Movies, 4K Movies or 1, 5">
-            <p class="settings-description">Comma-separated list of Plex movie library names or IDs (e.g., 'Movies,4K Movies' or '1,5')</p>
-        </div>
-
-        <div class="settings-form-group symlink-plex-setting" style="display: none;">
-            <label for="plex-shows_libraries_symlink" class="settings-title">TV Show Libraries:</label>
-            <input type="text" id="plex-shows_libraries_symlink" name="Plex.shows_libraries"
-                   value="{{ settings.get('Plex', {}).get('shows_libraries', '') }}" class="settings-input"
-                   data-section="Plex" data-key="shows_libraries"
-                   placeholder="TV Shows, Anime or 2, 3">
-            <p class="settings-description">Comma-separated list of Plex TV show library names or IDs (e.g., 'TV Shows,Anime' or '2,3')</p>
-        </div>
-
-
-        <!-- Plex settings included in File Management section -->
-        <div id="plex-settings-in-file-management" style="display: none;">
-            <div class="settings-subheader">
-                <h5>Plex Settings</h5>
-            </div>
-            {% for key, value in settings_schema['Plex'].items() %}
+        {% for section in ['TMDB', 'TVDB'] %}
+            {% for key, value in settings_schema[section].items() %}
                 {% if key != 'tab' %}
                 <div class="settings-form-group">
-                    <label for="plex-{{ key }}" class="settings-title">{{ key|replace('_', ' ')|title }}:</label>
+                    <label for="{{ section|lower }}-{{ key }}" class="settings-title">{{ section }} {{ key|replace('_', ' ')|title }}:</label>
                     {% if value.type == 'boolean' %}
-                        <input type="checkbox" id="plex-{{ key }}" name="Plex.{{ key }}"
-                               data-section="Plex" data-key="{{ key }}"
-                               {% if settings.get('Plex', {}).get(key) %}checked{% endif %}>
+                        <input type="checkbox" id="{{ section|lower }}-{{ key }}" name="{{ section }}.{{ key }}"
+                               data-section="{{ section }}" data-key="{{ key }}"
+                               {% if settings.get(section, {}).get(key) %}checked{% endif %}>
                     {% elif value.choices %}
-                        <select id="plex-{{ key }}" name="Plex.{{ key }}" class="settings-input"
-                                data-section="Plex" data-key="{{ key }}">
+                        <select id="{{ section|lower }}-{{ key }}" name="{{ section }}.{{ key }}" class="settings-input"
+                                data-section="{{ section }}" data-key="{{ key }}">
                             {% for choice in value.choices %}
-                                <option value="{{ choice }}" {% if settings.get('Plex', {}).get(key) == choice %}selected{% endif %}>{{ choice }}</option>
+                                <option value="{{ choice }}" {% if settings.get(section, {}).get(key) == choice %}selected{% endif %}>{{ choice }}</option>
                             {% endfor %}
                         </select>
                     {% else %}
-                        <input type="{{ value.type }}" id="plex-{{ key }}" name="Plex.{{ key }}"
-                               value="{{ settings.get('Plex', {}).get(key, '') }}" class="settings-input"
-                               data-section="Plex" data-key="{{ key }}"
-                               {% if key in ['movie_libraries', 'shows_libraries'] %}data-plex-required="true"{% endif %}
-                               {% if key == 'disable_plex_library_checks' %}data-plex-required="true"{% endif %}
-                               {% if value.sensitive %}type="password"{% endif %}>
+                        {# TMDB's api_key stays locked (visible, read-only) in restricted environment modes,
+                           matching the field's old behavior when it lived under Additional Settings. #}
+                        <input type="{% if value.sensitive or (section == 'TMDB' and key == 'api_key' and environment_mode != 'full') %}password{% else %}{{ value.type }}{% endif %}" id="{{ section|lower }}-{{ key }}" name="{{ section }}.{{ key }}"
+                               value="{{ settings.get(section, {}).get(key, '') }}" class="settings-input"
+                               data-section="{{ section }}" data-key="{{ key }}"
+                               {% if section == 'TMDB' and key == 'api_key' and environment_mode != 'full' %}readonly disabled{% endif %}>
                     {% endif %}
                     {% if value.description %}
-                        <p class="settings-description">{{ value.description }}</p>
+                        <p class="settings-description">{{ value.description|safe }}</p>
                     {% endif %}
                 </div>
                 {% endif %}
             {% endfor %}
-        </div>
-        
-        <!-- Jellyfin/Emby settings included in File Management section -->
-        <div id="jellyfin-settings-in-file-management" style="display: none;">
-            <div class="settings-form-group">
-                <label for="emby_jellyfin_url" class="settings-title">Jellyfin/Emby URL:</label>
-                <input type="text" id="emby_jellyfin_url" name="Debug.emby_jellyfin_url"
-                       value="{{ settings.get('Debug', {}).get('emby_jellyfin_url', '') }}" class="settings-input"
-                       data-section="Debug" data-key="emby_jellyfin_url"
-                       autocomplete="off">
-                <p class="settings-description">URL for Emby or Jellyfin server (e.g. http://localhost:8096)</p>
-            </div>
-            <div class="settings-form-group">
-                <label for="emby_jellyfin_token" class="settings-title">Jellyfin/Emby Token:</label>
-                <input type="password" id="emby_jellyfin_token" name="Debug.emby_jellyfin_token"
-                       value="{{ settings.get('Debug', {}).get('emby_jellyfin_token', '') }}" class="settings-input"
-                       data-section="Debug" data-key="emby_jellyfin_token"
-                       autocomplete="new-password">
-                <p class="settings-description">Authentication token for Emby or Jellyfin</p>
-            </div>
-        </div>
+        {% endfor %}
     </div>
 </div>
-{% endif %}
 
 <script>
 // Global function for updating media server settings

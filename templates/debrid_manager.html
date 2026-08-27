@@ -788,6 +788,7 @@
                         <option value="error">Error</option>
                     </select>
                     <button onclick="usenetLoadActivity(document.getElementById('usenet-filter-select').value||null)" class="un-btn"><i class="fa-solid fa-rotate" style="color:#e8601c"></i> Refresh</button>
+                    <button onclick="usenetClearActivity()" class="un-btn"><i class="fa-solid fa-trash" style="color:#ff4444"></i> Clear Log</button>
                 </div>
             </div>
             <div id="usenet-activity-container">
@@ -900,6 +901,7 @@
                         <option value="error">Error</option>
                     </select>
                     <button onclick="debridLoadActivity(document.getElementById('dr-filter-select').value||null)" class="un-btn"><i class="fa-solid fa-rotate" style="color:#CE93D8"></i> Refresh</button>
+                    <button onclick="debridClearActivity()" class="un-btn"><i class="fa-solid fa-trash" style="color:#ff4444"></i> Clear Log</button>
                 </div>
             </div>
             <div id="dr-activity-container">
@@ -4423,6 +4425,23 @@ async function usenetLoadActivity(filter) {
     await _usenetFetchActivity();
 }
 
+async function usenetClearActivity() {
+    if (!confirm('Clear the entire NZB repair activity log?\n\nThis only deletes the log history — it does not touch any media, Plex entries, or provider jobs.\n\nContinue?')) return;
+    try {
+        const r = await fetch('/debrid_manager/api/usenet/repair/activity/clear', {method: 'POST'});
+        const d = await r.json();
+        if (d.success) {
+            _usenetActivityOffset = 0;
+            await _usenetFetchActivity();
+        } else {
+            alert('Failed to clear activity log: ' + (d.error || 'unknown error'));
+        }
+    } catch(e) {
+        console.error('[Usenet] activity clear error', e);
+        alert('Failed to clear activity log');
+    }
+}
+
 async function _usenetFetchActivity() {
     const container = document.getElementById('usenet-activity-container');
     const pagination = document.getElementById('usenet-activity-pagination');
@@ -4479,12 +4498,28 @@ function _buildOutcomeTooltip(r) {
             lines.push('Broken file successfully replaced with a new NZB download.');
             if (r.replacement_title) lines.push('New: ' + r.replacement_title);
             break;
+        case 'replacement_pending':
+            lines.push('A candidate is being collected and must pass article and playback validation before cleanup.');
+            break;
         case 'reinserted':
             lines.push('cli_mount link resolver re-triggered for this entry.');
             break;
         case 'skipped_max_attempts':
-            lines.push('Maximum repair attempts reached — requires manual intervention.');
-            if (r.repair_attempts) lines.push('Attempts made: ' + r.repair_attempts);
+            if (r.current_replacement_title) {
+                lines.push('Maximum repair attempts were reached, but the item has since been resolved (retried or fixed another way).');
+            } else {
+                lines.push('Maximum repair attempts reached — requires manual intervention.');
+                if (r.repair_attempts) lines.push('Attempts made: ' + r.repair_attempts);
+            }
+            break;
+        case 'manual_retry':
+            lines.push('Manually retried after exhausting automatic repair attempts.');
+            if (r.current_replacement_title) {
+                lines.push('A replacement was found and collected successfully.');
+            } else {
+                lines.push('Item moved to Wanted for a fresh scrape.');
+                if (r.current_item_state) lines.push('Current state: ' + r.current_item_state);
+            }
             break;
     }
     return lines.join('\n').replace(/"/g, '&quot;');
@@ -4523,19 +4558,28 @@ function _usenetRenderActivity(rows, container, pagination) {
 
     rows.forEach((r, idx) => {
         const bg = idx % 2 === 0 ? 'transparent' : 'rgba(128,128,128,0.04)';
-        const outcomeColor = r.outcome === 'replaced' ? '#00d4aa' : r.outcome === 'not_found' ? '#ffaa44' : r.outcome === 'plex_deleted' ? '#4488ff' : r.outcome === 'reinserted' ? '#a78bfa' : '#ff4444';
-        const outcomeLabel = r.outcome === 'replaced' ? 'Replaced' : r.outcome === 'not_found' ? 'Not Found' : r.outcome === 'plex_deleted' ? 'Plex Deleted' : r.outcome === 'reinserted' ? 'Re-inserted' : (r.outcome || '—');
+        const resolvedElsewhere = (r.outcome === 'manual_retry' || r.outcome === 'skipped_max_attempts') && !!r.current_replacement_title;
+        const outcomeColor = r.outcome === 'replaced' ? '#00d4aa' : r.outcome === 'replacement_pending' ? '#ffaa44' : r.outcome === 'not_found' ? '#ffaa44' : r.outcome === 'plex_deleted' ? '#4488ff' : r.outcome === 'reinserted' ? '#a78bfa' : resolvedElsewhere ? '#00d4aa' : r.outcome === 'manual_retry' ? '#4488ff' : '#ff4444';
+        const outcomeLabel = r.outcome === 'replaced' ? 'Replaced' : r.outcome === 'replacement_pending' ? 'Pending verification' : r.outcome === 'not_found' ? 'Not Found' : r.outcome === 'plex_deleted' ? 'Plex Deleted' : r.outcome === 'reinserted' ? 'Re-inserted' : (resolvedElsewhere && r.outcome === 'manual_retry') ? 'Retry Succeeded' : (resolvedElsewhere && r.outcome === 'skipped_max_attempts') ? 'Resolved' : r.outcome === 'manual_retry' ? 'Retrying…' : r.outcome === 'skipped_max_attempts' ? 'Max Attempts' : (r.outcome || '—');
         const outcomeTooltip = _buildOutcomeTooltip(r);
         const epSub = r.season_number ? `<br><span style="font-size:11px;color:#888">S${String(r.season_number).padStart(2,'0')}E${String(r.episode_number||0).padStart(2,'0')}</span>` : '';
-        const ts = r.created_at ? new Date(r.created_at + (r.created_at.endsWith('Z') ? '' : 'Z')).toLocaleString() : '—';
+        const activityTime = r.updated_at || r.created_at;
+        const ts = activityTime ? new Date(activityTime + (activityTime.endsWith('Z') ? '' : 'Z')).toLocaleString() : '—';
         const brokenTitle = r.broken_nzb_title || r.broken_nzb_id || '—';
-        const replTitle = (r.replacement_title && r.replacement_title !== '—') ? r.replacement_title : null;
+        const replTitle = resolvedElsewhere && r.current_replacement_title
+            ? r.current_replacement_title
+            : (r.replacement_title && r.replacement_title !== '—') ? r.replacement_title : null;
         const candidateCell = _renderActivityCandidateCell(brokenTitle, replTitle, r.broken_nzb_id);
+        const retryBtn = (r.outcome === 'skipped_max_attempts' && !resolvedElsewhere)
+            ? `<button class="dm-btn dm-btn-secondary dm-btn-xs" style="margin-left:8px"
+                       data-item-id="${_esc(r.item_id)}" data-broken-id="${_esc(r.broken_nzb_id || '')}"
+                       onclick="retryExhaustedRepair(this)" title="Move back to Wanted and try to find another replacement">Retry</button>`
+            : '';
         html += `<tr style="border-bottom:1px solid var(--border-color,#2a2a2a);background:${bg};">
             <td style="padding:8px 12px;white-space:nowrap;font-family:monospace;font-size:11px;color:var(--text-secondary,#888)">${ts}</td>
             <td style="padding:8px 12px;font-weight:500;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_esc(r.title || '—')}${epSub}</td>
             <td style="padding:8px 12px;max-width:0;overflow:hidden">${candidateCell}</td>
-            <td style="padding:8px 12px;white-space:nowrap"><span style="color:${outcomeColor};font-weight:600;font-size:12px;cursor:help" title="${outcomeTooltip}">${outcomeLabel}</span></td>
+            <td style="padding:8px 12px;white-space:nowrap"><span style="color:${outcomeColor};font-weight:600;font-size:12px;cursor:help" title="${outcomeTooltip}">${outcomeLabel}</span>${retryBtn}</td>
         </tr>`;
     });
 
@@ -5003,6 +5047,34 @@ async function afDelete(btn) {
     }
 }
 
+async function retryExhaustedRepair(btn) {
+    const itemId = btn.dataset.itemId || '';
+    const brokenId = btn.dataset.brokenId || '';
+    if (!itemId) return;
+    if (!confirm('Move this item back to Wanted and try to find another replacement?')) return;
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+        const r = await fetch('/debrid_manager/api/usenet/repair/retry_exhausted', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({item_id: itemId, broken_nzb_id: brokenId}),
+        });
+        const d = await r.json();
+        if (d.success) {
+            _usenetFetchActivity();
+        } else {
+            btn.disabled = false;
+            btn.textContent = 'Retry';
+            alert('Retry failed: ' + (d.error || d.result?.message || 'unknown error'));
+        }
+    } catch (e) {
+        btn.disabled = false;
+        btn.textContent = 'Retry';
+        alert('Retry error: ' + e.message);
+    }
+}
+
 // Auto-refresh every 10s while the usenet tab is visible
 function afStartPolling() {
     afLoad();
@@ -5129,6 +5201,23 @@ async function debridLoadActivity(filter) {
     const sel = document.getElementById('dr-filter-select');
     if (sel) sel.value = filter || '';
     await _debridFetchActivity();
+}
+
+async function debridClearActivity() {
+    if (!confirm('Clear the entire debrid repair activity log?\n\nThis only deletes the log history — it does not touch any media, Plex entries, or provider jobs.\n\nContinue?')) return;
+    try {
+        const r = await fetch('/debrid_manager/api/debrid/repair/activity/clear', {method: 'POST'});
+        const d = await r.json();
+        if (d.success) {
+            _debridActivityOffset = 0;
+            await _debridFetchActivity();
+        } else {
+            alert('Failed to clear activity log: ' + (d.error || 'unknown error'));
+        }
+    } catch(e) {
+        console.error('[Debrid] activity clear error', e);
+        alert('Failed to clear activity log');
+    }
 }
 
 async function _debridFetchActivity() {
@@ -7275,7 +7364,7 @@ async function _slDeleteAll(kind) {
                 });
                 const d = await r.json();
                 if (d.success) {
-                    showPopup({ type: 'success', title: 'Success', message: `Deleted ${d.deleted}${d.failed ? `, failed ${d.failed}` : ''}`, autoClose: 4000 });
+                    showPopup({ type: 'success', title: 'Success', message: `Deleted ${d.deleted}${d.skipped ? `, skipped ${d.skipped} (now in use)` : ''}${d.failed ? `, failed ${d.failed}` : ''}`, autoClose: 4000 });
                     // Re-scan to refresh
                     await _slStartScan();
                 } else {

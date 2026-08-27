@@ -18,7 +18,13 @@ RUN apt-get update && \
     xvfb fonts-liberation fonts-unifont libnss3 libnspr4 libatk1.0-0 \
     libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
     libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 \
-    libcairo2 libatspi2.0-0 && \
+    libcairo2 libatspi2.0-0 \
+    # DejaVu Sans — last-resort system-font fallback for poster overlay text
+    # (see overlays/font_manager.py's _LOCAL_FONT_MAP). Without this package
+    # the fallback path was silently unreachable: the font_manager fell
+    # through to trying a Google Fonts download for "DejaVuSans-Bold", which
+    # isn't a real Google Fonts family name and always failed.
+    fonts-dejavu-core && \
     # Cleanup
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
@@ -91,45 +97,10 @@ EXPOSE 5000 8888
 RUN mkdir -p /etc/supervisor/conf.d
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-# Create an entrypoint script
-RUN echo '#!/bin/bash\n\
-\n\
-# Function to set permissions\n\
-set_permissions() {\n\
-    echo "Setting permissions for /user directory..."\n\
-    chmod -R 755 /user\n\
-    find /user -type f -exec chmod 644 {} +\n\
-    chown -R $PUID:$PGID /user\n\
-    echo "Permissions set successfully"\n\
-}\n\
-\n\
-# Create user with specified PUID/PGID or use root\n\
-if [ $PUID != 0 ] || [ $PGID != 0 ]; then\n\
-    echo "Starting with custom user - PUID: $PUID, PGID: $PGID"\n\
-    groupadd -g $PGID appuser\n\
-    useradd -u $PUID -g $PGID -d /app appuser\n\
-    set_permissions\n\
-    echo "Created user appuser with UID: $PUID and GID: $PGID"\n\
-    # Update supervisord config to use the new user\n\
-    sed -i "s/user=root/user=appuser/" /etc/supervisor/conf.d/supervisord.conf\n\
-    echo "Updated supervisord configuration to use appuser"\n\
-else\n\
-    echo "Starting with root user (PUID=0, PGID=0)"\n\
-    set_permissions\n\
-fi\n\
-\n\
-# Start supervisord and tail logs\n\
-if [ $PUID != 0 ] || [ $PGID != 0 ]; then\n\
-    echo "Starting supervisord as appuser"\n\
-    gosu appuser supervisord -n -c /etc/supervisor/conf.d/supervisord.conf & \n\
-else\n\
-    echo "Starting supervisord as root"\n\
-    supervisord -n -c /etc/supervisor/conf.d/supervisord.conf & \n\
-fi\n\
-\n\
-sleep 2\n\
-exec tail -F /user/logs/debug.log' > /app/entrypoint.sh && \
-chmod +x /app/entrypoint.sh
+# Keep the runtime entrypoint in a normal source file so its root-only setup
+# (including X11 socket-directory ownership) cannot drift from the image.
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Use the entrypoint script
 CMD ["/app/entrypoint.sh"]

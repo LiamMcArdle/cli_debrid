@@ -279,10 +279,26 @@ class ScrapingQueue:
                 # logging.info(f"[DEBUG_ITEM_{DEBUG_ITEM_ID}] PASSED alternate scrape window check.")
                 pass
 
+            # A manual retry (usenet/repair_engine.retry_exhausted_item) skips
+            # coalescing on its very next scrape pass — it was retried
+            # specifically to get away from a broken job, and blindly
+            # coalescing into a sibling that still points at that same (or
+            # another dead) job can loop it forever. Every other item's
+            # coalescing behavior below is completely unchanged.
+            _skip_coalesce_manual_retry = False
+            try:
+                from usenet.repair_engine import _manual_retry_pending, _manual_retry_pending_lock
+                with _manual_retry_pending_lock:
+                    if item_to_process.get('id') in _manual_retry_pending:
+                        _manual_retry_pending.discard(item_to_process.get('id'))
+                        _skip_coalesce_manual_retry = True
+            except Exception:
+                pass
+
             # --- NZB season pack coalescing: if another episode of the same show/season
             # is already in Adding or Checking with an NZB job, reuse that job directly
             # instead of scraping again (which would pick a different season pack NZB).
-            if item_to_process.get('type') == 'episode':
+            if item_to_process.get('type') == 'episode' and not _skip_coalesce_manual_retry:
                 _coalesce_imdb = item_to_process.get('imdb_id')
                 _coalesce_season = item_to_process.get('season_number')
                 if _coalesce_imdb and _coalesce_season is not None:
@@ -301,25 +317,59 @@ class ScrapingQueue:
                         finally:
                             _cconn.close()
                         import re as _re_coal
-                        if _sibling_nzb and not _re_coal.search(r'[Ss]\d{2}[Ee]\d{2}', _sibling_nzb[1] or ''):
+                        # A sibling job is only safe to reuse as a "season pack" if NEITHER the
+                        # scraped release title NOR the actual downloaded filename reveal a
+                        # specific episode marker anywhere. Checking the title alone is not
+                        # enough: some indexers (e.g. DrunkenSlug REPACK releases) publish a
+                        # genuinely single-episode NZB under a season-level release name like
+                        # "Show.S03.REPACK.WEB-DL...", with the real episode number appearing
+                        # only in the inner filename once downloaded. Trusting a title-less match
+                        # by itself caused every other episode of that season to silently reuse
+                        # that one episode's file. Checking the filename too catches this case:
+                        # once the sibling has actually downloaded, its filled_by_file (e.g.
+                        # "Show.S03E01....mkv") carries the real episode marker even when the
+                        # scraped title never did.
+                        _coal_title = (_sibling_nzb[4] or '') if _sibling_nzb else ''  # original_scraped_torrent_title
+                        _coal_file = (_sibling_nzb[1] or '') if _sibling_nzb else ''  # filled_by_file
+                        _coal_title_has_ep = bool(_re_coal.search(r'[Ss]\d{2}[Ee]\d{2}', _coal_title))
+                        _coal_file_has_ep = bool(_re_coal.search(r'[Ss]\d{2}[Ee]\d{2}', _coal_file))
+                        # An entirely empty title/filename is not evidence of a pack either - it
+                        # usually just means the sibling's own submission hasn't finished writing
+                        # back yet. Requiring at least one real (non-empty) field, with neither
+                        # field showing a specific episode, avoids wrongly coalescing this item
+                        # into an unrelated individual episode's job.
+                        if _sibling_nzb and (_coal_title or _coal_file) and not _coal_title_has_ep and not _coal_file_has_ep:
                             _job_id = _sibling_nzb[0]
-                            _job_url = _sibling_nzb[2] or ''
-                            _job_title = _sibling_nzb[3] or ''
-                            _job_orig = _sibling_nzb[4] or ''
-                            _job_seg = _sibling_nzb[5] or ''
-                            logging.info(f'[NZBPack] {item_identifier}: season pack already submitted (job={_job_id}), coalescing into same job')
-                            from database.database_writing import update_media_item, update_media_item_state
-                            update_media_item_state(item_to_process['id'], 'Adding')
-                            _coal_seg_kwargs = {'nzb_segment_id': _job_seg} if _job_seg else {}
-                            update_media_item(item_to_process['id'],
-                                filled_by_torrent_id=_job_id,
-                                filled_by_magnet=_job_url,
-                                filled_by_title=_job_title,
-                                original_scraped_torrent_title=_job_orig,
-                                **_coal_seg_kwargs,
-                            )
-                            self.remove_item(item_to_process)
-                            return True
+                            # Verify the shared job is still actually queryable on the provider
+                            # before reusing it - a job that completed and was since cleaned up
+                            # (or never existed) will ghost every retry forever if reused blindly,
+                            # since nothing else ever re-checks it once it's written to this item.
+                            _job_hash_for_check = _job_id[4:] if str(_job_id).startswith('nzb:') else _job_id
+                            try:
+                                from usenet.climount_client import is_nzb_job_alive as _is_job_alive
+                                _coalesce_job_alive = _is_job_alive(_job_hash_for_check)
+                            except Exception:
+                                _coalesce_job_alive = True  # unknown due to error - don't block a legitimate reuse
+                            if not _coalesce_job_alive:
+                                logging.warning(f'[NZBPack] {item_identifier}: sibling job {_job_id} no longer alive on provider - not coalescing, submitting fresh')
+                            else:
+                                _job_url = _sibling_nzb[2] or ''
+                                _job_title = _sibling_nzb[3] or ''
+                                _job_orig = _sibling_nzb[4] or ''
+                                _job_seg = _sibling_nzb[5] or ''
+                                logging.info(f'[NZBPack] {item_identifier}: season pack already submitted (job={_job_id}), coalescing into same job')
+                                from database.database_writing import update_media_item, update_media_item_state
+                                update_media_item_state(item_to_process['id'], 'Adding')
+                                _coal_seg_kwargs = {'nzb_segment_id': _job_seg} if _job_seg else {}
+                                update_media_item(item_to_process['id'],
+                                    filled_by_torrent_id=_job_id,
+                                    filled_by_magnet=_job_url,
+                                    filled_by_title=_job_title,
+                                    original_scraped_torrent_title=_job_orig,
+                                    **_coal_seg_kwargs,
+                                )
+                                self.remove_item(item_to_process)
+                                return True
                     except Exception as _ce:
                         logging.debug(f'[NZBPack] Season pack coalesce check failed: {_ce}')
 
@@ -662,14 +712,17 @@ class ScrapingQueue:
                                     len(_batch_candidates) >= _season_total
                                 )
 
-                                if _all_eps_requested and is_multi_pack:
+                                _disable_nzb_season_packs = get_setting('Usenet Provider', 'disable_nzb_season_packs', True)
+
+                                if _all_eps_requested and is_multi_pack and not _disable_nzb_season_packs:
                                     # Full season in batch and multi-pack mode — current item will
                                     # scrape as season pack; siblings will coalesce onto its job.
                                     # No special handling needed here; fall through to normal scrape.
                                     logging.info(f'[NZBBatch] Full season ({len(_batch_candidates)}/{_season_total} eps) — season pack path handles this')
                                 else:
-                                    # Partial batch or individual mode — scrape each episode in the
-                                    # batch right now so they all move to Adding in one tick.
+                                    # Partial batch, individual mode, or full season with NZB season
+                                    # packs disabled — scrape each episode in the batch right now so
+                                    # they all move to Adding in one tick (as a virtual aggregate pack).
                                     # Each gets its own cli_mount job and independent health check.
                                     _batch_submitted = 0
                                     _batch_ids_to_remove = set()

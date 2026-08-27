@@ -326,6 +326,8 @@ class ProgramRunner:
             'task_sync_cli_mount_changes': 5 * 60, # Run every 5 minutes
             'task_push_pending_climount_tags': 5 * 60, # Run every 5 minutes — catches tags changed on cli_debrid side only
             'task_nzb_health_check': 10,             # Run every 10 seconds — polls NZB items in Adding
+            'task_nzb_playback_repair_completion': 15, # Confirm only already-started playback repairs
+            'task_nzb_playback_cleanup_retry': 20 * 60, # Background retry for old-file cleanup deferred after finalization
             'task_backfill_plex_guids': 24 * 60 * 60,    # Run once (disabled by default)
             'task_backfill_plex_ms_item_id': 24 * 60 * 60, # Run once (disabled by default)
             # --- END EDIT ---
@@ -526,6 +528,8 @@ class ProgramRunner:
             'task_update_queue_views',
             'task_send_notifications',
             'task_nzb_health_check',
+            'task_nzb_playback_repair_completion',
+            'task_nzb_playback_cleanup_retry',
             # Essential Periodic Tasks
             'task_check_service_connectivity',
             'task_heartbeat',
@@ -3308,6 +3312,8 @@ class ProgramRunner:
     _nzb_health_triggered: dict = {}     # entry_name → tick count since trigger (0 = not yet triggered)
     _NZB_HEALTH_MAX_POLL_TICKS = 6       # give up polling after ~60s (6 ticks × 10s)
     _nzb_confirmed_complete: dict = {}   # job_id → entry_name for jobs confirmed complete+folder found
+    _nzb_ghost_repeat_counts: dict = {}  # item_id → consecutive ghost-job cycles for this item
+    _NZB_GHOST_BLACKLIST_THRESHOLD = 3   # blacklist instead of retrying after this many ghost repeats
 
     def task_nzb_health_check(self):
         """Poll NZB items in Adding state, run health checks, move to Checking or back to Wanted.
@@ -3574,6 +3580,19 @@ class ProgramRunner:
                         logging.debug(f'[NZB] {torrent_id} still queued/unknown — waiting')
                         continue
                     elif progress == -2:
+                        try:
+                            from database.nzb_playback_repair import reject_active_candidate
+                            if reject_active_candidate(item_id, job_id, 'provider_job_missing'):
+                                logging.warning(
+                                    '[NZBPlayback] Provisional candidate %s disappeared; original retained and candidate excluded',
+                                    job_id,
+                                )
+                                adding_queue.remove_item(item)
+                                continue
+                        except Exception as _playback_ghost_err:
+                            logging.error('[NZBPlayback] Could not persist missing candidate %s: %s',
+                                          job_id, _playback_ghost_err, exc_info=True)
+                            continue
                         # Ghost job — never existed in cli_mount or already purged.
                         # Move primary item AND all siblings to Wanted (not retry in Adding)
                         # so they re-scrape fresh. Do NOT retry from scrape_results here
@@ -3594,15 +3613,41 @@ class ProgramRunner:
                         logging.warning(f'[NZB] Ghost job {torrent_id}: found {len(_ghost_items)} item(s) to move to Wanted')
                         for _gi in _ghost_items:
                             try:
+                                _gi_id = _gi['id']
                                 _gi_url = _gi.get('filled_by_magnet', '')
                                 if _gi_url and _gi_url != item.get('filled_by_magnet', ''):
                                     _add_guid_g(_gi_url)
-                                self.queue_manager.move_to_wanted(_gi, 'Adding')
-                                logging.info(f'[NZB] Moved ghost job item {_gi["id"]} to Wanted')
+                                # Cap how many times the same item can be resurrected into a
+                                # ghost job before we stop retrying and blacklist instead -
+                                # without this, an item whose reused reference keeps ghosting
+                                # (e.g. a dead cli_mount job resurrected by a watchlist re-add)
+                                # loops Wanted->Scraping->Adding forever with no escalation.
+                                _ghost_count = self._nzb_ghost_repeat_counts.get(_gi_id, 0) + 1
+                                self._nzb_ghost_repeat_counts[_gi_id] = _ghost_count
+                                if _ghost_count >= self._NZB_GHOST_BLACKLIST_THRESHOLD:
+                                    logging.warning(f'[NZB] Item {_gi_id} ghosted {_ghost_count}x — blacklisting instead of retrying again')
+                                    self.queue_manager.move_to_blacklisted(_gi, 'Adding')
+                                    self._nzb_ghost_repeat_counts.pop(_gi_id, None)
+                                else:
+                                    self.queue_manager.move_to_wanted(_gi, 'Adding')
+                                    logging.info(f'[NZB] Moved ghost job item {_gi_id} to Wanted (ghost count {_ghost_count}/{self._NZB_GHOST_BLACKLIST_THRESHOLD})')
                             except Exception as _gi_err:
                                 logging.error(f'[NZB] Failed to move ghost item {_gi.get("id")} to Wanted: {_gi_err}')
                         continue
                     elif progress == -1:
+                        try:
+                            from database.nzb_playback_repair import reject_active_candidate
+                            if reject_active_candidate(item_id, job_id, 'provider_job_failed'):
+                                logging.warning(
+                                    '[NZBPlayback] Provisional candidate %s failed; original retained and candidate excluded',
+                                    job_id,
+                                )
+                                adding_queue.remove_item(item)
+                                continue
+                        except Exception as _playback_fail_err:
+                            logging.error('[NZBPlayback] Could not persist failed candidate %s: %s',
+                                          job_id, _playback_fail_err, exc_info=True)
+                            continue
                         logging.warning(f'[NZB] {torrent_id} failed in cli_mount — adding to not-wanted and moving back to Scraping')
                         try:
                             from database.not_wanted_magnets import add_to_not_wanted_nzb_guid as _add_guid, add_to_not_wanted_nzb_segment as _add_seg
@@ -3626,11 +3671,26 @@ class ProgramRunner:
                             ]
                             for _ds in _dead_siblings:
                                 try:
+                                    _ds_id = _ds['id']
                                     _ds_url = _ds.get('filled_by_magnet', '')
                                     if _ds_url:
                                         _add_guid(_ds_url)
-                                    self.queue_manager.move_to_wanted(_ds, 'Adding')
-                                    logging.info(f'[NZB] Cleaned up dead sibling {_ds["id"]} from Adding')
+                                    # Cap repeats for coalesced siblings the same way the primary
+                                    # item below is capped. Without this, a sibling sharing the
+                                    # dead job reference (e.g. a coalesced season pack) keeps
+                                    # getting reset to Wanted every cycle with nothing ever
+                                    # incrementing for it, reproducing the exact unbounded
+                                    # Wanted->Scraping->Adding loop this cap exists to close -
+                                    # just for the sibling instead of the primary item.
+                                    _ds_fail_count = self._nzb_ghost_repeat_counts.get(_ds_id, 0) + 1
+                                    self._nzb_ghost_repeat_counts[_ds_id] = _ds_fail_count
+                                    if _ds_fail_count >= self._NZB_GHOST_BLACKLIST_THRESHOLD:
+                                        logging.warning(f'[NZB] Sibling {_ds_id} failed-in-cli_mount {_ds_fail_count}x — blacklisting instead of retrying again')
+                                        self._nzb_ghost_repeat_counts.pop(_ds_id, None)
+                                        self.queue_manager.move_to_blacklisted(_ds, 'Adding')
+                                    else:
+                                        self.queue_manager.move_to_wanted(_ds, 'Adding')
+                                        logging.info(f'[NZB] Cleaned up dead sibling {_ds_id} from Adding (failure count {_ds_fail_count}/{self._NZB_GHOST_BLACKLIST_THRESHOLD})')
                                 except Exception:
                                     pass
                         except Exception:
@@ -3693,7 +3753,15 @@ class ProgramRunner:
                             # Move back to Wanted for fresh re-scrape rather than blacklisting.
                             # NZB failures exhaust scrape_results quickly (not-wanted list filters them),
                             # but new results may be available on indexers — don't blacklist prematurely.
-                            logging.info(f'[NZB] {torrent_id} no remaining results — moving to Wanted for fresh scrape')
+                            #
+                            # That assumption only holds if the fresh re-scrape actually reaches a
+                            # different NZB each time. If something keeps reusing the same dead
+                            # reference (the not-wanted guid it just added above doesn't stop a
+                            # title-match reuse elsewhere from grabbing it again), this becomes an
+                            # unbounded loop instead of the intended "try something new" retry - so
+                            # cap repeats of the identical outcome for this item before giving up.
+                            _fail_count = self._nzb_ghost_repeat_counts.get(item_id, 0) + 1
+                            self._nzb_ghost_repeat_counts[item_id] = _fail_count
                             try:
                                 from database.database_writing import update_media_item as _umi_nw
                                 _umi_nw(item_id, filled_by_torrent_id=None, filled_by_file=None,
@@ -3701,7 +3769,13 @@ class ProgramRunner:
                                         scrape_results=None, fall_back_to_single_scraper=False)
                             except Exception:
                                 pass
-                            self.queue_manager.move_to_wanted(item, 'Adding')
+                            if _fail_count >= self._NZB_GHOST_BLACKLIST_THRESHOLD:
+                                logging.warning(f'[NZB] Item {item_id} failed-in-cli_mount {_fail_count}x with no new results each time — blacklisting instead of retrying again')
+                                self._nzb_ghost_repeat_counts.pop(item_id, None)
+                                self.queue_manager.move_to_blacklisted(item, 'Adding')
+                            else:
+                                logging.info(f'[NZB] {torrent_id} no remaining results — moving to Wanted for fresh scrape (failure count {_fail_count}/{self._NZB_GHOST_BLACKLIST_THRESHOLD})')
+                                self.queue_manager.move_to_wanted(item, 'Adding')
                         continue
                     elif progress < 100:
                         # Check if this job has been downloading too long without finishing.
@@ -3734,6 +3808,19 @@ class ProgramRunner:
                             except Exception:
                                 pass
                             logging.debug(f'[NZB] {torrent_id} progress={progress}% — waiting')
+                            continue
+                        try:
+                            from database.nzb_playback_repair import reject_active_candidate
+                            if reject_active_candidate(item_id, job_id, 'provider_job_timeout'):
+                                logging.warning(
+                                    '[NZBPlayback] Provisional candidate %s timed out; original retained and candidate excluded',
+                                    job_id,
+                                )
+                                adding_queue.remove_item(item)
+                                continue
+                        except Exception as _playback_timeout_err:
+                            logging.error('[NZBPlayback] Could not persist timed-out candidate %s: %s',
+                                          job_id, _playback_timeout_err, exc_info=True)
                             continue
                         # Download timed out — treat like a failed job: add URL to not-wanted,
                         # delete from cli_mount, try next scrape result or move to Wanted.
@@ -4125,6 +4212,9 @@ class ProgramRunner:
                                 debrid_folder_name=_folder_name,
                                 original_scraped_torrent_title=nzb_original_title,
                             )
+                            # Item cleared Adding on a real, live job — any prior ghost-job
+                            # repeats for it are no longer relevant to a future streak.
+                            self._nzb_ghost_repeat_counts.pop(item_id, None)
                             # Move all coalesced siblings (same torrent_id, still in Adding,
                             # no filled_by_file yet) to Checking together with the initiator.
                             # _resolve_nzb_file_info will assign per-episode filenames to all
@@ -4147,6 +4237,7 @@ class ProgramRunner:
                                         original_scraped_torrent_title=nzb_original_title,
                                     )
                                     _moved_as_sibling.add(_sib['id'])
+                                    self._nzb_ghost_repeat_counts.pop(_sib['id'], None)
                                     logging.info(f'[NZB] Moved coalesced sibling {_sib["id"]} to Checking with initiator')
                                 except Exception as _se:
                                     logging.warning(f'[NZB] Could not move sibling {_sib.get("id")} to Checking: {_se}')
@@ -4663,6 +4754,23 @@ class ProgramRunner:
         except Exception as e:
             logging.error(f'[PlexGUIDBackfill] Task error: {e}', exc_info=True)
 
+    def task_nzb_playback_repair_completion(self):
+        """Verify and clean only active NZB playback repairs; never scans the backlog."""
+        try:
+            from database.nzb_playback_repair import process_pending_playback_repairs
+            process_pending_playback_repairs()
+        except Exception as exc:
+            logging.error('[NZBPlayback] Completion task failed: %s', exc, exc_info=True)
+
+    def task_nzb_playback_cleanup_retry(self):
+        """Slow-cadence background retry for old-file cleanup deferred by the
+        fast completion worker — repairs already finalized as replaced."""
+        try:
+            from database.nzb_playback_repair import retry_deferred_playback_cleanups
+            retry_deferred_playback_cleanups()
+        except Exception as exc:
+            logging.error('[NZBPlayback] Cleanup retry task failed: %s', exc, exc_info=True)
+
     def task_repair_broken_nzbs(self, triggered_by: str = 'scheduled'):
         """Scan cli_mount for broken NZBs and attempt to repair them via re-scrape."""
         logging.info('[NZBRepair] Starting broken NZB repair task')
@@ -5121,12 +5229,15 @@ class ProgramRunner:
                     logging.error(f"[REPLACE] Error in reconciliation replace hook: {_replace_err}")
             # --- End Step 1b ---
 
-            # --- Step 1c: Collect stranded NZB coalesced items in Adding state ---
+            # --- Step 1c: Resolve stranded NZB coalesced items in Adding state ---
             # When a season pack NZB is submitted, only the initiator episode goes through
             # health check → Checking → _resolve_nzb_file_info → Collected.
             # The coalesced siblings sit in Adding with filled_by_torrent_id=nzb:xxx but no
-            # filled_by_file. If a sibling is already Collected (via Plex scan), collect them
-            # immediately with proper file info copied from the Collected sibling.
+            # filled_by_file. If a sibling is already Collected, look up the pack's actual
+            # file listing on cli_mount and match each stranded item to its own episode file
+            # by SxxEyy (same matching checking_queue._resolve_nzb_file_info uses) before
+            # moving it into Checking - never straight to Collected, since that would mark
+            # an item done with no real file/symlink ever created for it.
             try:
                 stranded_rows = cursor.execute("""
                     SELECT a.id, a.imdb_id, a.season_number, a.episode_number, a.title
@@ -5139,7 +5250,7 @@ class ProgramRunner:
                 """).fetchall()
 
                 if stranded_rows:
-                    stranded_collected = []
+                    stranded_matches = []
                     for row in stranded_rows:
                         # Prefer the initiator row (has nzb torrent_id + folder info),
                         # fall back to any Collected sibling with a filled_by_file.
@@ -5156,17 +5267,52 @@ class ProgramRunner:
                             LIMIT 1
                         """, (row['imdb_id'], row['season_number'], row['id'])).fetchone()
                         if sibling:
-                            stranded_collected.append((row['id'], dict(sibling), dict(row)))
+                            stranded_matches.append((row['id'], dict(sibling), dict(row)))
 
-                    if stranded_collected:
-                        for item_id, sib, item in stranded_collected:
-                            # Use filled_by_title as location_basename (folder name) — sibling's
-                            # location_basename may be a filename if set before the fix.
+                    if stranded_matches:
+                        import re as _re_sc
+                        from usenet.climount_client import get_climount_client as _get_dc_sc
+                        _dc_sc = _get_dc_sc()
+                        _folder_files_cache = {}  # folder_name -> video_files list, avoid repeat lookups
+
+                        for item_id, sib, item in stranded_matches:
                             folder_name = sib['filled_by_title'] or sib['debrid_folder_name'] or sib['location_basename']
+                            if not folder_name:
+                                continue
+
+                            if folder_name not in _folder_files_cache:
+                                try:
+                                    _result = _dc_sc.get_nzb_folder_all_files(folder_name)
+                                    _folder_files_cache[folder_name] = _result[1] if _result else []
+                                except Exception as _lookup_err:
+                                    logging.warning(f"[NZBCoalesce] Folder lookup failed for {folder_name!r}: {_lookup_err}")
+                                    _folder_files_cache[folder_name] = []
+                            video_files = _folder_files_cache[folder_name]
+
+                            season = item['season_number']
+                            episode = item['episode_number']
+                            matched_file = None
+                            if season is not None and episode is not None:
+                                ep_pat = _re_sc.compile(rf'[Ss]{season:02d}[Ee]{episode:02d}(?![0-9])', _re_sc.IGNORECASE)
+                                for vf in video_files:
+                                    if ep_pat.search(vf):
+                                        matched_file = vf
+                                        break
+
+                            if not matched_file:
+                                # Can't confirm this item's own file exists in the pack folder yet -
+                                # leave it in Adding rather than falsely marking it done.
+                                reconciliation_logger.debug(
+                                    f"[NZBCoalesce] Stranded item {item_id} '{item['title']}' "
+                                    f"S{item['season_number']}E{item['episode_number']} — no matching file "
+                                    f"found yet in folder {folder_name!r}, leaving in Adding"
+                                )
+                                continue
+
                             cursor.execute("""
                                 UPDATE media_items SET
-                                    state = 'Collected',
-                                    collected_at = ?,
+                                    state = 'Checking',
+                                    filled_by_file = ?,
                                     filled_by_torrent_id = ?,
                                     filled_by_title = ?,
                                     debrid_folder_name = ?,
@@ -5175,7 +5321,7 @@ class ProgramRunner:
                                     real_debrid_original_title = ?
                                 WHERE id = ?
                             """, (
-                                now_str,
+                                matched_file,
                                 sib['filled_by_torrent_id'],
                                 folder_name,
                                 folder_name,
@@ -5185,9 +5331,9 @@ class ProgramRunner:
                                 item_id,
                             ))
                             reconciliation_logger.info(
-                                f"[NZBCoalesce] Collected stranded Adding item {item_id} "
+                                f"[NZBCoalesce] Resolved stranded Adding item {item_id} "
                                 f"'{item['title']}' S{item['season_number']}E{item['episode_number']} "
-                                f"— sibling {sib['id']} already Collected"
+                                f"→ {matched_file!r}, moved to Checking (sibling {sib['id']} already Collected)"
                             )
             except Exception as _sc_err:
                 logging.error(f"[NZBCoalesce] Step 1c error: {_sc_err}", exc_info=True)
@@ -6043,7 +6189,7 @@ class ProgramRunner:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            items = cursor.execute('SELECT id, title, filled_by_title, filled_by_file, type, imdb_id, tmdb_id, season_number, episode_number, year, version, original_scraped_torrent_title, real_debrid_original_title, debrid_folder_name, last_updated, upgrading_from, upgrading_from_torrent_id FROM media_items WHERE state = "Checking" AND (ghostlisted IS NULL OR ghostlisted = 0)').fetchall()
+            items = cursor.execute('SELECT id, title, filled_by_title, filled_by_file, filled_by_torrent_id, filled_by_magnet, type, imdb_id, tmdb_id, season_number, episode_number, year, version, original_scraped_torrent_title, real_debrid_original_title, debrid_folder_name, last_updated, upgrading_from, upgrading_from_torrent_id FROM media_items WHERE state = "Checking" AND (ghostlisted IS NULL OR ghostlisted = 0)').fetchall()
         except sqlite3.Error as db_err:
             logging.error(f"Database error fetching items for Plex check: {db_err}")
             conn.close()
@@ -6053,6 +6199,90 @@ class ProgramRunner:
             if conn: conn.close()
 
         logging.info(f"Found {len(items)} media items in Checking state to verify against Plex location '{plex_file_location}'")
+
+        if not hasattr(self, 'plex_scan_tick_counts'):
+            self.plex_scan_tick_counts = {}
+
+        def _ffprobe_gate_or_reject(item_dict, actual_file_path, cache_key):
+            """Optional playability check for Plex mode, gated by the same
+            ffprobe_all_nzbs / ffprobe_all_debrid_additions toggles used by
+            check_local_file_for_item in Symlinked/Local mode. Runs the moment
+            a real on-disk path is resolved here, before this item is ever
+            surfaced to Plex (scanned or searched for) — so a confirmed-broken
+            file is rejected and re-scraped before Plex has any chance to add
+            it, avoiding a "recently added" flicker.
+            Returns True if the item should proceed, False if it was rejected
+            (already reverted to Wanted; caller should skip further processing).
+            """
+            # In Symlinked/Local mode, check_local_file_for_item is already the
+            # authoritative ffprobe gate for this item - it runs synchronously
+            # in the same pass that creates the symlink. task_check_plex_files
+            # can run concurrently with that (e.g. update_plex_on_file_discovery
+            # enabled alongside Symlinked/Local, a supported combination) and
+            # would otherwise independently re-resolve and re-probe the same
+            # file with no coordination between the two - the same class of
+            # redundant/racing double-verification already fixed elsewhere this
+            # session. Leave this task's role in that mode as pure Plex
+            # notification, same as before this change.
+            if get_setting('File Management', 'file_collection_management') == 'Symlinked/Local':
+                return True
+
+            item = dict(item_dict)
+            torrent_id = str(item.get('filled_by_torrent_id') or '')
+            is_nzb = torrent_id.startswith('nzb:')
+            probe_section = 'Usenet Provider' if is_nzb else 'Debrid Provider'
+            probe_key = 'ffprobe_all_nzbs' if is_nzb else 'ffprobe_all_debrid_additions'
+            if not get_setting(probe_section, probe_key, False):
+                return True
+
+            if is_nzb:
+                try:
+                    from database.nzb_playback_repair import has_pending_playback_repair
+                    if has_pending_playback_repair(item.get('id')):
+                        logging.info(f"[ffprobe] Skipping {probe_key} for item {item.get('id')} — active playback-repair replacement candidate, already verified by cli_mount's own check")
+                        return True
+                except Exception:
+                    pass
+
+                # An item reaches Checking as soon as its NZB job is *matched*
+                # (file list known from NZB/par2 metadata), not once the job has
+                # actually finished downloading - unlike Symlinked/Local mode
+                # (confirmed working, left untouched), Plex mode's file-discovery
+                # here has no extra settle/retry delay before the probe fires, so
+                # it's more exposed to catching the file mid-download. The
+                # readability probe samples a random point 20-80% into the file's
+                # duration - if that point hasn't downloaded yet, the read fails
+                # cleanly (not an inconclusive/timeout case), so the probe's own
+                # conservative "assume readable" fallback never catches this and
+                # a genuinely-fine file gets wrongly rejected. Defer the probe
+                # until cli_mount reports the job at/near complete instead of
+                # judging a file that isn't fully there yet.
+                try:
+                    job_hash = torrent_id[4:] if torrent_id.startswith('nzb:') else torrent_id
+                    from usenet.climount_client import get_climount_client
+                    job_status = get_climount_client().get_job_status(job_hash)
+                    if job_status and job_status.get('state') != 'completed' and job_status.get('progress', 100) < 95:
+                        logging.info(f"[ffprobe] Deferring {probe_key} for item {item.get('id')} — job {job_hash} still downloading ({job_status.get('progress', 0)}%)")
+                        return True
+                except Exception as e:
+                    logging.debug(f"[ffprobe] Could not check job download progress for {torrent_id}: {e}")
+
+            logging.info(f"[ffprobe] Running playability check ({probe_key}) on '{actual_file_path}'")
+            from usenet.repair_engine import _verify_file_readable
+            if _verify_file_readable(actual_file_path):
+                logging.info(f"[ffprobe] Playability check passed for '{actual_file_path}'")
+                return True
+
+            logging.warning(f"[ffprobe] Playability check FAILED for '{actual_file_path}' — rejecting and reverting item {item.get('id')} to Wanted")
+            from utilities.local_library_scan import _reject_unplayable_source
+            _reject_unplayable_source(item, is_nzb)
+            try:
+                self.queue_manager.move_to_wanted(item, 'Checking')
+            except Exception as e_wanted:
+                logging.error(f"[ffprobe] Failed to move item {item.get('id')} back to Wanted after failed probe: {e_wanted}")
+            if cache_key in self.plex_scan_tick_counts:
+                del self.plex_scan_tick_counts[cache_key]
+            return False
 
         # Check if Plex library checks are disabled (file discovery only)
         if get_setting('Plex', 'disable_plex_library_checks', default=False):
@@ -6199,6 +6429,9 @@ class ProgramRunner:
                 if file_found_on_disk:
                     logging.info(f"Confirmed file exists on disk: {actual_file_path} for item {item_id}") # Log actual path found
                     self.file_location_cache[cache_key] = 'exists'
+
+                    if not _ffprobe_gate_or_reject(item_dict, actual_file_path, cache_key):
+                        continue
 
                     # --- START EDIT: Add Tick Check and Scan Path Gathering ---
                     should_trigger_scan = False
@@ -6465,6 +6698,9 @@ class ProgramRunner:
                     self.file_location_cache[cache_key] = 'exists'
                     current_tick = self.plex_scan_tick_counts.get(cache_key, 0) + 1
                     self.plex_scan_tick_counts[cache_key] = current_tick
+
+                    if not _ffprobe_gate_or_reject(item_dict, actual_file_path, cache_key):
+                        continue
 
                     # Option C: Direct Plex library lookup.
                     # Try 1: file path search (most reliable — checks exact file Plex should have indexed).
@@ -10279,4 +10515,3 @@ def run_program():
 
 if __name__ == "__main__":
     run_program()
-

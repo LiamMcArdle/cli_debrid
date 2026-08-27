@@ -1283,7 +1283,28 @@ class CheckingQueue:
                                             if directory:
                                                 # Store item type with directory for proper section matching
                                                 item_type = updated_item_data.get('type', 'episode')  # Default to episode for shows
-                                                directories_to_scan[directory] = item_type
+
+                                                # If this item was ffprobe-verified (playability check enabled
+                                                # for its protocol), scan its directory immediately instead of
+                                                # waiting for the batched scan at the end of this torrent
+                                                # group - a confirmed-playable file should show up in Plex
+                                                # right away. Leaves the batched path below completely
+                                                # untouched for every item where the setting is off.
+                                                _torrent_id_for_scan = str(updated_item_data.get('filled_by_torrent_id', '') or '')
+                                                _is_nzb_for_scan = _torrent_id_for_scan.startswith('nzb:')
+                                                _ffprobe_scan_section = 'Usenet Provider' if _is_nzb_for_scan else 'Debrid Provider'
+                                                _ffprobe_scan_key = 'ffprobe_all_nzbs' if _is_nzb_for_scan else 'ffprobe_all_debrid_additions'
+                                                if get_setting(_ffprobe_scan_section, _ffprobe_scan_key, False):
+                                                    try:
+                                                        if use_jellyfin:
+                                                            emby_update_item({'full_path': directory, 'location_on_disk': directory, 'type': item_type})
+                                                        elif use_plex:
+                                                            plex_update_item({'full_path': directory, 'location_on_disk': directory, 'type': item_type})
+                                                        logging.info(f"[ffprobe] Triggered immediate media server scan for verified directory: {directory}")
+                                                    except Exception as _ffprobe_scan_err:
+                                                        logging.warning(f"[ffprobe] Immediate scan failed for {directory}: {_ffprobe_scan_err}")
+                                                else:
+                                                    directories_to_scan[directory] = item_type
 
                                 conn = get_db_connection()
                                 cursor = conn.execute('SELECT state FROM media_items WHERE id = ?', (item_in_torrent_group['id'],))
@@ -1295,7 +1316,10 @@ class CheckingQueue:
                                     logging.info(f"Item {item_in_torrent_group['id']} is marked for upgrading, keeping in Upgrading state after local check.")
                                 elif current_item_state == 'Collected':
                                     logging.info(f"Item {item_in_torrent_group['id']} state confirmed as Collected after local check.")
-                                    queue_manager.move_to_collected(item_in_torrent_group, "Checking", skip_notification=True)
+                                    # check_local_file_for_item() above already ran handle_state_change()
+                                    # for this exact state transition (via local_library_scan.py); avoid
+                                    # re-running CineSync/subtitles/custom-script a second time here.
+                                    queue_manager.move_to_collected(item_in_torrent_group, "Checking", skip_notification=True, skip_state_change_hook=True)
                                     # Sync labels now that item is detected in Plex
                                     try:
                                         from utilities.plex_label_manager import sync_labels_to_plex_for_item, is_plex_labels_enabled_anywhere
@@ -1305,7 +1329,10 @@ class CheckingQueue:
                                         logging.error(f"Error syncing labels for item {item_in_torrent_group['id']}: {e}")
                                 elif current_item_state:
                                     logging.warning(f"Item {item_in_torrent_group['id']} processed locally but state is '{current_item_state}'. Moving to Collected.")
-                                    queue_manager.move_to_collected(item_in_torrent_group, "Checking", skip_notification=True)
+                                    # check_local_file_for_item() above already ran handle_state_change()
+                                    # for this exact state transition (via local_library_scan.py); avoid
+                                    # re-running CineSync/subtitles/custom-script a second time here.
+                                    queue_manager.move_to_collected(item_in_torrent_group, "Checking", skip_notification=True, skip_state_change_hook=True)
                                     # Sync labels now that item is detected in Plex
                                     try:
                                         from utilities.plex_label_manager import sync_labels_to_plex_for_item, is_plex_labels_enabled_anywhere
@@ -1635,6 +1662,35 @@ class CheckingQueue:
         # Get all items in the checking queue with this torrent ID *at this moment*
         # Iterate over a copy of self.items for safety if handlers modify it.
         items_for_stalled_torrent = [item for item in list(self.items) if item.get('filled_by_torrent_id') == torrent_id]
+
+        # Debrid season-pack sibling reuse means a sibling episode can already be Collected
+        # on this same torrent_id while another sibling is still stuck stalling in this
+        # queue - such a sibling has left self.items entirely, so it's invisible to the
+        # in-memory check above. Removing the torrent here would silently break that
+        # already-Collected episode's playback. Check the DB for any such episode first.
+        if not str(torrent_id).startswith('nzb:'):
+            try:
+                from database import get_db_connection as _gdb_stall
+                _known_ids = {i['id'] for i in items_for_stalled_torrent}
+                _conn = _gdb_stall()
+                try:
+                    _placeholders = ','.join('?' * len(_known_ids)) if _known_ids else 'NULL'
+                    _other = _conn.execute(
+                        f"SELECT 1 FROM media_items WHERE filled_by_torrent_id=? "
+                        f"AND state IN ('Collected','Upgrading') "
+                        f"AND id NOT IN ({_placeholders}) LIMIT 1",
+                        (torrent_id, *_known_ids)
+                    ).fetchone()
+                finally:
+                    _conn.close()
+                if _other:
+                    logging.info(f"Torrent {torrent_id} has a Collected/Upgrading sibling outside this queue's stalled check — not removing, only handling the items stalled here")
+                    for item_to_move in items_for_stalled_torrent:
+                        if self.contains_item_id(item_to_move['id']):
+                            queue_manager.move_to_wanted(item_to_move, "Checking")
+                    return
+            except Exception as e:
+                logging.warning(f"Could not check for Collected siblings of torrent {torrent_id}: {e} — proceeding with normal stalled handling")
 
         if not items_for_stalled_torrent:
             logging.warning(f"No items found for stalled torrent {torrent_id} at the moment of handling.")

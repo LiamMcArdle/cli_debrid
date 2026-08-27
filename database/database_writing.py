@@ -9,6 +9,15 @@ from utilities.post_processing import handle_state_change
 from typing import List
 import sqlite3
 
+# original_collected_at records an item's first-ever collection time and must
+# never be reset without also resetting collected_at (and vice versa) — every
+# site that sends an item back to 'Wanted' for a genuine re-download needs
+# both cleared together, or the item permanently loses its "first collection"
+# notification (see queue_manager.move_to_collected and local_library_scan.py,
+# which both key off original_collected_at being unset). Interpolate this
+# into each reset UPDATE's SET clause instead of hand-typing the two columns.
+RESET_COLLECTION_STATE_SQL = "collected_at = NULL, original_collected_at = NULL"
+
 @retry_on_db_lock()
 def bulk_delete_by_id(id_value, id_type):
     conn = get_db_connection()
@@ -168,7 +177,7 @@ def update_release_date_and_state(
             conn.close()
     
 @retry_on_db_lock()
-def update_media_item_state(item_id, state, **kwargs):
+def update_media_item_state(item_id, state, skip_state_change_hook=False, **kwargs):
     conn = get_db_connection()
     try:
         conn.execute('BEGIN TRANSACTION')
@@ -224,11 +233,17 @@ def update_media_item_state(item_id, state, **kwargs):
         if updated_item_row:
             item_dict = dict(updated_item_row)
 
-            # Handle post-processing based on state
-            if state == 'Collected':
-                handle_state_change(item_dict)
-            elif state == 'Upgrading':
-                handle_state_change(item_dict)
+            # Handle post-processing based on state. Callers that already ran
+            # handle_state_change() for this exact state transition themselves
+            # (e.g. checking_queue.py, after local_library_scan.py's explicit
+            # call) pass skip_state_change_hook=True to avoid double-running
+            # CineSync, the subtitle downloader, and any custom post-processing
+            # script for the same item in the same cycle.
+            if not skip_state_change_hook:
+                if state == 'Collected':
+                    handle_state_change(item_dict)
+                elif state == 'Upgrading':
+                    handle_state_change(item_dict)
 
         logging.debug(f"Updated media item (ID: {item_id}) state to {state}")
 
@@ -501,6 +516,52 @@ def update_media_item(item_id: int, **kwargs):
         if conn:
             conn.close()
 
+def enable_fallback_to_single_scraper(item: dict, reason: str = ""):
+    """Sets fall_back_to_single_scraper=True for `item` and every other pending
+    episode of the same series/season/version, regardless of episode number.
+
+    Multi-pack mode (queues/scraping_queue.py) is forced on for any episode
+    scrape older than 7 days - a single stuck-in-multi episode (e.g. episode 1,
+    since nothing "before" it can ever propagate the flag to it) can otherwise
+    be starved of single-episode candidates forever if the only multi-pack
+    result available gets filtered out for an unrelated reason (bad language,
+    wrong group, etc.), since forcing multi-pack rejects every single-episode
+    result outright. Previously this only propagated to *later* episodes
+    (episode_number > current), which is exactly what let episode 1 get stuck.
+    """
+    item_id = item.get('id')
+    if not item_id or item.get('fall_back_to_single_scraper'):
+        return
+    update_media_item(item_id, fall_back_to_single_scraper=True)
+    logging.info(f"Enabled single scraper fallback for item ID {item_id} ({item.get('title')}){f': {reason}' if reason else ''}")
+
+    if item.get('type') != 'episode':
+        return
+    series_title = item.get('series_title', '') or item.get('title', '')
+    season = item.get('season') or item.get('season_number')
+    version = item.get('version')
+    current_id = item_id
+
+    from .database_reading import stream_all_media_items
+    for candidate in stream_all_media_items(state=None, media_type='episode'):
+        try:
+            if candidate.get('id') == current_id:
+                continue
+            if (candidate.get('series_title', '') or candidate.get('title', '')) != series_title:
+                continue
+            if (candidate.get('season') or candidate.get('season_number')) != season:
+                continue
+            if candidate.get('version') != version:
+                continue
+            if candidate.get('fall_back_to_single_scraper'):
+                continue
+            match_id = candidate.get('id')
+            if match_id:
+                update_media_item(match_id, fall_back_to_single_scraper=True)
+                logging.debug(f"Enabled single scraper fallback for related item ID: {match_id} ({candidate.get('title')})")
+        except Exception as iter_err:
+            logging.error(f"Error while streaming candidate items for single scraper fallback: {iter_err}")
+
 @retry_on_db_lock()
 def update_blacklisted_date(item_id: int, blacklisted_date: datetime | None):
     conn = get_db_connection()
@@ -737,6 +798,10 @@ def add_media_item(item: dict, user_initiated: bool = False) -> int:
                     logging.debug(f"[add_media_item] Resolved imdb_id {_resolved_imdb} from tmdb_id {tmdb_id}")
             except Exception:
                 pass
+
+        if item_type == 'movie':
+            from .movie_release_overrides import apply_movie_release_override_to_item
+            apply_movie_release_override_to_item(item, conn=conn)
 
         # GHOSTLIST/BLACKLIST CHECK
         if imdb_id or tmdb_id:

@@ -3610,7 +3610,23 @@ def api_symlink_audit_delete():
 
     symlink_dir = get_setting('File Management', 'symlinked_files_path', '/mnt/symlinked')
     rclone_dir  = get_setting('File Management', 'original_files_path',  '/mnt/zurg/__all__')
-    deleted, failed, errors = 0, 0, []
+    deleted, failed, errors, skipped = 0, 0, [], 0
+
+    # Re-verify against the CURRENT filesystem state right before deleting -
+    # the caller's path list came from a cached scan that may be stale (a new
+    # symlink may have been created pointing at one of these paths since the
+    # scan ran, e.g. by normal ongoing collection activity). Trusting the
+    # cache blindly can delete a file a real, currently-active symlink now
+    # depends on.
+    current_linked_targets = set()
+    for root, dirs, files in os.walk(symlink_dir, followlinks=False):
+        for name in files:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                raw = os.readlink(full)
+                target = raw if os.path.isabs(raw) else os.path.normpath(
+                    os.path.join(os.path.dirname(full), raw))
+                current_linked_targets.add(target)
 
     for p in paths:
         if not isinstance(p, str):
@@ -3619,6 +3635,9 @@ def api_symlink_audit_delete():
         if not (p.startswith(symlink_dir) or p.startswith(rclone_dir)):
             errors.append(f'Refused: {p}')
             failed += 1
+            continue
+        if p in current_linked_targets:
+            skipped += 1
             continue
         try:
             os.remove(p)
@@ -3639,7 +3658,7 @@ def api_symlink_audit_delete():
         except Exception:
             pass
 
-    return jsonify({'success': True, 'deleted': deleted, 'failed': failed, 'errors': errors[:20]})
+    return jsonify({'success': True, 'deleted': deleted, 'failed': failed, 'skipped': skipped, 'errors': errors[:20]})
 
 
 # ---------------------------------------------------------------------------
@@ -5319,6 +5338,18 @@ def usenet_repair_activity():
         return jsonify(success=False, error=str(e))
 
 
+@debrid_manager_bp.route('/api/usenet/repair/activity/clear', methods=['POST'])
+def usenet_repair_activity_clear():
+    """Clear the NZB repair activity log."""
+    try:
+        from database.nzb_repair_activity import clear_repair_activity
+        deleted = clear_repair_activity(source='usenet')
+        return jsonify(success=True, deleted=deleted)
+    except Exception as e:
+        logging.error(f'[UsenetRepair] activity clear error: {e}')
+        return jsonify(success=False, error=str(e))
+
+
 @debrid_manager_bp.route('/api/usenet/repair/scan_status')
 def usenet_scan_status():
     """Check if cli_mount is currently running a health sweep (active_run != null and running)."""
@@ -5401,6 +5432,24 @@ def usenet_fix_single():
         return jsonify(success=True, result=result)
     except Exception as e:
         logging.error(f'[UsenetRepair] fix_single error: {e}')
+        return jsonify(success=False, error=str(e))
+
+
+@debrid_manager_bp.route('/api/usenet/repair/retry_exhausted', methods=['POST'])
+def usenet_retry_exhausted():
+    """Manually retry an item stuck at skipped_max_attempts: clean up the dead
+    entry, blacklist it, and move the item back to Wanted for a fresh scrape."""
+    try:
+        body = request.get_json(silent=True) or {}
+        item_id = body.get('item_id')
+        broken_nzb_id = body.get('broken_nzb_id', '') or ''
+        if not item_id:
+            return jsonify(success=False, error='item_id required'), 400
+        from usenet.repair_engine import retry_exhausted_item
+        result = retry_exhausted_item(int(item_id), broken_nzb_id)
+        return jsonify(success=result.get('outcome') == 'ok', result=result)
+    except Exception as e:
+        logging.error(f'[UsenetRepair] retry_exhausted error: {e}', exc_info=True)
         return jsonify(success=False, error=str(e))
 
 
@@ -5559,6 +5608,20 @@ def debrid_repair_activity():
         return jsonify(success=True, rows=rows, total=total)
     except Exception as e:
         logging.error(f'[DebridRepair] activity error: {e}')
+        return jsonify(success=False, error=str(e))
+
+
+@debrid_manager_bp.route('/api/debrid/repair/activity/clear', methods=['POST'])
+def debrid_repair_activity_clear():
+    """Clear the debrid repair activity log. Shares the nzb_repair_activity
+    table with the NZB log, scoped by the same broken_nzb_id prefix the
+    debrid engine's own reads use."""
+    try:
+        from database.nzb_repair_activity import clear_repair_activity
+        deleted = clear_repair_activity(source='debrid')
+        return jsonify(success=True, deleted=deleted)
+    except Exception as e:
+        logging.error(f'[DebridRepair] activity clear error: {e}')
         return jsonify(success=False, error=str(e))
 
 

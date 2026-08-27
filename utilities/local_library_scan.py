@@ -784,9 +784,33 @@ def get_symlink_path(item: Dict[str, Any], original_file: str, skip_jikan_lookup
         imdb_id = item.get('imdb_id', '')
         if imdb_id == 'tt0000000':
             imdb_id = ''
-            
+
+        raw_title = item.get('title', 'Unknown')
+        # sanitize_filename ASCII-encodes and drops anything it can't represent — for a
+        # title that's partly or entirely non-Latin script, that can strip it down to
+        # nothing (or to a short, non-distinguishing fragment — e.g. '怪獣8号' survives
+        # as just "8", 'NARUTO－ナルト－' survives as "NARUTO", which happens to be fine
+        # here but isn't guaranteed to be unique for some other mixed-script title). The
+        # show-level folder template ('{title} ({year})') has no other uniqueness anchor,
+        # so a collapsed or barely-distinguishing title risks two different non-Latin
+        # titled shows released the same year landing in the same directory and silently
+        # interleaving episode files. Fall back to a stable, unique identifier whenever
+        # the title contains any non-Latin script at all, rather than only when nothing
+        # survives — checked via presence of any non-Latin letter (script-agnostic:
+        # Japanese, Korean, Chinese, Hindi, Cyrillic, Arabic, etc. all match), the
+        # same detection used for the TVDB-side fix for this same underlying issue.
+        from utilities.text_utils import has_non_latin_letter
+        effective_title = raw_title
+        if raw_title and raw_title.strip() and has_non_latin_letter(raw_title):
+            effective_title = imdb_id or item.get('tmdb_id', '') or 'unknown'
+            logging.warning(
+                f"[SymlinkPath] Title {raw_title!r} has no ASCII-safe representation — "
+                f"falling back to {effective_title!r} to avoid colliding with other "
+                f"items released in {item.get('year', '')!r}"
+            )
+
         template_vars = {
-            'title': item.get('title', 'Unknown'),
+            'title': effective_title,
             'year': item.get('year', ''),
             'imdb_id': imdb_id,
             'tmdb_id': item.get('tmdb_id', ''),
@@ -1133,6 +1157,89 @@ def _apply_nzb_naming(source_file: str, item: Dict[str, Any]) -> str:
         return source_file
 
 
+def _reject_unplayable_source(item: Dict[str, Any], is_nzb: bool) -> None:
+    """Mark a confirmed-unplayable file's source as not-wanted and revert the item
+    to Wanted so it gets rescraped, mirroring the existing missing-segments/
+    checking-timeout rejection pattern used elsewhere in the queue processing."""
+    try:
+        if is_nzb:
+            from database.not_wanted_magnets import add_to_not_wanted_nzb_guid
+            nzb_url = item.get('filled_by_magnet', '')
+            if nzb_url:
+                add_to_not_wanted_nzb_guid(nzb_url)
+        else:
+            from database.not_wanted_magnets import add_to_not_wanted, add_to_not_wanted_urls
+            from debrid.common import extract_hash_from_magnet
+            magnet = item.get('filled_by_magnet', '')
+            hash_value = extract_hash_from_magnet(magnet) if magnet else None
+            if hash_value:
+                add_to_not_wanted(hash_value)
+            # Also blacklist the raw URL itself (mirrors torrent_processor.py's
+            # add_to_not_wanted_urls alongside add_to_not_wanted). Needed because
+            # `magnet` here is frequently an unresolved Jackett indexer redirect
+            # link, not a real magnet: URI — is_magnet_not_wanted's hash-based
+            # comparison can never match that at scrape-filter time (it doesn't
+            # follow redirects), so a re-scrape can pick the exact same broken
+            # torrent again via a different indexer wrapping the same release.
+            # is_url_not_wanted is already checked everywhere is_magnet_not_wanted
+            # is, and both indexer links for the same release carry the same
+            # `file=` query param, so this closes the gap using the matching
+            # mechanism that already exists for it — no changes needed to the
+            # comparison logic itself.
+            if magnet and magnet.startswith('http'):
+                add_to_not_wanted_urls(magnet)
+    except Exception as e:
+        logging.warning(f"[ffprobe] Failed to add unplayable source to not-wanted: {e}")
+
+    # not_wanted only stops a *fresh scrape* from picking this release again -
+    # sibling-reuse (debrid and NZB) picks a candidate straight from a known
+    # torrent_id without ever consulting it, so without this a sibling episode
+    # would keep reusing (and re-failing) this exact torrent for the rest of
+    # the season. See utilities/session_bad_torrents.py.
+    try:
+        from utilities.session_bad_torrents import mark_torrent_unplayable
+        mark_torrent_unplayable(item.get('filled_by_torrent_id'), item.get('filled_by_file'))
+    except Exception as e:
+        logging.warning(f"[ffprobe] Failed to mark torrent as known-unplayable: {e}")
+
+    # Actually remove the dead torrent/NZB job from the debrid service / cli_mount,
+    # not just blacklist it locally - otherwise it sits there forever taking up
+    # space even though nothing will ever reuse it. Skipped if another item still
+    # actively depends on the same torrent_id (a shared season pack where only one
+    # sibling episode's file was bad) - removing it would break that sibling too.
+    try:
+        torrent_id = item.get('filled_by_torrent_id')
+        if torrent_id:
+            from queues.adding_queue import torrent_has_other_active_owner, remove_unwanted_torrent
+            if not torrent_has_other_active_owner(torrent_id, item.get('id')):
+                remove_unwanted_torrent(
+                    torrent_id,
+                    is_nzb=is_nzb,
+                    removal_reason="Removed due to failed ffprobe playability check"
+                )
+            else:
+                logging.info(f"[ffprobe] Torrent {torrent_id} still needed by other episode(s) sharing this pack — not removing")
+    except Exception as e:
+        logging.warning(f"[ffprobe] Failed to remove unplayable torrent from debrid service: {e}")
+
+    # An episode stuck in forced multi-pack scraping (queues/scraping_queue.py,
+    # any scrape >7 days old) that fails here via ffprobe - rather than the
+    # Adding-queue matching-failure path that normally sets this flag - would
+    # otherwise never get single-episode candidates and could loop on this
+    # rejection indefinitely if the only multi-pack result available keeps
+    # getting filtered out for an unrelated reason.
+    try:
+        from database.database_writing import enable_fallback_to_single_scraper
+        enable_fallback_to_single_scraper(item, reason="ffprobe playability check failed")
+    except Exception as e:
+        logging.warning(f"[ffprobe] Failed to enable single scraper fallback: {e}")
+
+    try:
+        update_media_item_state(item.get('id'), 'Wanted')
+    except Exception as e:
+        logging.error(f"[ffprobe] Failed to revert item {item.get('id')} to Wanted after failed playability check: {e}")
+
+
 def _cleanup_old_symlink(item: Dict[str, Any], item_identifier: str, source_file: str, old_filename: str) -> None:
     """Remove the old symlink (and notify the media server) after a successful upgrade.
 
@@ -1401,6 +1508,54 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
             # For NZB items in Plex mode with NZB naming enabled: move file to organised structure
             source_file = _apply_nzb_naming(source_file, item)
 
+            # Optional playability verification, gated by protocol-specific toggles
+            # (off by default). Only meaningful here in Symlinked/Local mode, which
+            # is the only mode that reaches this function with a real source_file.
+            _torrent_id_for_probe = str(item.get('filled_by_torrent_id', '') or '')
+            _is_nzb_for_probe = _torrent_id_for_probe.startswith('nzb:')
+            _probe_section = 'Usenet Provider' if _is_nzb_for_probe else 'Debrid Provider'
+            _probe_key = 'ffprobe_all_nzbs' if _is_nzb_for_probe else 'ffprobe_all_debrid_additions'
+            # An item that's an active playback-repair replacement candidate
+            # (NZB-only — there's no debrid equivalent of VerifyReplacement)
+            # already gets ffprobed by cli_mount's own VerifyReplacement
+            # before it's accepted, on a code path that's synchronized with
+            # when the old file's cleanup can proceed. Running ffprobe_all_nzbs
+            # here too would be a second, independent, uncoordinated check on
+            # the exact same file — skip it and let VerifyReplacement be the
+            # sole authority for replacement candidates specifically.
+            _skip_probe_for_replacement = False
+            if _is_nzb_for_probe:
+                try:
+                    from database.nzb_playback_repair import has_pending_playback_repair
+                    if has_pending_playback_repair(item.get('id')):
+                        _skip_probe_for_replacement = True
+                        logging.info(
+                            f"[ffprobe] Skipping {_probe_key} for '{source_file}' — active playback-repair "
+                            f"replacement candidate, already verified by cli_mount's own check"
+                        )
+                except Exception:
+                    pass
+            if get_setting(_probe_section, _probe_key, False) and not _skip_probe_for_replacement:
+                logging.info(f"[ffprobe] Running playability check ({_probe_key}) on '{source_file}'")
+                from usenet.repair_engine import _verify_file_readable
+                if _verify_file_readable(source_file):
+                    logging.info(f"[ffprobe] Playability check passed for '{source_file}'")
+                else:
+                    logging.warning(f"[ffprobe] Playability check FAILED for '{source_file}' — rejecting and reverting to Wanted")
+                    _reject_unplayable_source(item, _is_nzb_for_probe)
+                    # _reject_unplayable_source only updates the DB row - without also
+                    # moving the item out of the in-memory CheckingQueue, the DB says
+                    # Wanted while the queue still holds it with its stale filled_by_*
+                    # fields, until the next queue refresh reconciles them. The Plex-mode
+                    # equivalent (run_program.py's _ffprobe_gate_or_reject) already does
+                    # this; mirror it here for parity.
+                    try:
+                        from queues.queue_manager import QueueManager
+                        QueueManager().move_to_wanted(item, 'Checking')
+                    except Exception as e_wanted:
+                        logging.error(f"[ffprobe] Failed to move item {item.get('id')} back to Wanted after failed probe: {e_wanted}")
+                    return False
+
             # Get destination path based on settings (using the found source_file)
             dest_file = get_symlink_path(item, source_file, skip_jikan_lookup=False)
             if not dest_file:
@@ -1569,10 +1724,17 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                 current_time = datetime.now()
                 
                 # Prepare update values
+                # original_collected_at is meant to be the item's first-ever collection
+                # time (matches the COALESCE(original_collected_at, ...) pattern used in
+                # database/collected_items.py's Plex-mode collection path) — preserve it
+                # across repair-driven re-collections instead of overwriting it every
+                # time, otherwise a repair looks identical to a first-time collection to
+                # both the notification gate below and notifications.py's own dedup-by-
+                # original_collected_at logic.
                 update_values = {
                         'location_on_disk': dest_file,
                     'collected_at': current_time,
-                    'original_collected_at': current_time,
+                    'original_collected_at': item.get('original_collected_at') or current_time,
                     'original_path_for_symlink': source_file,
                     'state': new_state,
                     'filled_by_title': item.get('filled_by_title'),
@@ -1689,7 +1851,14 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                 previous_state = item.get('state')
 
                 if not item.get('upgrading_from'): # This indicates a regular collection, where new_state is 'Collected'
-                    if previous_state != 'Collected':
+                    # previous_state alone doesn't catch a repair-driven re-collection: NZBRepair/
+                    # torrent-replace flows intentionally bounce the item out of 'Collected' (into
+                    # 'Adding'/'Upgrading') before resubmitting, so previous_state != 'Collected' is
+                    # true on every repair attempt too, not just the first-ever collection. Gate on
+                    # original_collected_at as well — it's preserved (not overwritten) once first set,
+                    # so its presence means this item has genuinely been collected before, regardless
+                    # of what state it was bounced through for the repair.
+                    if previous_state != 'Collected' and not item.get('original_collected_at'):
                         from database.database_writing import add_to_collected_notifications
                         notification_item = item.copy()
                         notification_item.update(update_values)
@@ -1698,7 +1867,7 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                         add_to_collected_notifications(notification_item)
                         logging.info(f"Added collection notification for item: {item_identifier}")
                     else:
-                        logging.info(f"Item {item_identifier} was already 'Collected'. Skipping redundant collection notification.")
+                        logging.info(f"Item {item_identifier} was already collected previously (previous_state={previous_state!r}, original_collected_at={item.get('original_collected_at')!r}). Skipping redundant collection notification.")
                 # Add notification for upgrades
                 elif item.get('upgrading_from'): # This indicates an upgrade, notification_item['new_state'] will be 'Upgraded'
                     # An item is 'Upgraded' from a previous version. Its state before this specific upgrade
@@ -1832,33 +2001,36 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                                     try:
                                         # First, check if there's an existing entry for this movie/episode that's blacklisted or ghostlisted
                                         # This prevents creating duplicate entries when a blacklisted version already exists
+                                        # (media_items has no plain 'blacklisted' boolean column — blacklisted-ness is
+                                        # represented by blacklisted_date being set, same convention used in
+                                        # queues/blacklisted_queue.py and routes/debug_routes.py)
                                         if item_type == 'episode':
                                             existing_movie_check = conn.execute('''
-                                                SELECT id, state, blacklisted, ghostlisted
+                                                SELECT id, state, blacklisted_date, ghostlisted
                                                 FROM media_items
                                                 WHERE imdb_id = ? AND type = ? AND version = ?
                                                 AND season_number = ? AND episode_number = ?
-                                                AND (blacklisted = 1 OR ghostlisted = 1)
+                                                AND (blacklisted_date IS NOT NULL OR ghostlisted = 1)
                                                 LIMIT 1
                                             ''', (item.get('imdb_id'), item_type, item.get('version'),
                                                   item.get('season_number'), item.get('episode_number'))).fetchone()
                                         else:  # movie
                                             existing_movie_check = conn.execute('''
-                                                SELECT id, state, blacklisted, ghostlisted
+                                                SELECT id, state, blacklisted_date, ghostlisted
                                                 FROM media_items
                                                 WHERE imdb_id = ? AND type = ? AND version = ?
-                                                AND (blacklisted = 1 OR ghostlisted = 1)
+                                                AND (blacklisted_date IS NOT NULL OR ghostlisted = 1)
                                                 LIMIT 1
                                             ''', (item.get('imdb_id'), item_type, item.get('version'))).fetchone()
 
                                         if existing_movie_check:
-                                            logging.info(f"[MultiFile] Skipping additional file {additional_filename} - found existing blacklisted/ghostlisted entry (ID: {existing_movie_check['id']}, blacklisted: {existing_movie_check['blacklisted']}, ghostlisted: {existing_movie_check['ghostlisted']})")
+                                            logging.info(f"[MultiFile] Skipping additional file {additional_filename} - found existing blacklisted/ghostlisted entry (ID: {existing_movie_check['id']}, blacklisted_date: {existing_movie_check['blacklisted_date']}, ghostlisted: {existing_movie_check['ghostlisted']})")
                                             conn.close()
                                             continue
 
                                         # Check if this specific file already exists in the database
                                         cursor = conn.execute(
-                                            'SELECT id, blacklisted, ghostlisted FROM media_items WHERE filled_by_file = ? AND type = ?',
+                                            'SELECT id, blacklisted_date, ghostlisted FROM media_items WHERE filled_by_file = ? AND type = ?',
                                             (additional_filename, item_type)
                                         )
                                         existing = cursor.fetchone()
@@ -1866,7 +2038,7 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
 
                                         if existing:
                                             # Check if the existing entry is blacklisted or ghostlisted
-                                            if existing['blacklisted'] == 1 or existing['ghostlisted'] == 1:
+                                            if existing['blacklisted_date'] is not None or existing['ghostlisted'] == 1:
                                                 logging.info(f"[MultiFile] Skipping update for {additional_filename} - existing entry (ID: {existing['id']}) is blacklisted/ghostlisted")
                                                 conn.close()
                                                 continue

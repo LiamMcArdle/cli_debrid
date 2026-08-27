@@ -9,17 +9,22 @@ _NULL_AIRDATE_RECHECK = timedelta(hours=24)
 _TMDB_MAPPING_THRESHOLD = timedelta(days=21)
 
 
-def is_stale(item_type: str, media_status: str | None, last_trakt_fetch: datetime | None) -> bool:
+def is_stale(item_type: str, media_status: str | None, last_trakt_fetch: datetime | None, force: bool = False) -> bool:
     """Determine whether an item's metadata should be re-fetched from Trakt.
 
     Args:
         item_type: 'show' or 'movie'.
         media_status: Denormalized status string (e.g. 'returning series', 'ended').
         last_trakt_fetch: When the item was last fetched from Trakt API.
+        force: Skip the age check entirely and report stale regardless of
+            last_trakt_fetch (used by manual "refresh now" actions).
 
     Returns:
         True if the item is stale and should be refreshed.
     """
+    if force:
+        return True
+
     if last_trakt_fetch is None:
         return True
 
@@ -35,6 +40,16 @@ def is_stale(item_type: str, media_status: str | None, last_trakt_fetch: datetim
 
     # movie or anything else
     return age >= _MOVIE_THRESHOLD
+
+
+def is_older_than(checked_at: datetime | None, max_age: timedelta) -> bool:
+    """Return whether a cached value is missing or older than ``max_age``."""
+    if checked_at is None:
+        return True
+    now = datetime.now(timezone.utc)
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=timezone.utc)
+    return (now - checked_at) >= max_age
 
 
 def should_recheck_null_airdate(checked_at: datetime | None) -> bool:

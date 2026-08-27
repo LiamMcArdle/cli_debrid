@@ -1193,9 +1193,22 @@ def is_refresh_token_expired() -> bool:
 
 def ensure_trakt_auth():
     logging.debug("Checking Trakt authentication")
-    
+
     # Read config directly from file like the battery does
     trakt_config = get_trakt_config()
+
+    # settings.json is where a fresh authorization writes client_id/secret,
+    # but .pytrakt.json's own CLIENT_ID/CLIENT_SECRET (saved alongside the
+    # OAuth tokens at authorization time) is the actual source of truth for
+    # an already-completed auth — same fallback order used everywhere else
+    # Trakt credentials are read (see discover_routes.py). Checking
+    # settings.json alone would treat a real, working authorization as
+    # "not configured" whenever settings.json's Trakt section is empty.
+    client_id = trakt_config.get('CLIENT_ID', '') or get_setting('Trakt', 'client_id', '')
+    client_secret = trakt_config.get('CLIENT_SECRET', '') or get_setting('Trakt', 'client_secret', '')
+    if not str(client_id or '').strip() or not str(client_secret or '').strip():
+        logging.debug("Trakt is not configured; skipping Trakt authentication")
+        return None
     
     # Extract tokens from config
     access_token = trakt_config.get('OAUTH_TOKEN')

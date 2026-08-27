@@ -1036,7 +1036,11 @@ def process_metadata(media_items: List[Dict[str, Any]]) -> Dict[str, List[Dict[s
     logging.debug(f"Finished processing. Prepared {len(processed_items['movies'])} movies and {len(processed_items['episodes'])} episodes for database operations.")
     return processed_items
 
-def get_release_date(media_details: Dict[str, Any], imdb_id: Optional[str] = None) -> str:
+def get_release_date(
+    media_details: Dict[str, Any],
+    imdb_id: Optional[str] = None,
+    release_date_cache_max_age: Optional[timedelta] = None,
+) -> str:
     if not media_details:
         logging.warning("No media details provided for release date")
         return 'Unknown'
@@ -1045,7 +1049,13 @@ def get_release_date(media_details: Dict[str, Any], imdb_id: Optional[str] = Non
         logging.warning("Attempted to get release date with None IMDB ID")
         return media_details.get('released', 'Unknown')
 
-    release_dates, _ = DirectAPI.get_movie_release_dates(imdb_id)
+    if release_date_cache_max_age is None:
+        release_dates, _ = DirectAPI.get_movie_release_dates(imdb_id)
+    else:
+        release_dates, _ = DirectAPI.get_movie_release_dates(
+            imdb_id,
+            max_cache_age=release_date_cache_max_age,
+        )
     logging.debug(f"Processing release dates for IMDb ID: {imdb_id}")
 
     if not release_dates:
@@ -1152,10 +1162,20 @@ def get_imdb_id_if_missing(item: Dict[str, Any]) -> Optional[str]:
     imdb_id, _ = DirectAPI.tmdb_to_imdb(str(tmdb_id), media_type=api_media_type)
     return imdb_id
 
-def refresh_release_dates():
+def refresh_release_dates(force_bypass_cache: bool = False):
+    """Recheck release dates for all in-flight movies/episodes.
+
+    force_bypass_cache: when False (the default, used by the periodic
+    task_refresh_release_dates scheduled job), Unreleased movies are only
+    rechecked against the provider once per 24h (see a0df2b31) to avoid
+    hammering TMDB/TVDB every ~10h10m run. When True (used by the manual
+    "Refresh Release Dates" debug-page button), that floor is skipped
+    entirely so a manual click always forces a real provider re-fetch,
+    even for an item whose cache was written minutes ago.
+    """
     from database import get_all_media_items, update_release_date_and_state
     import content_checkers.trakt as trakt
-    logging.info("Starting refresh_release_dates function")
+    logging.info("Starting refresh_release_dates function (force_bypass_cache=%s)", force_bypass_cache)
 
     # Load IMDB→Trakt ID cache
     imdb_trakt_cache = trakt.load_imdb_trakt_cache()
@@ -1214,7 +1234,30 @@ def refresh_release_dates():
                     new_theatrical_release_date = None
                 else:
                     logging.info("Getting release date, physical release date, and theatrical release date")
-                    fetched_release_date = get_release_date(metadata, imdb_id)
+                    if force_bypass_cache:
+                        release_date_cache_max_age = timedelta(0)
+                        logging.info(
+                            "Forcing release-date cache bypass for %s (%s)",
+                            title,
+                            imdb_id,
+                        )
+                    else:
+                        release_date_cache_max_age = (
+                            timedelta(days=1)
+                            if item_dict.get('state') == 'Unreleased'
+                            else None
+                        )
+                        if release_date_cache_max_age is not None:
+                            logging.info(
+                                "Applying daily release-date metadata recheck for %s (%s)",
+                                title,
+                                imdb_id,
+                            )
+                    fetched_release_date = get_release_date(
+                        metadata,
+                        imdb_id,
+                        release_date_cache_max_age=release_date_cache_max_age,
+                    )
                     new_physical_release_date = get_physical_release_date(imdb_id)
                     new_theatrical_release_date = get_theatrical_release_date(imdb_id)
                     logging.info(f"Physical release date: {new_physical_release_date}")
@@ -1229,6 +1272,20 @@ def refresh_release_dates():
                             logging.warning(f"Fetched release date was 'Unknown' for {title} ({imdb_id}) and no valid existing date to fall back to")
                     else:
                         new_release_date = fetched_release_date
+
+                from database.movie_release_overrides import get_movie_release_override
+                release_override = get_movie_release_override(
+                    imdb_id=imdb_id,
+                    tmdb_id=item_dict.get('tmdb_id'),
+                )
+                if release_override:
+                    new_release_date = release_override['release_date']
+                    logging.info(
+                        "Applying manual release-date override for %s (%s): %s",
+                        title,
+                        imdb_id,
+                        new_release_date,
+                    )
 
                 item_dict['early_release_original'] = item_dict.get('early_release', False)
                 item_dict['physical_release_date_original'] = item_dict.get('physical_release_date')
@@ -1339,7 +1396,12 @@ def refresh_release_dates():
                 new_airtime = None
 
             elif media_type == 'episode':
-                metadata, source = DirectAPI.get_show_metadata(imdb_id)
+                if force_bypass_cache:
+                    logging.info(
+                        "Forcing release-date cache bypass for %s S%sE%s (%s)",
+                        title, season_number, episode_number, imdb_id,
+                    )
+                metadata, source = DirectAPI.get_show_metadata(imdb_id, force_refresh=force_bypass_cache)
                 logging.info(f"Processing metadata for {title} S{season_number}E{episode_number}")
 
                 new_airtime = get_episode_airtime(imdb_id, season_number, episode_number)

@@ -64,7 +64,7 @@ from flask import Response, stream_with_context
 import sqlite3
 from utilities.local_library_scan import convert_item_to_symlink, get_symlink_path, create_symlink, resync_symlinks_with_new_settings
 from scraper.functions.ptt_parser import parse_with_ptt
-from database.database_writing import add_media_item
+from database.database_writing import add_media_item, RESET_COLLECTION_STATE_SQL
 from routes.program_operation_routes import get_program_runner
 from utilities.plex_removal_cache import cache_plex_removal
 import subprocess
@@ -294,7 +294,11 @@ def bulk_delete_by_imdb():
 @admin_required
 def refresh_release_dates_route():
     from metadata.metadata import refresh_release_dates # Added import here
-    refresh_release_dates()
+    # Manual trigger: bypass the periodic task's 24h-per-item cache floor so
+    # this always forces a real provider re-fetch, not just a re-read of
+    # whatever was already cached (which could be minutes old and still
+    # showing 'Unknown').
+    refresh_release_dates(force_bypass_cache=True)
     return jsonify({'success': True, 'message': 'Release dates refreshed successfully'})
 
 @debug_bp.route('/reset_battery_show_cache', methods=['POST'])
@@ -1562,14 +1566,14 @@ def move_item_to_wanted(item_id, current_original_scraped_title=None):
                     cur_lookup.close()
 
         cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE media_items 
-            SET state = 'Wanted', 
-                filled_by_file = NULL, 
-                filled_by_title = NULL, 
-                filled_by_magnet = NULL, 
-                filled_by_torrent_id = NULL, 
-                collected_at = NULL,
+        cursor.execute(f'''
+            UPDATE media_items
+            SET state = 'Wanted',
+                filled_by_file = NULL,
+                filled_by_title = NULL,
+                filled_by_magnet = NULL,
+                filled_by_torrent_id = NULL,
+                {RESET_COLLECTION_STATE_SQL},
                 last_updated = ?,
                 location_on_disk = NULL,
                 original_path_for_symlink = NULL,
@@ -2279,14 +2283,14 @@ def convert_to_symlinks():
                                 logging.info(f"Deleted item {item_dict['title']} as duplicate exists")
                             else:
                                 # Update the item to Wanted state
-                                cursor.execute("""
-                                    UPDATE media_items 
+                                cursor.execute(f"""
+                                    UPDATE media_items
                                     SET state = 'Wanted',
                                         filled_by_file = NULL,
                                         filled_by_title = NULL,
                                         filled_by_magnet = NULL,
                                         filled_by_torrent_id = NULL,
-                                        collected_at = NULL,
+                                        {RESET_COLLECTION_STATE_SQL},
                                         location_on_disk = NULL,
                                         last_updated = CURRENT_TIMESTAMP,
                                         version = TRIM(version, '*')
@@ -5041,6 +5045,182 @@ def run_bulk_subtitle_scan():
     from routes.extensions import task_queue
     task_id = task_queue.add_task(async_run_bulk_subs)
     return jsonify({'task_id': task_id}), 202
+
+@debug_bp.route('/api/scan_duplicate_symlinks', methods=['POST'])
+@admin_required
+def scan_duplicate_symlinks():
+    """Read-only scan: find TV episode symlinks that point at the same underlying
+    file. Usually means a season pack was mismatched during collection and
+    multiple "different" episodes actually got symlinked to the same single
+    file instead of their own - so playing S01E04 actually plays S01E01, etc.
+    Makes no changes; rescraping affected items is a separate explicit action."""
+    import os
+    from collections import defaultdict
+    from database import get_db_connection
+
+    try:
+        symlink_root = get_setting('File Management', 'symlinked_files_path', '')
+        if not symlink_root:
+            return jsonify({'success': False, 'error': 'no symlinked_files_path configured'}), 400
+
+        tv_folder_names = [get_setting('Debug', 'tv_shows_folder_name', 'TV Shows')]
+        if get_setting('Debug', 'enable_separate_anime_folders', False):
+            tv_folder_names.append(get_setting('Debug', 'anime_tv_shows_folder_name', 'Anime TV Shows'))
+
+        tv_roots = [os.path.join(symlink_root, name) for name in tv_folder_names]
+        existing_roots = [r for r in tv_roots if os.path.isdir(r)]
+        if not existing_roots:
+            return jsonify({'success': False, 'error': f'No TV symlink folders found (checked: {", ".join(tv_roots)})'}), 400
+
+        by_target = defaultdict(list)
+        scanned = 0
+        for tv_root in existing_roots:
+            for dirpath, dirnames, filenames in os.walk(tv_root):
+                for name in filenames:
+                    full = os.path.join(dirpath, name)
+                    if not os.path.islink(full):
+                        continue
+                    scanned += 1
+                    try:
+                        target = os.readlink(full)
+                    except OSError:
+                        continue
+                    by_target[target].append(full)
+
+        dupe_groups = {t: paths for t, paths in by_target.items() if len(paths) > 1}
+
+        conn = get_db_connection()
+        groups_out = []
+        for target, paths in dupe_groups.items():
+            items = []
+            for p in paths:
+                row = conn.execute(
+                    "SELECT id, title, year, season_number, episode_number FROM media_items WHERE location_on_disk = ?",
+                    (p,)
+                ).fetchone()
+                # Only items matched to a real database row are actionable from
+                # this UI (nothing to safely rescrape otherwise) - drop the rest
+                # rather than showing an inert "not matched" row.
+                if not row:
+                    continue
+                items.append({
+                    'path': p,
+                    'item_id': row['id'],
+                    'title': row['title'],
+                    'year': row['year'],
+                    'season_number': row['season_number'],
+                    'episode_number': row['episode_number'],
+                })
+            if len(items) > 1:
+                # Distinguish a genuine mismatch (different episodes wrongly sharing a file)
+                # from a legitimate combined multi-episode release file (e.g. a premiere
+                # packaged as one S01E01E02.mkv covering both episodes) - same episode/season
+                # numbers on both sides is the signal either way, but only the latter is
+                # expected/harmless. Reuse the same title parser the scraper already uses for
+                # ranking (parse_with_ptt) rather than writing new episode-detection logic.
+                is_multi_episode_release = False
+                try:
+                    from scraper.functions.ptt_parser import parse_with_ptt
+                    target_basename = os.path.basename(target)
+                    parsed = parse_with_ptt(target_basename)
+                    parsed_episodes = set(parsed.get('episodes') or [])
+                    group_episodes = {i['episode_number'] for i in items if i.get('episode_number') is not None}
+                    if group_episodes and parsed_episodes == group_episodes:
+                        is_multi_episode_release = True  # "possible" - PTT parsing isn't infallible, still shown for review either way
+                except Exception as e:
+                    logging.debug(f"Multi-episode release detection failed for {target}: {e}")
+                groups_out.append({
+                    'target': target,
+                    'items': items,
+                    'is_multi_episode_release': is_multi_episode_release,
+                })
+        conn.close()
+
+        groups_out.sort(key=lambda g: -len(g['items']))
+
+        return jsonify({
+            'success': True,
+            'scanned': scanned,
+            'group_count': len(groups_out),
+            'affected_count': sum(len(g['items']) for g in groups_out),
+            'groups': groups_out,
+        })
+    except Exception as e:
+        logging.error(f"Error scanning for duplicate symlink targets: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@debug_bp.route('/api/rescrape_duplicate_symlinks', methods=['POST'])
+@admin_required
+def rescrape_duplicate_symlinks():
+    """Fully delete the given items (media server entry, symlink, source file/
+    debrid-or-usenet download, cache) the same way deleting an episode from the
+    library does, then move them back to Wanted so they get rescraped fresh.
+    Deletion runs as one batch via DeletionManager.delete_multiple_items, whose
+    sibling guard already excludes other items in the same batch when deciding
+    whether a shared season-pack torrent/NZB is still needed elsewhere - so
+    rescraping an entire duplicate-target group in one go won't have the items
+    block each other's cleanup."""
+    from database import get_db_connection
+
+    try:
+        data = request.get_json(silent=True) or {}
+        item_ids = data.get('item_ids') or []
+        if not item_ids:
+            return jsonify({'success': False, 'error': 'No item_ids provided'}), 400
+
+        debrid_provider = get_debrid_provider()
+        deletion_manager = DeletionManager(debrid_provider=debrid_provider)
+        result = deletion_manager.delete_multiple_items(
+            item_ids=item_ids,
+            blacklist=False,
+            blacklist_sources=False,
+            delete_from_media_server=True,
+            delete_files=True,
+            delete_from_debrid=True,
+            delete_symlinks=True,
+            clear_cache=True,
+            remove_from_content_source=False,
+            skip_database=True  # We reset state to Wanted ourselves below instead of deleting the row
+        )
+
+        if not result.get('success'):
+            errors_list = result.get('errors', ['Deletion failed'])
+            logging.error(f"Error deleting duplicate-symlink items before rescrape: {errors_list}")
+            return jsonify({'success': False, 'error': errors_list[0] if errors_list else 'Deletion failed', 'errors': errors_list}), 500
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        now = datetime.now()
+        moved = 0
+        for item_id in item_ids:
+            cursor.execute(f'''
+                UPDATE media_items
+                SET state = 'Wanted',
+                    filled_by_file = NULL,
+                    filled_by_title = NULL,
+                    filled_by_magnet = NULL,
+                    filled_by_torrent_id = NULL,
+                    {RESET_COLLECTION_STATE_SQL},
+                    last_updated = ?,
+                    disable_not_wanted_check = TRUE,
+                    location_on_disk = NULL,
+                    original_path_for_symlink = NULL,
+                    original_scraped_torrent_title = NULL,
+                    upgrading_from = NULL,
+                    version = TRIM(version, '*'),
+                    upgrading = NULL
+                WHERE id = ?
+                AND state NOT IN ('Wanted', 'Scraping', 'Adding')
+            ''', (now, item_id))
+            moved += cursor.rowcount
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'moved': moved})
+    except Exception as e:
+        logging.error(f"Error rescraping duplicate-symlink items: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @debug_bp.route('/api/fix_zurg_symlinks', methods=['POST'])
 @admin_required

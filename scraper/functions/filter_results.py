@@ -106,7 +106,12 @@ def filter_results(
     filter_out = version_settings.get('filter_out', [])
     enable_hdr = version_settings.get('enable_hdr', False)
     disable_adult = get_setting('Scraping', 'disable_adult', False)
-    disable_nzb_season_packs = get_setting('Usenet Provider', 'disable_nzb_season_packs', False)
+    # Fallback only matters for a config missing this key entirely (e.g. a pre-0.6.08
+    # install whose settings.json predates this field and was never backfilled —
+    # ensure_settings_file() only populates schema defaults when the whole config
+    # file is missing, not individual missing keys in an existing one). Kept in sync
+    # with the schema default in utilities/settings_schema.py.
+    disable_nzb_season_packs = get_setting('Usenet Provider', 'disable_nzb_season_packs', True)
     
     #logging.debug(f"Starting filter_results with {len(results)} results")
     #logging.debug(f"Version settings: resolution={max_resolution}({resolution_wanted}), size={min_size_gb}-{max_size_gb}GB, HDR={enable_hdr}")
@@ -1565,7 +1570,10 @@ def filter_results(
                 # article, unlike per-episode/aggregate results which only re-grab the
                 # affected episode. When disabled, reject NZB packs outright rather than
                 # scoring/selecting them — movies and non-NZB (torrent) packs are unaffected.
-                if disable_nzb_season_packs and is_identified_as_pack and result.get('protocol') == 'nzb':
+                # NZB Aggregate virtual packs (is_nzb_season_pack) are exempt: they're built
+                # from separate per-episode NZBs, so a repair only re-grabs the one episode.
+                if disable_nzb_season_packs and is_identified_as_pack and result.get('protocol') == 'nzb' \
+                        and not result.get('is_nzb_season_pack'):
                     result['filter_reason'] = "NZB season packs disabled"
                     logging.info(f"Rejected: NZB season pack disabled by setting for '{original_title}' (Size: {result['size']:.2f}GB)")
                     continue

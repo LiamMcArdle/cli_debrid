@@ -4,6 +4,7 @@ from .torrent_tracking import create_torrent_tracking_table
 from .content_source_retry import create_retry_queue_table
 from .upgrade_hub_activity import create_upgrade_hub_activity_table
 from .nzb_repair_activity import create_nzb_repair_activity_table
+from .nzb_playback_repair import create_nzb_playback_repair_table
 import sqlite3
 import os
 
@@ -14,6 +15,7 @@ def create_database():
     create_retry_queue_table()
     create_upgrade_hub_activity_table()
     create_nzb_repair_activity_table()
+    create_nzb_playback_repair_table()
     #TODO: create_upgrading_table()
 
     # Add statistics-specific indexes
@@ -31,6 +33,9 @@ def migrate_schema():
 
         # Check if the column exists
         cursor = conn.cursor()
+
+        from .movie_release_overrides import ensure_movie_release_override_table
+        ensure_movie_release_override_table(conn)
         
         # Check if statistics_summary table exists and has id column
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='statistics_summary'")
@@ -852,6 +857,10 @@ def verify_database():
     migrate_schema()
     create_torrent_tracking_table()
     create_nzb_repair_activity_table()
+    # verify_database() is the startup path for existing installations.
+    # create_database() is only used for a brand-new database, so keeping the
+    # playback table solely there leaves upgraded databases without it.
+    create_nzb_playback_repair_table()
 
     # Ensure overlay_removal_queue table exists (handles post-delete without restart)
     try:
@@ -993,6 +1002,9 @@ def create_tables():
                 source_position INTEGER
             )
         ''')
+
+        from .movie_release_overrides import ensure_movie_release_override_table
+        ensure_movie_release_override_table(conn)
 
         # Add new table for tracking requested seasons
         cursor.execute('''
