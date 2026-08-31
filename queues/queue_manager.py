@@ -529,10 +529,19 @@ class QueueManager:
         wake_count = get_wake_count(item['id'])
         logging.debug(f"Wake count before moving to Wanted: {wake_count}")
 
+        # A wake from Sleeping or Dormant starts a fresh retry cycle, so lift the
+        # single-scraper fallback and let the item try season packs again. The flag
+        # exists to stop an item from re-grabbing a pack whose debrid add just
+        # failed within the current cycle; left in place it permanently bans packs
+        # for shows where packs are the only viable source.
+        wake_params = {}
+        if from_queue in ("Sleeping", "Dormant"):
+            wake_params['fall_back_to_single_scraper'] = False
+
         updated_item = self._move_item_to_queue(item, from_queue, "Wanted", "Wanted", new_version=new_version,
                                                 filled_by_title=None, filled_by_magnet=None,
                                                 filled_by_torrent_id=None, filled_by_file=None,
-                                                debrid_folder_name=None)
+                                                debrid_folder_name=None, **wake_params)
         
         if updated_item:
             # No additional processing needed for Wanted queue itself

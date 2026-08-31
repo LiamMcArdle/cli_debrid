@@ -195,6 +195,7 @@ def update_media_item_state(item_id, state, **kwargs):
             'sleep_cycles',
             'next_retry_at',
             'last_scrape_failure',
+            'fall_back_to_single_scraper',
         ]
         for field in optional_fields:
             if field in kwargs:
