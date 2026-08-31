@@ -497,6 +497,30 @@ def truncate_path_components(
     return sanitized
 
 
+def _reuse_existing_dir_casing(root: str, parts: list) -> list:
+    """Replace each directory segment with an existing one that matches
+    case-insensitively, so a metadata title recased upstream (e.g. 'Jujutsu
+    Kaisen' -> 'JUJUTSU KAISEN') keeps filing into the show's existing folder
+    instead of splitting it into two folders that differ only by case."""
+    resolved = []
+    current = root
+    for segment in parts:
+        if not os.path.isdir(os.path.join(current, segment)):
+            try:
+                entries = os.listdir(current)
+            except OSError:
+                entries = []
+            match = next((e for e in entries
+                          if e.lower() == segment.lower()
+                          and os.path.isdir(os.path.join(current, e))), None)
+            if match is not None and match != segment:
+                logging.info(f"[SymlinkPath] Reusing existing folder '{match}' for '{segment}' (case-insensitive match)")
+                segment = match
+        resolved.append(segment)
+        current = os.path.join(current, segment)
+    return resolved
+
+
 def get_symlink_path(item: Dict[str, Any], original_file: str, skip_jikan_lookup: bool = False) -> str:
     """Get the full path for the symlink based on settings and metadata."""
     import json
@@ -919,6 +943,7 @@ def get_symlink_path(item: Dict[str, Any], original_file: str, skip_jikan_lookup
                     parts.append(sanitized_template_part)
         
         # 'parts' now contains: ordered_prefix_parts + directory_parts_from_template
+        parts = _reuse_existing_dir_casing(final_symlinked_path_root, parts)
         dir_path = os.path.join(final_symlinked_path_root, *parts)
         
         try:
