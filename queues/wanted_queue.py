@@ -9,6 +9,44 @@ from database.core import get_db_connection
 from database.database_reading import get_all_media_items, check_existing_media_item
 from database.database_writing import update_media_item_state, update_blacklisted_date, remove_from_media_items
 
+
+def wanted_order_by(sort_order_type, sort_by_release_date, recent_release_days):
+    """ORDER BY clauses and their bound parameters for the Wanted candidate query.
+
+    Default order is recently released items first, then whoever has waited
+    longest. Plain ``title ASC`` starved everything after the first few
+    letters: every wake from Sleeping/Dormant re-enters Wanted, and an A-M show
+    sorted ahead of an N-Z item that had waited days. move_to_wanted bumps
+    last_updated, so a wake joins the back of the line; the hour bucket keeps a
+    show's episodes contiguous so multi-pack sibling detection still sees them
+    together. The GLOB guard matters: release_date holds the string 'Unknown'
+    for some rows, and 'U' sorts above every digit.
+    """
+    clauses = []
+    params = []
+    if sort_order_type == "Movies First":
+        clauses.append("CASE type WHEN 'movie' THEN 0 ELSE 1 END")
+    elif sort_order_type == "Episodes First":
+        clauses.append("CASE type WHEN 'episode' THEN 0 ELSE 1 END")
+    if sort_by_release_date:
+        clauses.append("release_date DESC")
+        clauses.append("title ASC")
+    else:
+        try:
+            recent_days = max(0, int(recent_release_days))
+        except (TypeError, ValueError):
+            recent_days = 14
+        clauses.append(
+            "CASE WHEN release_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' "
+            "AND release_date >= date('now', ?) THEN 0 ELSE 1 END"
+        )
+        params.append(f"-{recent_days} days")
+        clauses.append("strftime('%Y-%m-%d %H', last_updated) ASC")
+        clauses.append("title ASC")
+    clauses.append("CASE WHEN type = 'episode' THEN season_number ELSE NULL END ASC NULLS FIRST")
+    clauses.append("CASE WHEN type = 'episode' THEN episode_number ELSE NULL END ASC NULLS FIRST")
+    return clauses, params
+
 # Define constants for queue size limits
 SCRAPING_QUEUE_MAX_SIZE = 500
 # New threshold to pause Wanted processing entirely
@@ -435,22 +473,12 @@ class WantedQueue:
 
             # 3. Build Query for Candidate Items (REGULAR items)
             query = "SELECT * FROM media_items WHERE state = 'Wanted' AND (ghostlisted IS NULL OR ghostlisted = 0)" # This will not pick up already moved forced items
-            params = []
-            order_by_clauses = []
-            sort_order_type = get_setting("Queue", "queue_sort_order", "None")
-            if sort_order_type == "Movies First":
-                order_by_clauses.append("CASE type WHEN 'movie' THEN 0 ELSE 1 END")
-            elif sort_order_type == "Episodes First":
-                order_by_clauses.append("CASE type WHEN 'episode' THEN 0 ELSE 1 END")
-            sort_by_release_date = get_setting("Queue", "sort_by_release_date_desc", False)
-            if sort_by_release_date:
-                order_by_clauses.append("release_date DESC")
-                order_by_clauses.append("title ASC")
-            else:
-                order_by_clauses.append("title ASC")
-            order_by_clauses.append("CASE WHEN type = 'episode' THEN season_number ELSE NULL END ASC NULLS FIRST")
-            order_by_clauses.append("CASE WHEN type = 'episode' THEN episode_number ELSE NULL END ASC NULLS FIRST")
-            
+            order_by_clauses, params = wanted_order_by(
+                get_setting("Queue", "queue_sort_order", "None"),
+                get_setting("Queue", "sort_by_release_date_desc", False),
+                get_setting("Queue", "wanted_recent_release_days", 14),
+            )
+
             content_source_priority = get_setting("Queue", "content_source_priority", "")
             source_priority_list = [s.strip() for s in content_source_priority.split(',') if s.strip()]
 

@@ -543,6 +543,12 @@ SETTINGS_SCHEMA = {
             "default": 250,
             "min": 1
         },
+        "wanted_recent_release_days": {
+            "type": "integer",
+            "description": "Wanted items released within this many days are scraped before the backlog; everything else is taken oldest-first. Only applies when 'Sort by release date' is off.",
+            "default": 14,
+            "min": 0
+        },
         "wake_limit": {
             "type": "string",
             "description": "DEPRECATED and no longer read. Superseded by Queue.retry_ladder_minutes.",
