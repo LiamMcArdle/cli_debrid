@@ -405,6 +405,19 @@ def _add_collected_items_impl(media_items_batch, recent=False, backfill=False, d
         logging.info(f"[Collection Debug] Starting processing of {len(filtered_media_items_batch)} filtered media items.")
         # start_time_batch = time.time()
 
+        # How long after release an item stays eligible for upgrading.
+        # Was hardcoded to 7 days, which is arbitrary: a better release
+        # frequently lands weeks or months later (a WEB-DL followed by a
+        # BluRay remux, or a 4K re-release), and the window shut long
+        # before it appeared. 0 or negative means no time limit. Read once
+        # per batch, not once per row: a full library scan is ~30k rows.
+        try:
+            _upgrade_window = int(
+                get_setting("Scraping", "upgrade_window_days", default=7))
+        except (TypeError, ValueError):
+            _upgrade_window = 7
+        _upgrading_enabled = bool(get_setting("Scraping", "enable_upgrading", default=False))
+
         for index, item in enumerate(filtered_media_items_batch):
             item_identifier = generate_identifier(item)
             # start_time_item = time.time()
@@ -618,22 +631,12 @@ def _add_collected_items_impl(media_items_batch, recent=False, backfill=False, d
                             # Check if the DB item was manually assigned
                             is_manually_assigned = existing_db_item.get('content_source') == 'Magnet_Assigner'
 
-                            # How long after release an item stays eligible for upgrading.
-                            # Was hardcoded to 7 days, which is arbitrary: a better release
-                            # frequently lands weeks or months later (a WEB-DL followed by a
-                            # BluRay remux, or a 4K re-release), and the window shut long
-                            # before it appeared. 0 or negative means no time limit.
-                            try:
-                                _upgrade_window = int(
-                                    get_setting("Scraping", "upgrade_window_days", default=7))
-                            except (TypeError, ValueError):
-                                _upgrade_window = 7
                             _within_window = (_upgrade_window <= 0 or
                                               days_since_release <= _upgrade_window)
 
                             # Determine the new state, preventing upgrade for manual assignments
                             should_upgrade = (_within_window and
-                                              get_setting("Scraping", "enable_upgrading", default=False) and
+                                              _upgrading_enabled and
                                               not is_manually_assigned) # Check if NOT manually assigned
 
                             if should_upgrade:

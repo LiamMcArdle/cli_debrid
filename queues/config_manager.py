@@ -294,10 +294,17 @@ def save_config(config):
         # Save the new config
         with open(CONFIG_FILE, 'w') as file:
             # Move file pointer to beginning and truncate before writing
-            file.seek(0) 
+            file.seek(0)
             file.truncate()
             json.dump(config, file, indent=4, default=json_serializer)
-            
+        # utilities.settings caches its parse of this file; tell it directly
+        # rather than trusting the mtime alone.
+        try:
+            from utilities.settings import invalidate_config_cache
+            invalidate_config_cache()
+        except Exception as _inv_err:
+            logging.debug(f"Could not invalidate settings cache: {_inv_err}")
+
         # Clear update cache
         try:
             from routes.base_routes import clear_cache

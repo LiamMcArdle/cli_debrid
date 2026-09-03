@@ -136,15 +136,24 @@ class MediaMatcher:
             from database.core import get_db_connection
             conn = get_db_connection()
             try:
-                placeholders = ','.join('?' * len(basenames))
-                sql = (f"SELECT filled_by_file FROM media_items "
-                       f"WHERE imdb_id = ? AND filled_by_file IN ({placeholders}) "
-                       f"AND state IN ('Collected','Upgrading')")
-                params = [imdb_id, *basenames]
-                if exclude_item_id is not None:
-                    sql += " AND id != ?"
-                    params.append(exclude_item_id)
-                return {row[0] for row in conn.execute(sql, params) if row[0]}
+                in_use = set()
+                # SQLite caps bound parameters (999 on older builds). A full
+                # series pack can carry more filenames than that, and one
+                # oversized IN list would raise and fail this guard open for
+                # exactly the packs it matters most for.
+                chunk_size = 500
+                for start in range(0, len(basenames), chunk_size):
+                    chunk = basenames[start:start + chunk_size]
+                    placeholders = ','.join('?' * len(chunk))
+                    sql = (f"SELECT filled_by_file FROM media_items "
+                           f"WHERE imdb_id = ? AND filled_by_file IN ({placeholders}) "
+                           f"AND state IN ('Collected','Upgrading')")
+                    params = [imdb_id, *chunk]
+                    if exclude_item_id is not None:
+                        sql += " AND id != ?"
+                        params.append(exclude_item_id)
+                    in_use.update(row[0] for row in conn.execute(sql, params) if row[0])
+                return in_use
             finally:
                 conn.close()
         except Exception as e:

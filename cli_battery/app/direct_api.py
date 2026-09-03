@@ -614,48 +614,95 @@ def _build_show_metadata_dict(item: Item) -> dict:
 def _fetch_and_store_xem(item: Item, session: SqlAlchemySession, metadata_dict: dict):
     """Fetch XEM mapping if missing (or stale-and-empty) and store it.
 
+    Compatibility wrapper: prefer _xem_fetch_plan + _xem_fetch_and_store so the
+    HTTP call happens with no session open.
+
     Two deliberate details:
       * On failure the value stored is ``[]``, not ``{}``. scraper.py gates its
         entire absolute-episode remap on ``isinstance(xem_mapping_list, list)``,
         and ``isinstance({}, list)`` is False -- so the old coercion disarmed
         XEM permanently for every show it touched.
-      * An empty result is re-fetched after a short TTL. The original code
-        returned early on mere key presence with no staleness check, so a single
+      * An empty result is re-fetched after a TTL. The original code returned
+        early on mere key presence with no staleness check, so a single
         upstream outage pinned a show at 'no mapping' forever.
     """
+    _xem_fetch_and_store(_xem_fetch_plan(item, session, metadata_dict), metadata_dict)
+
+
+def _xem_fetch_plan(item: Item, session: SqlAlchemySession, metadata_dict: dict) -> Optional[Tuple[int, int]]:
+    """Decide, from the database alone, whether a XEM fetch is due.
+
+    Returns ``(item.id, tvdb_id)`` when it is, else None. The HTTP call itself
+    is made by ``_xem_fetch_and_store`` AFTER the caller's session has closed:
+    it used to run inside get_show_metadata's session, so a slow thexem.info
+    (15s timeout) held a battery DB session open for every scrape that
+    touched a show without a mapping. The TTL on an empty entry depends on WHY
+    it is empty -- see _xem_entry_is_stale.
+    """
     if 'xem_mapping' in metadata_dict:
-        existing_value = metadata_dict.get('xem_mapping')
-        if existing_value:
-            return
+        if metadata_dict.get('xem_mapping'):
+            return None
         if not _xem_entry_is_stale(item, session):
-            return
+            return None
     ids = metadata_dict.get('ids', {})
     tvdb_id = ids.get('tvdb') if isinstance(ids, dict) else None
     if not tvdb_id:
+        return None
+    return item.id, tvdb_id
+
+
+def _xem_fetch_and_store(plan: Optional[Tuple[int, int]], metadata_dict: dict) -> None:
+    """Run the XEM fetch for a plan and persist the outcome in its own session."""
+    if not plan:
         return
+    item_id, tvdb_id = plan
     try:
         xem_data = fetch_xem_mapping(tvdb_id)
-        xem_value = xem_data if isinstance(xem_data, list) else []
-        metadata_dict['xem_mapping'] = xem_value
-        now = datetime.now(_get_local_tz())
-        existing = session.query(Metadata).filter_by(item_id=item.id, key='xem_mapping').first()
-        if existing:
-            existing.value = json.dumps(xem_value)
-            existing.last_updated = now
-        else:
-            session.add(Metadata(
-                item_id=item.id, key='xem_mapping',
-                value=json.dumps(xem_value), provider='xem', last_updated=now,
-            ))
     except Exception as e:
-        logger.error(f"XEM fetch error for {item.imdb_id}: {e}")
+        logger.error(f"XEM fetch error for item {item_id}: {e}")
+        return
+    if xem_data is None:
+        # No answer. Keep whatever is stored (an older definitive answer is
+        # better than nothing) and only leave a short-TTL placeholder when
+        # there is no row at all, so the next scrape asks again soon.
+        value, provider, overwrite = [], _XEM_UNAVAILABLE_PROVIDER, False
+    else:
+        value, provider, overwrite = list(xem_data), _XEM_PROVIDER, True
+    if overwrite or 'xem_mapping' not in metadata_dict:
+        metadata_dict['xem_mapping'] = value
+    now = datetime.now(_get_local_tz())
+    try:
+        with managed_session() as session:
+            existing = session.query(Metadata).filter_by(item_id=item_id, key='xem_mapping').first()
+            if existing:
+                if overwrite:
+                    existing.value = json.dumps(value)
+                    existing.provider = provider
+                    existing.last_updated = now
+            else:
+                session.add(Metadata(
+                    item_id=item_id, key='xem_mapping',
+                    value=json.dumps(value), provider=provider, last_updated=now,
+                ))
+    except Exception as e:
+        logger.error(f"XEM store error for item {item_id}: {e}")
 
 
 # ─── DirectAPI ───────────────────────────────────────────────────────────────
 
-# Re-fetch an empty xem_mapping entry after this long. A populated entry is
-# treated as permanent, as it was before.
+# How long an EMPTY xem_mapping entry is trusted before it is re-fetched. A
+# populated entry is treated as permanent, as it was before. TheXEM answering
+# "no show with the id" is definitive and true of most shows, so it is held for
+# a month; an entry left by a failed request is retried after hours.
 _XEM_EMPTY_TTL = timedelta(hours=6)
+_XEM_NOSHOW_TTL = timedelta(days=30)
+_XEM_PROVIDER = 'xem'
+_XEM_UNAVAILABLE_PROVIDER = 'xem-unavailable'
+
+
+def _xem_ttl_for(provider: Optional[str]) -> timedelta:
+    """TTL of an empty xem_mapping row, chosen by how the emptiness arose."""
+    return _XEM_EMPTY_TTL if provider == _XEM_UNAVAILABLE_PROVIDER else _XEM_NOSHOW_TTL
 
 # Cinemeta episode maps: refresh a populated map weekly, retry an empty one
 # after a short delay. Never store a permanent negative.
@@ -682,8 +729,15 @@ def _metadata_age(item: Item, session: SqlAlchemySession, key: str) -> Optional[
 
 
 def _xem_entry_is_stale(item: Item, session: SqlAlchemySession) -> bool:
-    age = _metadata_age(item, session, 'xem_mapping')
-    return age is None or age > _XEM_EMPTY_TTL
+    row = session.query(Metadata).filter_by(item_id=item.id, key='xem_mapping').first()
+    if row is None or row.last_updated is None:
+        return True
+    last_updated = row.last_updated
+    if last_updated.tzinfo is None:
+        # Written as local wall clock; see _metadata_age.
+        last_updated = last_updated.replace(tzinfo=_get_local_tz())
+    age = datetime.now(timezone.utc) - last_updated
+    return age > _xem_ttl_for(row.provider)
 
 
 def _fetch_and_store_cinemeta_map(item: Item, session: SqlAlchemySession, metadata_dict: dict):
@@ -1002,6 +1056,8 @@ class DirectAPI:
             return None, None
 
         try:
+            hit_md = None
+            xem_plan = None
             with managed_session() as session:
                 item = session.query(Item).options(
                     selectinload(Item.item_metadata),
@@ -1010,11 +1066,22 @@ class DirectAPI:
 
                 if item and not is_stale(item.type or 'show', item.media_status, item.last_trakt_fetch):
                     logging.debug(f"get_show_metadata {imdb_id}: cache HIT")
-                    md = _build_show_metadata_dict(item)
-                    _fetch_and_store_xem(item, session, md)
-                    if imdb_id == LEGO_MASTERS_US_IMDB_ID and 'seasons' in md:
-                        md['seasons'] = _apply_lego_masters_us_season_fix(md['seasons'])
-                    return md, 'battery'
+                    hit_md = _build_show_metadata_dict(item)
+                    xem_plan = _xem_fetch_plan(item, session, hit_md)
+
+            if hit_md is not None:
+                # The HTTP call runs with no session open; _build_show_metadata_dict
+                # already materialised everything the eager loads fetched.
+                _xem_fetch_and_store(xem_plan, hit_md)
+                if imdb_id == LEGO_MASTERS_US_IMDB_ID and 'seasons' in hit_md:
+                    hit_md['seasons'] = _apply_lego_masters_us_season_fix(hit_md['seasons'])
+                return hit_md, 'battery'
+
+            with managed_session() as session:
+                item = session.query(Item).options(
+                    selectinload(Item.item_metadata),
+                    selectinload(Item.seasons).selectinload(Season.episodes),
+                ).filter_by(imdb_id=imdb_id).first()
 
                 # Stale or missing — refresh, unless Trakt is in cooldown
                 logging.debug(f"get_show_metadata {imdb_id}: cache MISS (stale={item is not None})")

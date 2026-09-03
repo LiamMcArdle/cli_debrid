@@ -19,7 +19,12 @@ def fetch_xem_mapping(tvdb_id: int) -> Optional[List[Dict[str, Any]]]:
         tvdb_id: The TVDB ID of the show.
 
     Returns:
-        A list of mapping dictionaries if successful, otherwise None.
+        A list of mapping dictionaries if successful; an EMPTY list when TheXEM
+        answered definitively that it has no show under this id; None when no
+        answer was obtained (cooldown, 403, timeout, transport or parse error).
+        Callers cache the empty list for a long time and the None for a short
+        one -- most shows have no XEM entry, and re-asking about them every
+        few hours was one HTTP round trip per show per scrape cycle.
         Each dictionary in the list typically contains keys like 'scene', 'tvdb', etc.,
         each mapping to another dictionary with 'season', 'episode', 'absolute'.
     """
@@ -53,14 +58,15 @@ def fetch_xem_mapping(tvdb_id: int) -> Optional[List[Dict[str, Any]]]:
 
         if data.get("result") == "success":
             logger.info(f"Successfully retrieved XEM mapping for TVDB ID {tvdb_id}.")
-            return data.get("data") # This should be the list of mappings
+            mapping = data.get("data") # This should be the list of mappings
+            return mapping if isinstance(mapping, list) else []
         else:
             message = data.get("message", "Unknown reason")
             # Don't log an error if the show simply isn't found, just info.
             if "no show with the" in message:
                  logger.info(f"No mapping found on TheXEM for TVDB ID {tvdb_id}: {message}")
-            else:
-                logger.error(f"Failed to retrieve XEM mapping for TVDB ID {tvdb_id}. Result: {data.get('result')}, Message: {message}")
+                 return []
+            logger.error(f"Failed to retrieve XEM mapping for TVDB ID {tvdb_id}. Result: {data.get('result')}, Message: {message}")
             return None
 
     except requests.exceptions.Timeout:

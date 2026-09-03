@@ -7,6 +7,8 @@ from utilities.settings_schema import SETTINGS_SCHEMA
 from utilities.file_lock import FileLock
 import time
 import shutil # Added for copy2
+import copy
+import threading
 
 # --- Start Dynamic Path Functions ---
 def get_config_dir():
@@ -81,7 +83,57 @@ class Settings:
                 except Exception as e:
                     logging.error(f"Failed to close lock file handle for {self.lock_file_path}: {e}")
 
+# --- Parsed-config cache ----------------------------------------------------
+# get_setting() is called from per-result and per-file loops (the not-wanted
+# check alone runs ~100 times per scrape), and every call used to open, lock
+# and re-parse config.json. The parsed object is cached against the file's
+# (mtime_ns, size, inode) and re-read only when that changes. Writers in this
+# process also invalidate explicitly: shutil.copy2 preserves the SOURCE mtime,
+# so a backup restore can put an older timestamp on the file and the stat key
+# alone would not notice.
+_config_cache = {'key': None, 'config': None}
+_config_cache_lock = threading.Lock()
+
+
+def _config_stat_key(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def invalidate_config_cache():
+    """Drop the cached parse. Call after writing config.json."""
+    with _config_cache_lock:
+        _config_cache['key'] = None
+        _config_cache['config'] = None
+
+
+def _load_config_cached():
+    """The parsed config, shared. Callers must not mutate the returned object."""
+    path = get_config_file_path()
+    key = _config_stat_key(path)
+    if key is not None:
+        with _config_cache_lock:
+            if _config_cache['config'] is not None and _config_cache['key'] == key:
+                return _config_cache['config']
+    config = _read_config_from_disk()
+    # A missing or unparseable file returns {} and is never cached, so the
+    # next call re-checks rather than serving an empty config forever.
+    if key is not None and config:
+        with _config_cache_lock:
+            _config_cache['key'] = key
+            _config_cache['config'] = config
+    return config
+
+
 def load_config():
+    """A private copy of the parsed config. Safe to mutate and pass to save_config."""
+    return copy.deepcopy(_load_config_cached())
+
+
+def _read_config_from_disk():
     config_file_path = get_config_file_path()
     lock_file_path = get_lock_file_path()
 
@@ -265,6 +317,8 @@ def save_config(config):
                     except Exception as e_restore:
                         logging.error(f"Failed to restore backup {backup_file}: {str(e_restore)}")
                 # Propagate the original save error? Or just log? Currently just logs.
+            finally:
+                invalidate_config_cache()
 
     except Exception as e_lock:
         # This catches errors during lock acquisition (__enter__)
@@ -281,23 +335,26 @@ def parse_bool(value):
     return bool(value)
 
 def get_setting(section, key=None, default=None):
-    # This function relies on load_config, which is now dynamic
-    config = load_config()
+    # Reads the shared parsed config. Anything mutable handed back is copied so
+    # a caller that edits a section cannot poison every later read.
+    config = _load_config_cached()
     if section == 'Content Sources':
         content_sources = config.get(section, {})
         if not isinstance(content_sources, dict):
             logging.warning(f"get_setting: 'Content Sources' is not a dictionary (type: {type(content_sources)}). Resetting to empty dict.")
             content_sources = {}
-        return content_sources
+        return copy.deepcopy(content_sources)
 
     if key is None:
         # Return the whole section, default to empty dict if section missing
         section_data = config.get(section, {})
-        return section_data
+        return copy.deepcopy(section_data)
 
     # Get specific key from section, default to provided default if section or key missing
     section_data = config.get(section, {})
     value = section_data.get(key, default)
+    if isinstance(value, (dict, list)):
+        value = copy.deepcopy(value)
 
 
     # Handle boolean values (Keep this logic)
