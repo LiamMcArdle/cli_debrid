@@ -732,6 +732,18 @@ SETTINGS_SCHEMA = {
             "default": 5,
             "min": 0
         },
+        "max_query_aliases": {
+            "type": "integer",
+            "description": "How many Latin-script alternate titles are sent to the indexers per scrape, on top of the main and romanized titles. Every alias is still used for matching; this only limits queries. Each alias costs a round trip to every enabled scraper.",
+            "default": 3,
+            "min": 0
+        },
+        "max_native_query_aliases": {
+            "type": "integer",
+            "description": "How many native-script titles (Japanese, etc.) are sent to Nyaa per scrape. Other indexers never see them; nothing is published under a non-Latin name anywhere else.",
+            "default": 1,
+            "min": 0
+        },
         "versions": {
             "type": "dict",
             "description": "Scraping versions configuration",

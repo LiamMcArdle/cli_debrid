@@ -119,7 +119,9 @@ class ScraperManager:
         skip_id_based: bool = False,
         id_season: Optional[int] = None,
         id_episode: Optional[int] = None,
-        unavailable_scope: Optional[set] = None
+        unavailable_scope: Optional[set] = None,
+        nyaa_only: bool = False,
+        single_format: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Scrape all configured sources for content, enrich with specific metadata, and log detailed results.
@@ -299,7 +301,8 @@ class ScraperManager:
                               season=season, episode=episode,
                               episode_formats=episode_formats if is_anime and is_episode else None,
                               tmdb_id=tmdb_id, multi=multi,
-                              is_translated_search=is_translated
+                              is_translated_search=is_translated,
+                              single_format=single_format,
                           )
                      else: # OldNyaa
                           results = self.scrapers[scraper_type](
@@ -545,6 +548,13 @@ class ScraperManager:
 
             # Skip anime scrapers if we already tried them above
             if is_anime and is_episode and scraper_type in ['Nyaa', 'OldNyaa']:
+                continue
+
+            # A native-script title is only ever answered by Nyaa. Nothing is
+            # published to Prowlarr, Zilean or Jackett under a Korean, Hebrew
+            # or Cyrillic name; measured 2026-08-26, 0 of 67 such queries ever
+            # produced an accepted result.
+            if nyaa_only and scraper_type not in ['Nyaa', 'OldNyaa']:
                 continue
 
             # Alias searches only vary the title; id-based scrapers would just

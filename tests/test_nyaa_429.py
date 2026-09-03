@@ -94,5 +94,41 @@ class Nyaa429Detection(unittest.TestCase):
         self.assertEqual(search.call_count, 0)
 
 
+class SingleFormatForAliasTitles(unittest.TestCase):
+    """An alias title runs one Nyaa format; the main title keeps them all."""
+
+    FORMATS = {'regular': 'S01E05', 'absolute': '017', 'no_zeros': '17'}
+
+    def test_recorded_preference_wins(self):
+        with patch('scraper.nyaa.get_anime_format', return_value='regular'):
+            self.assertEqual(nyaa.pick_single_format(self.FORMATS, 'tmdb1'),
+                             {'regular': 'S01E05'})
+
+    def test_absolute_when_no_preference(self):
+        with patch('scraper.nyaa.get_anime_format', return_value=None):
+            self.assertEqual(nyaa.pick_single_format(self.FORMATS, 'tmdb1'),
+                             {'absolute': '017'})
+
+    def test_first_format_when_neither_available(self):
+        with patch('scraper.nyaa.get_anime_format', return_value='combined'):
+            self.assertEqual(nyaa.pick_single_format({'regular': 'S01E05', 'no_zeros': '17'}, 'tmdb1'),
+                             {'regular': 'S01E05'})
+
+    def _episode_scrape(self, single_format):
+        with patch('scraper.nyaa._scrape_nyaa_with_format', return_value=[]) as fmt, \
+                patch('scraper.nyaa.get_anime_format', return_value=None), \
+                patch('scraper.nyaa.update_anime_format'), \
+                patch('scraper.nyaa.time.sleep', return_value=None):
+            nyaa.scrape_nyaa_anime_episode('Show', 2020, 1, 5, dict(self.FORMATS), 'tmdb1',
+                                           single_format=single_format)
+        return fmt.call_count
+
+    def test_alias_title_makes_one_request(self):
+        self.assertEqual(self._episode_scrape(single_format=True), 1)
+
+    def test_main_title_tries_every_format(self):
+        self.assertEqual(self._episode_scrape(single_format=False), len(self.FORMATS))
+
+
 if __name__ == '__main__':
     unittest.main()

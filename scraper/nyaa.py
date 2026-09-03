@@ -444,11 +444,33 @@ def test_nyaa_scraper(title: str, year: int, content_type: str, season: int = No
         print(f"Error testing Nyaa scraper: {str(e)}")
         return []
 
-def scrape_nyaa_anime_episode(title: str, year: int, season: int, episode: int, episode_formats: Dict[str, str], tmdb_id: str, is_translated_search: bool = False) -> List[Dict[str, Any]]:
+def pick_single_format(episode_formats: Dict[str, str], tmdb_id: Optional[str]) -> Dict[str, str]:
+    """Reduce a format map to the one format most likely to hit for this show.
+
+    The show's recorded preference (learned from earlier successful searches)
+    wins; otherwise the absolute number, which is how most back-catalog anime
+    is titled; otherwise the first format offered.
+    """
+    if not episode_formats:
+        return episode_formats
+    preferred = None
+    if tmdb_id:
+        try:
+            preferred = get_anime_format(tmdb_id)
+        except Exception as e:
+            logging.debug(f"Could not read anime format preference for {tmdb_id}: {e}")
+    for key in (preferred, 'absolute'):
+        if key and key in episode_formats:
+            return {key: episode_formats[key]}
+    first = next(iter(episode_formats))
+    return {first: episode_formats[first]}
+
+
+def scrape_nyaa_anime_episode(title: str, year: int, season: int, episode: int, episode_formats: Dict[str, str], tmdb_id: str, is_translated_search: bool = False, single_format: bool = False) -> List[Dict[str, Any]]:
     """Scrape Nyaa for an anime episode using different format patterns."""
     all_results = []
     format_results = {}
-    
+
     # Use the passed episode_formats instead of hardcoding
     if not episode_formats:
         # Fallback to hardcoded formats if none provided
@@ -459,6 +481,9 @@ def scrape_nyaa_anime_episode(title: str, year: int, season: int, episode: int, 
             'absolute': f"{((season - 1) * 13) + episode:03d}",  # Using default 13 episodes per season
             'combined': f"S{season:02d}E{((season - 1) * 13) + episode:03d}"  # Using default 13 episodes per season
         }
+    if single_format:
+        episode_formats = pick_single_format(episode_formats, tmdb_id)
+        logging.info(f"Alias search for {title}: using single Nyaa format {list(episode_formats)[0]}")
     
     # Define a function to scrape with a specific format
     def scrape_with_format(format_type, format_pattern):
@@ -558,15 +583,23 @@ def _scrape_nyaa_with_format(title: str, year: int, format_pattern: str, is_tran
 def scrape_nyaa(title: str, year: int, content_type: str = 'movie', season: Optional[int] = None,
                 episode: Optional[int] = None, episode_formats: Optional[Dict[str, str]] = None,
                 tmdb_id: Optional[str] = None, multi: bool = False,
-                is_translated_search: bool = False) -> List[Dict[str, Any]]:
-    """Main Nyaa scraping function."""
+                is_translated_search: bool = False,
+                single_format: bool = False) -> List[Dict[str, Any]]:
+    """Main Nyaa scraping function.
+
+    ``single_format`` restricts an episode search to one episode-number format
+    (the show's recorded preference, else absolute). Alias titles use it: the
+    main title already tried every format, and each extra format is another
+    sequential request against a host that blocks by burst.
+    """
     if content_type.lower() == 'episode' and tmdb_id:
         if multi:
             # For multi-episode requests, search for season packs instead of individual episodes
             return scrape_nyaa_anime_season(title, year, season, tmdb_id, episode_formats, is_translated_search)
         elif episode_formats:
             # For single episode requests with format info
-            return scrape_nyaa_anime_episode(title, year, season, episode, episode_formats, tmdb_id, is_translated_search)
+            return scrape_nyaa_anime_episode(title, year, season, episode, episode_formats, tmdb_id,
+                                             is_translated_search, single_format=single_format)
     
     # Set up default settings
     settings = {

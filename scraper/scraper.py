@@ -25,6 +25,7 @@ from pathlib import Path
 from scraper.functions import *
 from scraper.functions.anime_utils import convert_anime_episode_format_smart, detect_absolute_numbering
 from cli_battery.app.direct_api import DirectAPI
+from utilities.text_script import has_non_latin_letter
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,18 +40,47 @@ except ImportError:
 # Initialize DirectAPI at module level
 direct_api = DirectAPI()
 
-# Any Latin letter. Aliases are used for two different jobs and only one of them
-# wants every script: see where query_aliases is built in scrape().
-_LATIN_RE = re.compile(r'[A-Za-z]')
+# Aliases are used for two different jobs and only one of them wants every
+# script: see select_query_aliases and where it is called in scrape().
+#
+# Ceilings on how many aliases may become scrape QUERIES for one item. Each
+# Latin alias costs a round trip to every title-based scraper; a native-script
+# alias goes to Nyaa alone. Measured 2026-09-02 at a cap of 6: ~10 titles per
+# anime scrape, ~70 HTTP calls, 30s median per item. Both are Scraping settings.
+DEFAULT_MAX_QUERY_ALIASES = 3
+DEFAULT_MAX_NATIVE_QUERY_ALIASES = 1
 
-# Ceiling on how many aliases may become scrape QUERIES for one item. Each alias
-# costs a full round trip per episode format across every enabled scraper, so an
-# uncapped list turns one item into minutes of scrape budget.
-MAX_QUERY_ALIASES = 6
+# Names of a show's spin-offs, OVAs and films appear in its alias list because
+# the metadata provider files them under the parent. They are right to MATCH
+# against (a release titled by them is still this show's release) and wrong to
+# QUERY with: the query returns the spin-off's releases, which the identity
+# gate then has to reject one by one.
+_SPINOFF_ALIAS_RE = re.compile(
+    r'\((?:OAV|OVA|ONA|Specials?|Movie|Film|TV)\)|\b(?:OVA|OAV|Movie|Special|Gekijouban)\s*$',
+    re.IGNORECASE,
+)
 
-# Of those, how many may be native-script names. Only Nyaa answers in them, and
-# only for raws, so they get a tail rather than a share of the budget.
-MAX_NATIVE_QUERY_ALIASES = 2
+
+def select_query_aliases(matching_aliases, origin_names, max_latin, max_native):
+    """Split the aliases worth querying with out of the ones worth matching against.
+
+    Returns ``(latin, native)``: Latin-script names for every title-based
+    scraper, and the origin country's own native-script names for Nyaa only.
+    The two never trade slots -- a native name is useless to Prowlarr and a
+    Latin one is what Nyaa already gets from the main titles.
+    """
+    latin = []
+    native = []
+    origin = set(origin_names or ())
+    for alias in matching_aliases or []:
+        if not alias or _SPINOFF_ALIAS_RE.search(alias):
+            continue
+        if has_non_latin_letter(alias):
+            if alias in origin and len(native) < max_native:
+                native.append(alias)
+        elif len(latin) < max_latin:
+            latin.append(alias)
+    return latin, native
 
 # Trakt keys its alias map by country, while a version's `language_code` setting
 # is a language. Only the countries a language is actually titled in belong here
@@ -416,6 +446,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
 
         # Check if alias usage is disabled
         aliases_disabled = os.path.exists(os.path.join(os.path.dirname(__file__), '.alias_disabled'))
+        native_query_aliases = []
         if aliases_disabled:
             logging.info("Alias usage is temporarily disabled")
             preferred_alias = None
@@ -485,31 +516,20 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 if media_country_code and media_country_code in item_aliases:
                     origin_names = {a for a in (item_aliases.get(media_country_code) or []) if a}
 
-                # Latin first, native script as a small tail. Ordering origin
-                # country first -- correct for MATCHING, where its romaji names
-                # are the point -- spends the whole cap on native script for a
-                # show with many of them: Monogatari's six slots went to five
-                # Japanese names and one Latin, cutting exactly the romaji names
-                # releases are titled with. Releases are Latin by convention, so
-                # Latin gets the budget and the native names get enough slots to
-                # still reach Nyaa's raws.
-                latin = [a for a in matching_aliases if _LATIN_RE.search(a)]
-                native = [a for a in matching_aliases
-                          if not _LATIN_RE.search(a) and a in origin_names]
-                native_budget = min(len(native), MAX_NATIVE_QUERY_ALIASES)
-                query_aliases = (latin[:MAX_QUERY_ALIASES - native_budget]
-                                 + native[:native_budget])
-                if len(query_aliases) < MAX_QUERY_ALIASES:
-                    # One side came up short -- do not waste the leftover slots.
-                    for a in latin + native:
-                        if len(query_aliases) >= MAX_QUERY_ALIASES:
-                            break
-                        if a not in query_aliases:
-                            query_aliases.append(a)
-                if len(query_aliases) < len(matching_aliases):
-                    logging.info(f"Using {len(query_aliases)} of {len(matching_aliases)} aliases as "
-                                 f"scrape queries (dropped non-Latin, non-origin names and capped "
-                                 f"at {MAX_QUERY_ALIASES})")
+                try:
+                    max_latin = int(get_setting('Scraping', 'max_query_aliases',
+                                                DEFAULT_MAX_QUERY_ALIASES))
+                    max_native = int(get_setting('Scraping', 'max_native_query_aliases',
+                                                 DEFAULT_MAX_NATIVE_QUERY_ALIASES))
+                except (TypeError, ValueError):
+                    max_latin, max_native = DEFAULT_MAX_QUERY_ALIASES, DEFAULT_MAX_NATIVE_QUERY_ALIASES
+                query_aliases, native_query_aliases = select_query_aliases(
+                    matching_aliases, origin_names, max(0, max_latin), max(0, max_native))
+                if len(query_aliases) + len(native_query_aliases) < len(matching_aliases):
+                    logging.info(f"Using {len(query_aliases)} Latin + {len(native_query_aliases)} native "
+                                 f"of {len(matching_aliases)} aliases as scrape queries "
+                                 f"(caps {max_latin}/{max_native}; spin-off and non-origin "
+                                 f"native names dropped)")
 
         # Initialize anime-specific variables
         genres = filter_genres(genres)
@@ -1186,7 +1206,9 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
             original_season: Optional[int] = None,
             id_season_map: Optional[int] = None,
             id_episode_map: Optional[int] = None,
-            unavailable_scope: Optional[set] = None
+            unavailable_scope: Optional[set] = None,
+            nyaa_only: bool = False,
+            single_format: bool = False,
         ) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]], Dict[str, float]]:
             start_time = time.time()
             task_timings = {}
@@ -1255,7 +1277,9 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 is_anime=is_anime, # Pass the is_anime flag
                 id_season=id_season_map,
                 id_episode=id_episode_map,
-                unavailable_scope=unavailable_scope
+                unavailable_scope=unavailable_scope,
+                nyaa_only=nyaa_only,
+                single_format=single_format,
             )
             # Every result carries the exact coordinate used to query its
             # scraper.  Downstream code must not infer this from a batch-wide
@@ -1532,10 +1556,15 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                             except Exception as romanize_err:
                                 logging.warning(f"Failed to romanize Japanese title '{original_title_from_metadata}': {romanize_err}")
                         else:
-                            # Not Japanese, use as-is
+                            # Not Japanese, use as-is. A native-script name in
+                            # any other script (Hangul, Cyrillic, ...) is a Nyaa
+                            # query only, like the country aliases below.
                             if original_title_from_metadata.lower() not in tried_titles_lower:
+                                source_kind = ('native_alias'
+                                               if has_non_latin_letter(original_title_from_metadata)
+                                               else 'original_language')
                                 logging.info(f"Adding original language title from metadata for anime: {original_title_from_metadata}")
-                                titles_to_try.append(('original_language', original_title_from_metadata))
+                                titles_to_try.append((source_kind, original_title_from_metadata))
                                 tried_titles_lower.add(original_title_from_metadata.lower())
             except Exception as e:
                 logging.warning(f"Failed to get original title from metadata for {imdb_id}: {e}")
@@ -1553,6 +1582,14 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 if alias.lower() not in tried_titles_lower:
                     logging.info(f"Adding country alias: {alias}")
                     titles_to_try.append(('country_alias', alias))
+                    tried_titles_lower.add(alias.lower())
+
+        # 6. The origin country's native-script names, for Nyaa's raws only.
+        if not aliases_disabled and native_query_aliases:
+            for alias in native_query_aliases:
+                if alias.lower() not in tried_titles_lower:
+                    logging.info(f"Adding native-script alias (Nyaa only): {alias}")
+                    titles_to_try.append(('native_alias', alias))
                     tried_titles_lower.add(alias.lower())
 
         # Execute scraping based on the determined titles with threading and deduplication protection
@@ -1619,7 +1656,11 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                     original_season=original_season,  # Pass original TVDB season before any XEM remapping
                     id_season_map=id_season,      # Resolved coordinate for ID-based scrapers only
                     id_episode_map=id_episode,
-                    unavailable_scope=unavailable_scope
+                    unavailable_scope=unavailable_scope,
+                    # Native-script names are only ever answered by Nyaa, and an
+                    # alias title gets one Nyaa format rather than all of them.
+                    nyaa_only=(source == 'native_alias'),
+                    single_format=(source not in ['original', 'original_language', 'original_language_romanized', 'romanized_alias']),
                 )
                 logging.debug(f"[scrape_main] _do_scrape for '{search_title}' returned: passed={len(filtered_results)}, filtered_out={len(filtered_out_results if filtered_out_results else [])}")
                 
