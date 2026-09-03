@@ -32,7 +32,7 @@ from .cinemeta_client import fetch_cinemeta_episode_map
 from . import tvdb_client
 from . import trakt_auth
 from .staleness import is_stale, should_recheck_null_airdate, is_tmdb_mapping_stale
-from .xem_utils import fetch_xem_mapping
+from .xem_utils import fetch_xem_mapping, fetch_xem_names
 
 # Special-case: Lego Masters US season renumbering
 LEGO_MASTERS_US_IMDB_ID = "tt9615014"
@@ -491,18 +491,51 @@ def _upsert_season_titles(item_id: int, seasons_data: dict, session: SqlAlchemyS
     season name is read the same way an alias is -- as matching evidence.
     """
     titles = season_titles_from(seasons_data)
-    existing = session.query(Metadata).filter_by(item_id=item_id, key=SEASON_TITLES_KEY).first()
     if not titles:
         return
-    value = json.dumps(titles)
+    existing = session.query(Metadata).filter_by(item_id=item_id, key=SEASON_TITLES_KEY).first()
+    _merge_season_titles_row(session, item_id, existing, titles, source='provider')
+
+
+def _decode_titles(value) -> Dict[str, List[str]]:
+    try:
+        raw = value
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        return {str(k): [n for n in (v or []) if isinstance(n, str) and n] for k, v in (raw or {}).items()}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _merge_season_titles_row(session: SqlAlchemySession, item_id: int, existing,
+                             titles: Dict[str, List[str]], source: str) -> None:
+    """Union new season names into the row; never drop names another source added.
+
+    ``provider`` records which sources have contributed ('provider', 'xem'),
+    which is how the XEM names fetch knows it has already run for a show.
+    """
+    merged = _decode_titles(existing.value) if existing else {}
+    for season, names in (titles or {}).items():
+        bucket = merged.setdefault(str(season), [])
+        for name in names:
+            if name not in bucket:
+                bucket.append(name)
+    merged = {k: v for k, v in merged.items() if v}
+    sources = set(filter(None, (existing.provider or '').split(','))) if existing else set()
+    sources.add(source)
+    value = json.dumps(merged)
+    provider = ','.join(sorted(sources))
     now = datetime.now(_get_local_tz())
     if existing:
-        if existing.value != value:
+        if existing.value != value or existing.provider != provider:
             existing.value = value
+            existing.provider = provider
             existing.last_updated = now
     else:
         session.add(Metadata(item_id=item_id, key=SEASON_TITLES_KEY, value=value,
-                             provider='trakt', last_updated=now))
+                             provider=provider, last_updated=now))
 
 
 def _upsert_seasons_and_episodes(item_id: int, seasons_data: dict, session: SqlAlchemySession):
@@ -692,51 +725,77 @@ def _xem_fetch_plan(item: Item, session: SqlAlchemySession, metadata_dict: dict)
     touched a show without a mapping. The TTL on an empty entry depends on WHY
     it is empty -- see _xem_entry_is_stale.
     """
-    if 'xem_mapping' in metadata_dict:
-        if metadata_dict.get('xem_mapping'):
-            return None
-        if not _xem_entry_is_stale(item, session):
-            return None
     ids = metadata_dict.get('ids', {})
     tvdb_id = ids.get('tvdb') if isinstance(ids, dict) else None
     if not tvdb_id:
         return None
-    return item.id, tvdb_id
+    need_mapping = True
+    if 'xem_mapping' in metadata_dict:
+        if metadata_dict.get('xem_mapping'):
+            need_mapping = False
+        elif not _xem_entry_is_stale(item, session):
+            need_mapping = False
+    # Per-season scene names are fetched once per show, whether or not it has
+    # a numbering mapping: they are what let an arc-named release be matched.
+    titles_row = session.query(Metadata).filter_by(item_id=item.id, key=SEASON_TITLES_KEY).first()
+    need_names = not (titles_row and 'xem' in (titles_row.provider or ''))
+    if not need_mapping and not need_names:
+        return None
+    return item.id, tvdb_id, need_mapping, need_names
 
 
-def _xem_fetch_and_store(plan: Optional[Tuple[int, int]], metadata_dict: dict) -> None:
-    """Run the XEM fetch for a plan and persist the outcome in its own session."""
+def _xem_fetch_and_store(plan, metadata_dict: dict) -> None:
+    """Run the XEM fetches for a plan and persist the outcome in its own session."""
     if not plan:
         return
-    item_id, tvdb_id = plan
-    try:
-        xem_data = fetch_xem_mapping(tvdb_id)
-    except Exception as e:
-        logger.error(f"XEM fetch error for item {item_id}: {e}")
-        return
-    if xem_data is None:
-        # No answer. Keep whatever is stored (an older definitive answer is
-        # better than nothing) and only leave a short-TTL placeholder when
-        # there is no row at all, so the next scrape asks again soon.
-        value, provider, overwrite = [], _XEM_UNAVAILABLE_PROVIDER, False
-    else:
-        value, provider, overwrite = list(xem_data), _XEM_PROVIDER, True
-    if overwrite or 'xem_mapping' not in metadata_dict:
-        metadata_dict['xem_mapping'] = value
+    item_id, tvdb_id = plan[0], plan[1]
+    need_mapping = plan[2] if len(plan) > 2 else True
+    need_names = plan[3] if len(plan) > 3 else False
+
+    xem_data = None
+    if need_mapping:
+        try:
+            xem_data = fetch_xem_mapping(tvdb_id)
+        except Exception as e:
+            logger.error(f"XEM fetch error for item {item_id}: {e}")
+            need_mapping = False
+    names = None
+    if need_names:
+        try:
+            names = fetch_xem_names(tvdb_id)
+        except Exception as e:
+            logger.debug(f"XEM names fetch error for item {item_id}: {e}")
+            names = None
+
+    if need_mapping:
+        if xem_data is None:
+            # No answer. Keep whatever is stored (an older definitive answer is
+            # better than nothing) and only leave a short-TTL placeholder when
+            # there is no row at all, so the next scrape asks again soon.
+            value, provider, overwrite = [], _XEM_UNAVAILABLE_PROVIDER, False
+        else:
+            value, provider, overwrite = list(xem_data), _XEM_PROVIDER, True
+        if overwrite or 'xem_mapping' not in metadata_dict:
+            metadata_dict['xem_mapping'] = value
     now = datetime.now(_get_local_tz())
     try:
         with managed_session() as session:
-            existing = session.query(Metadata).filter_by(item_id=item_id, key='xem_mapping').first()
-            if existing:
-                if overwrite:
-                    existing.value = json.dumps(value)
-                    existing.provider = provider
-                    existing.last_updated = now
-            else:
-                session.add(Metadata(
-                    item_id=item_id, key='xem_mapping',
-                    value=json.dumps(value), provider=provider, last_updated=now,
-                ))
+            if need_mapping:
+                existing = session.query(Metadata).filter_by(item_id=item_id, key='xem_mapping').first()
+                if existing:
+                    if overwrite:
+                        existing.value = json.dumps(value)
+                        existing.provider = provider
+                        existing.last_updated = now
+                else:
+                    session.add(Metadata(
+                        item_id=item_id, key='xem_mapping',
+                        value=json.dumps(value), provider=provider, last_updated=now,
+                    ))
+            if names is not None:
+                # {} (no show) still marks the fetch done so it is not repeated.
+                titles_row = session.query(Metadata).filter_by(item_id=item_id, key=SEASON_TITLES_KEY).first()
+                _merge_season_titles_row(session, item_id, titles_row, names, source='xem')
     except Exception as e:
         logger.error(f"XEM store error for item {item_id}: {e}")
 

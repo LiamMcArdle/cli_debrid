@@ -5,6 +5,7 @@ every empty entry after six hours -- from inside get_show_metadata's cache-hit
 path, for every show without a mapping, on every scrape cycle.
 """
 
+import json
 import unittest
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
@@ -63,9 +64,22 @@ class FetchContract(unittest.TestCase):
             self.assertIsNone(xem_utils.fetch_xem_mapping(123))
 
 
-def _session_with_row(row):
+def _session_with_row(row, titles_row='fetched'):
+    """A session whose xem_mapping lookup returns `row`.
+
+    The season_titles lookup returns a row already marked as having had its
+    XEM names fetched, so the mapping logic under test is isolated; pass
+    titles_row=None to exercise the names fetch.
+    """
     session = MagicMock()
-    session.query.return_value.filter_by.return_value.first.return_value = row
+    if titles_row == 'fetched':
+        titles_row = MagicMock(provider='provider,xem', value='{}')
+
+    def filter_by(**kwargs):
+        q = MagicMock()
+        q.first.return_value = titles_row if kwargs.get('key') == 'season_titles' else row
+        return q
+    session.query.return_value.filter_by.side_effect = filter_by
     return session
 
 
@@ -86,7 +100,14 @@ class FetchPlan(unittest.TestCase):
 
     def test_missing_entry_is_fetched(self):
         md = {'ids': {'tvdb': 1}}
-        self.assertEqual(_xem_fetch_plan(self.item, _session_with_row(None), md), (7, 1))
+        self.assertEqual(_xem_fetch_plan(self.item, _session_with_row(None), md), (7, 1, True, False))
+
+    def test_names_are_fetched_once_even_with_a_populated_mapping(self):
+        md = {'xem_mapping': [{'scene': {}}], 'ids': {'tvdb': 1}}
+        plan = _xem_fetch_plan(self.item, _session_with_row(None, titles_row=None), md)
+        self.assertEqual(plan, (7, 1, False, True))
+        already = MagicMock(provider='provider,xem', value='{}')
+        self.assertIsNone(_xem_fetch_plan(self.item, _session_with_row(None, titles_row=already), md))
 
     def test_no_tvdb_id_means_nothing_to_ask(self):
         self.assertIsNone(_xem_fetch_plan(self.item, _session_with_row(None), {'ids': {}}))
@@ -99,28 +120,46 @@ class FetchPlan(unittest.TestCase):
     def test_old_definitive_empty_is_refetched(self):
         md = {'xem_mapping': [], 'ids': {'tvdb': 1}}
         session = _session_with_row(_row(_XEM_PROVIDER, timedelta(days=31)))
-        self.assertEqual(_xem_fetch_plan(self.item, session, md), (7, 1))
+        self.assertEqual(_xem_fetch_plan(self.item, session, md), (7, 1, True, False))
 
     def test_unavailable_placeholder_is_refetched_after_hours(self):
         md = {'xem_mapping': [], 'ids': {'tvdb': 1}}
         self.assertIsNone(_xem_fetch_plan(
             self.item, _session_with_row(_row(_XEM_UNAVAILABLE_PROVIDER, timedelta(hours=5))), md))
         self.assertEqual(_xem_fetch_plan(
-            self.item, _session_with_row(_row(_XEM_UNAVAILABLE_PROVIDER, timedelta(hours=7))), md), (7, 1))
+            self.item, _session_with_row(_row(_XEM_UNAVAILABLE_PROVIDER, timedelta(hours=7))), md), (7, 1, True, False))
 
 
 class FetchAndStore(unittest.TestCase):
-    def _run(self, fetched, existing_row, md):
-        session = _session_with_row(existing_row)
+    def _run(self, fetched, existing_row, md, plan=(7, 1, True, False), names=None, titles_row='fetched'):
+        session = _session_with_row(existing_row, titles_row=titles_row)
 
         @contextmanager
         def fake_session():
             yield session
 
         with patch.object(direct_api, 'fetch_xem_mapping', return_value=fetched), \
+                patch.object(direct_api, 'fetch_xem_names', return_value=names), \
                 patch.object(direct_api, 'managed_session', fake_session):
-            _xem_fetch_and_store((7, 1), md)
+            _xem_fetch_and_store(plan, md)
         return session
+
+    def test_names_are_merged_into_season_titles_and_marked(self):
+        titles_row = MagicMock(provider='provider', value=json.dumps({'17': ['Thousand-Year Blood War']}))
+        self._run(None, None, {}, plan=(7, 1, False, True),
+                  names={'17': ['Bleach - Sennen Kessen-hen']}, titles_row=titles_row)
+        self.assertEqual(json.loads(titles_row.value),
+                         {'17': ['Thousand-Year Blood War', 'Bleach - Sennen Kessen-hen']})
+        self.assertEqual(titles_row.provider, 'provider,xem')
+
+    def test_no_show_names_answer_still_marks_the_fetch_done(self):
+        session = self._run(None, None, {}, plan=(7, 1, False, True), names={}, titles_row=None)
+        session.add.assert_called_once()
+        self.assertEqual(session.add.call_args.args[0].provider, 'xem')
+
+    def test_failed_names_fetch_leaves_no_marker(self):
+        session = self._run(None, None, {}, plan=(7, 1, False, True), names=None, titles_row=None)
+        session.add.assert_not_called()
 
     def test_definitive_answer_overwrites_and_is_marked_xem(self):
         row = _row(_XEM_UNAVAILABLE_PROVIDER, timedelta(hours=7))

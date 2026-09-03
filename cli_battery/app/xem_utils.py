@@ -5,6 +5,56 @@ from typing import Optional, List, Dict, Any
 from .logger_config import logger
 
 XEM_API_URL = "https://thexem.info/map/all"
+XEM_NAMES_URL = "https://thexem.info/map/names"
+_XEM_HEADERS = {'User-Agent': 'cli_debrid/1.0 (https://github.com/godver3/cli_debrid)'}
+
+
+def fetch_xem_names(tvdb_id: int) -> Optional[Dict[str, List[str]]]:
+    """Per-season scene names from TheXEM: {season_number: [names]}.
+
+    This is where the release groups' own names for a season live -- for
+    Bleach S17 both 'Thousand-Year Blood War' and 'Sennen Kessen-hen'. The
+    provider's season title covers the first; nothing else covers the second.
+    Returns {} when XEM has no show under the id (definitive), None when no
+    answer was obtained. Season 0 is dropped: its names are never distinctive.
+    """
+    global _xem_blocked_until
+    if not tvdb_id:
+        return None
+    if time.time() < _xem_blocked_until:
+        return None
+    try:
+        response = requests.get(XEM_NAMES_URL, params={'id': tvdb_id, 'origin': 'tvdb'},
+                                headers=_XEM_HEADERS, timeout=15)
+        if response.status_code == 403:
+            _xem_blocked_until = time.time() + _XEM_COOLDOWN_SECONDS
+            logger.warning(f"TheXEM returned 403 for names of TVDB ID {tvdb_id}. Pausing XEM requests for {_XEM_COOLDOWN_SECONDS}s.")
+            return None
+        response.raise_for_status()
+        data = response.json()
+        if data.get("result") != "success":
+            if "no show with the" in str(data.get("message", "")):
+                return {}
+            return None
+        names: Dict[str, List[str]] = {}
+        for season, by_country in (data.get("data") or {}).items():
+            try:
+                if int(season) < 1:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            collected = []
+            values = by_country.values() if isinstance(by_country, dict) else [by_country]
+            for group in values:
+                for name in (group or []):
+                    if isinstance(name, str) and name.strip() and name not in collected:
+                        collected.append(name.strip())
+            if collected:
+                names[str(int(season))] = collected
+        return names
+    except Exception as e:
+        logger.debug(f"Error requesting XEM names for TVDB ID {tvdb_id}: {e}")
+        return None
 
 # Simple circuit breaker: if XEM returns 403 (IP/rate blocked), pause all
 # requests for _XEM_COOLDOWN_SECONDS to avoid hammering the server.
