@@ -228,6 +228,9 @@ def update_media_item_state(item_id, state, **kwargs):
                 query += ", next_retry_at = NULL"
             if 'dormant_cycles' not in kwargs:
                 query += ", dormant_cycles = 0"
+            # An exhausted-blacklisted row that a pack fills leaves Blacklisted
+            # through Checking; its blacklist date must not linger.
+            query += ", blacklisted_date = NULL"
         # A deadline only means something while the item is asleep. Left on a
         # row that woke into Wanted/Scraping it reads as a live hold and
         # misleads anyone counting them; the rung (sleep_cycles) is kept.

@@ -15,6 +15,29 @@ from .torrent_processor import TorrentProcessor
 from .media_matcher import MediaMatcher
 from database.torrent_tracking import update_adding_error
 
+
+def _related_fill_candidates(item):
+    """Every episode of this show a pack for it may fill, from the database.
+
+    Wanted and Scraping as before, plus the rows the retry ladder has parked in
+    Sleeping or Dormant, plus rows it exhausted into Blacklisted -- but never a
+    row a person blacklisted (queues.states.is_fillable_by_pack). Version and
+    title agreement are checked by find_related_items itself.
+    """
+    imdb_id = item.get('imdb_id')
+    if not imdb_id or item.get('type') != 'episode':
+        return []
+    try:
+        from database.database_reading import get_all_media_items
+        from queues.states import RELATED_FILL_STATES, is_fillable_by_pack
+        rows = get_all_media_items(state=list(RELATED_FILL_STATES), media_type='episode', imdb_id=imdb_id)
+        candidates = [row for row in rows if row.get('id') != item.get('id') and is_fillable_by_pack(row)]
+        logging.debug(f"Related-fill candidates for {imdb_id}: {len(candidates)} of {len(rows)} rows eligible.")
+        return candidates
+    except Exception as e:
+        logging.error(f"Could not load related-fill candidates for {imdb_id}: {e}")
+        return []
+
 class AddingQueue:
     """Manages the queue of items being added to the debrid service"""
     
@@ -241,23 +264,13 @@ class AddingQueue:
 
         logging.info(f"Adding Queue - Starting processing of {len(items_to_process)} available items")
             
-        # --- START EDIT: Get Wanted Queue items ONCE before the loop ---
-        wanted_items = []
-        scraping_items = []
-        try:
-            if 'Wanted' in queue_manager.queues:
-                wanted_items = queue_manager.queues['Wanted'].get_contents()
-                logging.debug(f"Fetched {len(wanted_items)} items from Wanted queue for related item check.")
-            else:
-                logging.warning("Wanted queue not found in QueueManager.")
-            if 'Scraping' in queue_manager.queues:
-                 scraping_items = queue_manager.queues['Scraping'].get_contents()
-                 logging.debug(f"Fetched {len(scraping_items)} items from Scraping queue for related item check.")
-            else:
-                 logging.warning("Scraping queue not found in QueueManager.")
-        except Exception as e:
-            logging.error(f"Error getting Wanted/Scraping queue contents: {e}")
-        # --- END EDIT ---
+        # Related-item candidates are fetched per item from the database (see
+        # _related_fill_candidates) rather than snapshotted from the in-memory
+        # Wanted/Scraping queues: the retry ladder parks most of a show's
+        # unfilled episodes in Sleeping/Dormant, which those snapshots never
+        # contained, so a season pack filled only the few siblings that
+        # happened to be Wanted at that instant and the rest re-added the same
+        # pack later, one at a time.
 
         # --- START EDIT: Fetch setting from Queue section ---
         try:
@@ -756,8 +769,8 @@ class AddingQueue:
                     # is for a specific season, related item matching is restricted to that season.
                     related_matches = self.media_matcher.find_related_items(
                         parsed_torrent_files,
-                        scraping_items, # Fetched before loop
-                        wanted_items,   # Fetched before loop
+                        [],                                   # candidates come from the DB now
+                        _related_fill_candidates(item),
                         item,           # Original item for context
                         xem_mapping=xem_mapping, # Pass XEM mapping for season context
                         torrent_title=torrent_title, # Pass torrent title for enhanced season detection

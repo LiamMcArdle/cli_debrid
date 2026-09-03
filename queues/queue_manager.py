@@ -717,10 +717,15 @@ class QueueManager:
     ):
         item_identifier = self.generate_identifier(item)
 
-        # GHOSTLIST CHECK: Prevent ghostlisted/blacklisted items from being moved to Checking
+        # GHOSTLIST CHECK: Prevent ghostlisted/blacklisted items from being moved to Checking.
+        # A row the retry ladder exhausted is the exception: it is blacklisted
+        # because nothing could be FOUND for it, so a pack that turns up with its
+        # file is exactly the supply it was waiting for. A row a person
+        # blacklisted stays blocked.
+        from queues.states import is_exhausted_blacklist
         item_state = item.get('state', '')
         is_ghostlisted = item.get('ghostlisted') == 1
-        is_blacklisted = item_state == 'Blacklisted'
+        is_blacklisted = item_state == 'Blacklisted' and not is_exhausted_blacklist(item)
 
         if is_ghostlisted or is_blacklisted:
             logging.warning(f"⛔ BLOCKED: Attempted to move {'ghostlisted' if is_ghostlisted else 'blacklisted'} item {item_identifier} to Checking from {from_queue} - operation blocked")

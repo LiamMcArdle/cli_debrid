@@ -111,6 +111,7 @@ class CounterPersistence(unittest.TestCase):
         conn.execute('''CREATE TABLE media_items (
             id INTEGER PRIMARY KEY, state TEXT, last_updated TIMESTAMP,
             fall_back_to_single_scraper BOOLEAN DEFAULT 1, dormant_cycles INTEGER DEFAULT 0,
+            blacklisted_date TIMESTAMP,
             filled_by_title TEXT, filled_by_magnet TEXT, filled_by_file TEXT,
             filled_by_torrent_id TEXT, scrape_results TEXT, version TEXT,
             resolution TEXT, upgrading_from TEXT, debrid_folder_name TEXT,
