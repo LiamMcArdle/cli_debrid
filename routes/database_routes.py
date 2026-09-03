@@ -18,6 +18,13 @@ import time # Added for caching
 from utilities.phalanx_db_cache_manager import PhalanxDBClassManager
 from database.torrent_tracking import get_torrent_history
 from utilities.web_scraper import get_media_meta
+
+# States the bulk 'move' action may write. The form value used to go straight
+# into the UPDATE, so a typo minted a state nothing would ever process.
+MOVABLE_STATES = frozenset({
+    'Wanted', 'Scraping', 'Adding', 'Checking', 'Sleeping', 'Dormant', 'Unreleased',
+    'Blacklisted', 'Collected', 'Upgrading', 'Pending Uncached', 'Final_Check',
+})
 from queues.config_manager import get_content_source_display_names, load_config
 from database import update_media_item_state
 from utilities.local_library_scan import convert_item_to_symlink
@@ -814,13 +821,21 @@ def bulk_queue_action():
                         
             elif action == 'move' and target_queue:
                 logging.info("Entering 'move' block.")
-                # Keep existing move functionality
+                if target_queue not in MOVABLE_STATES:
+                    return jsonify({'success': False,
+                                    'error': f"Unknown target queue '{target_queue}'"}), 400
                 conn = get_db_connection()
                 try:
                     cursor = conn.cursor()
                     placeholders = ','.join('?' * len(batch))
+                    # A move back to Wanted is a deliberate second chance, so the
+                    # retry ladder starts over. Without this a row moved out of
+                    # Dormant/Blacklisted kept its terminal rung and exhaustion
+                    # count and bounced straight back on its first failure.
+                    ladder_reset = (", sleep_cycles = 0, next_retry_at = NULL, dormant_cycles = 0"
+                                    if target_queue == 'Wanted' else "")
                     cursor.execute(
-                        f'UPDATE media_items SET state = ?, last_updated = ? WHERE id IN ({placeholders})',
+                        f'UPDATE media_items SET state = ?, last_updated = ?{ladder_reset} WHERE id IN ({placeholders})',
                         [target_queue, datetime.now()] + batch
                     )
                     total_processed += cursor.rowcount
@@ -1298,7 +1313,10 @@ def bulk_queue_action():
                                    upgrading = NULL,
                                    version = {version_case_final_sql},
                                    fall_back_to_single_scraper = 0,
-                                   last_updated = ? 
+                                   sleep_cycles = 0,
+                                   next_retry_at = NULL,
+                                   dormant_cycles = 0,
+                                   last_updated = ?
                                WHERE id IN ({placeholders_for_in_clause})"""
 
                         sql_params_for_final_db_update = params_for_rescrape_title_case_values + params_for_version_case_values + [datetime.now()] + item_ids_for_update_clause
@@ -1650,6 +1668,9 @@ def rescrape_single_item(item_id):
                    upgrading = NULL,
                    version = ?,
                    fall_back_to_single_scraper = 0,
+                   sleep_cycles = 0,
+                   next_retry_at = NULL,
+                   dormant_cycles = 0,
                    last_updated = ?
                WHERE id = ?""",
             (item_db_data.get('original_scraped_torrent_title'), cleaned_version_val, datetime.now(), item_id)

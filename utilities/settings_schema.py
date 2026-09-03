@@ -504,7 +504,7 @@ SETTINGS_SCHEMA = {
         },
         "retry_ladder_minutes": {
             "type": "string",
-            "description": "Escalating retry backoff for failed scrapes, in minutes, comma separated. After the last rung the item moves to Dormant and is re-checked periodically forever - it is never blacklisted. Leave empty for no retries (first failure goes straight to Dormant).",
+            "description": "Escalating retry backoff for failed scrapes, in minutes, comma separated. After the last rung the item moves to Dormant and is re-checked periodically; see dormant_cycles_before_blacklist. Leave empty for no retries (first failure goes straight to Dormant).",
             "default": "30,360,1440,4320,10080"
         },
         "retry_ladder_old_item_start_rung": {
@@ -527,9 +527,15 @@ SETTINGS_SCHEMA = {
         },
         "dormant_recheck_days": {
             "type": "number",
-            "description": "How often a Dormant item is re-scraped. Dormant items are re-checked forever and are never automatically blacklisted.",
+            "description": "How often a Dormant item is re-scraped.",
             "default": 7,
             "min": 1
+        },
+        "dormant_cycles_before_blacklist": {
+            "type": "integer",
+            "description": "After this many Dormant cycles without a usable result the item is blacklisted (that one item only, never its siblings). A manual requeue clears it. 0 keeps re-checking forever.",
+            "default": 3,
+            "min": 0
         },
         "dormant_batch_size": {
             "type": "integer",

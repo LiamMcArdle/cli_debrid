@@ -6,13 +6,14 @@ from utilities.settings import get_setting
 
 
 class DormantQueue:
-    """Terminal-but-not-permanent home for items the retry ladder could not fill.
+    """Long-interval home for items the retry ladder could not fill.
 
-    Dormant is the replacement for automatic blacklisting. An item lands here
-    after walking the whole escalating ladder without a single usable scrape
-    result. It keeps its row, its version and its ``last_scrape_failure``
-    record, and it is re-scraped every ``Queue.dormant_recheck_days`` --
-    forever. Nothing in this queue can write ``state='Blacklisted'``.
+    An item lands here after walking the whole escalating ladder without a
+    single usable scrape result. It keeps its row, its version and its
+    ``last_scrape_failure`` record, and it is re-scraped every
+    ``Queue.dormant_recheck_days``. After ``Queue.dormant_cycles_before_blacklist``
+    such cycles QueueManager.move_to_dormant blacklists that one item instead
+    (stage ``'exhausted'``); nothing in this queue writes that state itself.
 
     Like BlacklistedQueue and UnreleasedQueue this is DB-backed: the population
     is expected to be tens of thousands of rows, so it is never loaded into

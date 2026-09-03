@@ -415,6 +415,13 @@ def migrate_schema():
         if 'last_scrape_failure' not in columns:
             conn.execute('ALTER TABLE media_items ADD COLUMN last_scrape_failure TEXT')
             logging.info("Added last_scrape_failure column to media_items table.")
+        # dormant_cycles counts how many times an item has entered Dormant. On
+        # the Kth entry (Queue.dormant_cycles_before_blacklist) the item is
+        # blacklisted instead -- the one automatic route to Blacklisted, and it
+        # only ever touches the single exhausted row.
+        if 'dormant_cycles' not in columns:
+            conn.execute('ALTER TABLE media_items ADD COLUMN dormant_cycles INTEGER DEFAULT 0')
+            logging.info("Added dormant_cycles column to media_items table.")
 
         # Migrate data from legacy plex_* columns to ms_* columns (one-time migration)
         # Only runs when plex_rating_key data exists AND ms_item_id is completely unpopulated
@@ -884,7 +891,7 @@ def _verify_retry_ladder_columns():
     otherwise leave the program running against a schema it cannot write.
     """
     from database import get_db_connection
-    required = ('next_retry_at', 'last_scrape_failure', 'sleep_cycles')
+    required = ('next_retry_at', 'last_scrape_failure', 'sleep_cycles', 'dormant_cycles')
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -1004,6 +1011,7 @@ def create_tables():
                 sleep_cycles INTEGER DEFAULT 0,
                 next_retry_at TIMESTAMP,
                 last_scrape_failure TEXT,
+                dormant_cycles INTEGER DEFAULT 0,
                 last_checked TIMESTAMP,
                 scrape_results TEXT,
                 version TEXT,

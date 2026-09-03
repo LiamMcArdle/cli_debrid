@@ -7,9 +7,13 @@ and ``media_items.next_retry_at`` holds the absolute deadline -- so the backoff
 survives process restarts and settings saves, neither of which the old in-memory
 ``SleepingQueue.sleeping_queue_times`` dict did.
 
-When the ladder is exhausted the item moves to the terminal ``Dormant`` state,
-which is re-checked every ``Queue.dormant_recheck_days``, forever. Nothing in
-this module or its callers ever writes ``state='Blacklisted'``.
+When the ladder is exhausted the item moves to ``Dormant``, which is re-checked
+every ``Queue.dormant_recheck_days``. Each Dormant entry counts; on the Kth
+(``Queue.dormant_cycles_before_blacklist``) QueueManager.move_to_dormant
+blacklists that one item instead, tagged stage ``'exhausted'``. That is the
+only automatic route to ``state='Blacklisted'``: never a sibling, never on a
+transient error, never before K full ladders. Nothing in this module writes
+that state itself.
 
 Timestamps are always Python ``datetime`` objects, never ISO strings. The
 ``last_updated``/``next_retry_at`` columns are written through the sqlite3

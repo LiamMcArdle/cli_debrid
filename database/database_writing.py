@@ -196,6 +196,7 @@ def update_media_item_state(item_id, state, **kwargs):
             'next_retry_at',
             'last_scrape_failure',
             'fall_back_to_single_scraper',
+            'dormant_cycles',
         ]
         for field in optional_fields:
             if field in kwargs:
@@ -225,6 +226,8 @@ def update_media_item_state(item_id, state, **kwargs):
                 query += ", sleep_cycles = 0"
             if 'next_retry_at' not in kwargs:
                 query += ", next_retry_at = NULL"
+            if 'dormant_cycles' not in kwargs:
+                query += ", dormant_cycles = 0"
         # A deadline only means something while the item is asleep. Left on a
         # row that woke into Wanted/Scraping it reads as a live hold and
         # misleads anyone counting them; the rung (sleep_cycles) is kept.

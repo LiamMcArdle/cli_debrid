@@ -542,6 +542,11 @@ class QueueManager:
             wake_params['fall_back_to_single_scraper'] = False
         elif from_queue == "Sleeping" and not self._woke_from_hold(item):
             wake_params['fall_back_to_single_scraper'] = False
+        if from_queue == "Blacklisted":
+            # Leaving Blacklisted is a deliberate second chance: the ladder starts
+            # over, or an exhausted item would be re-blacklisted on its first
+            # Dormant entry.
+            wake_params.update(sleep_cycles=0, next_retry_at=None, dormant_cycles=0)
 
         updated_item = self._move_item_to_queue(item, from_queue, "Wanted", "Wanted", new_version=new_version,
                                                 filled_by_title=None, filled_by_magnet=None,
@@ -832,15 +837,23 @@ class QueueManager:
 
     def move_to_dormant(self, item: Dict[str, Any], from_queue: str,
                         failure_record: str = None):
-        """Move an item to the terminal Dormant state.
+        """Move an item to Dormant, or blacklist it once Dormant has been exhausted.
 
-        Dormant is NOT the blacklist. The item keeps its row and its version and
-        is re-scraped every ``Queue.dormant_recheck_days``, forever. After this
-        change state='Blacklisted' is reachable only from manual_blacklist.json
-        enforcement (WantedQueue.move_blacklisted_items), the UI
-        delete/blacklist routes, and the out-of-repo slop_cleanup script.
+        Dormant is re-scraped every ``Queue.dormant_recheck_days``. Each entry
+        increments ``dormant_cycles``; the Kth entry
+        (``Queue.dormant_cycles_before_blacklist``, 0 = never) blacklists the
+        item instead, tagged with a ``last_scrape_failure`` stage of
+        ``'exhausted'`` so it can be told apart from a manual blacklist.
+
+        That is the ONE automatic route to state='Blacklisted', and it touches
+        the single exhausted row: never a sibling, never on a transient error,
+        never before K full ladders. The August cascades (a dead scrape
+        coordinate blacklisting a whole season, an add failure sweeping the
+        episode table) stay gone. Without it the active pool never shrank: 195
+        shows with no collection in a fortnight held 1,659 rows that were
+        re-scraped every week forever.
         """
-        from queues.retry_ladder import get_dormant_interval
+        from queues.retry_ladder import get_dormant_interval, build_failure_record
 
         item_identifier = self.generate_identifier(item)
 
@@ -853,10 +866,32 @@ class QueueManager:
             logging.warning(f"⛔ BLOCKED: Attempted to move {'ghostlisted' if is_ghostlisted else 'blacklisted'} item {item_identifier} to Dormant from {from_queue} - operation blocked")
             return  # Block the move to Dormant
 
+        try:
+            cycles_done = int(item.get('dormant_cycles') or 0)
+        except (TypeError, ValueError):
+            cycles_done = 0
+        try:
+            exhaust_after = int(get_setting("Queue", "dormant_cycles_before_blacklist", 3))
+        except (TypeError, ValueError):
+            exhaust_after = 3
+        if exhaust_after > 0 and cycles_done + 1 >= exhaust_after:
+            record = build_failure_record(
+                stage='exhausted', error=f"{cycles_done + 1} Dormant cycles without a usable result")
+            logging.info(
+                f"Item {item_identifier} has exhausted {cycles_done + 1} Dormant cycle(s) "
+                f"(cap {exhaust_after}) in {from_queue}. Blacklisting this item only; a "
+                f"manual requeue resets it."
+            )
+            from database import update_media_item
+            update_media_item(item['id'], last_scrape_failure=record, dormant_cycles=cycles_done + 1)
+            item['last_scrape_failure'] = record
+            self.move_to_blacklisted(item, from_queue)
+            return
+
         next_retry_at = datetime.now() + get_dormant_interval()
         logging.info(
             f"Moving item {item_identifier} to Dormant from {from_queue} "
-            f"(next re-check {next_retry_at.isoformat(timespec='seconds')})"
+            f"(cycle {cycles_done + 1}, next re-check {next_retry_at.isoformat(timespec='seconds')})"
         )
 
         # sleep_cycles is left at its terminal value on purpose: a Dormant item
@@ -868,6 +903,7 @@ class QueueManager:
         # with a genuinely Collected row in the reconcile_queues duplicate sweep.
         extra = {
             'next_retry_at': next_retry_at,
+            'dormant_cycles': cycles_done + 1,
             'filled_by_title': None,
             'filled_by_magnet': None,
             'filled_by_torrent_id': None,
