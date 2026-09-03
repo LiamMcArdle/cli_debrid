@@ -6,7 +6,14 @@ from .logger_config import logger
 
 XEM_API_URL = "https://thexem.info/map/all"
 XEM_NAMES_URL = "https://thexem.info/map/names"
-_XEM_HEADERS = {'User-Agent': 'cli_debrid/1.0 (https://github.com/godver3/cli_debrid)'}
+# TheXEM answers 403 to the app's own User-Agent string (measured 2026-09-03:
+# 160 of 160 mapping requests in one hour), which had silently disabled XEM
+# for every show. It answers 200 to an ordinary browser UA -- the same one
+# scraper/torrentio.py already sends.
+_XEM_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json',
+}
 
 
 def fetch_xem_names(tvdb_id: int) -> Optional[Dict[str, List[str]]]:
@@ -91,9 +98,7 @@ def fetch_xem_mapping(tvdb_id: int) -> Optional[List[Dict[str, Any]]]:
 
     params = {'id': tvdb_id, 'origin': 'tvdb'}
     url = f"{XEM_API_URL}"
-    headers = {
-        'User-Agent': 'cli_debrid/1.0 (https://github.com/godver3/cli_debrid)'
-    }
+    headers = _XEM_HEADERS
 
     try:
         logger.info(f"Querying TheXEM for TVDB ID {tvdb_id}...")
