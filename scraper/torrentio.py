@@ -9,7 +9,8 @@ import time
 import random
 from http.client import RemoteDisconnected
 
-from scraper.scrape_status import ScraperUnavailable
+from scraper.scrape_status import ScraperUnavailable, ScraperParked
+from scraper.park import PARKS, park_remaining, trip as park_trip
 
 # qualityfilter=480p strips sub-1080p releases AT SOURCE, before any local
 # filter can see them — which silently removes ~24% of back-catalog results and
@@ -88,6 +89,16 @@ def fetch_data(url: str) -> Dict:
     completed request that carried no usable payload, so callers can tell
     'upstream has nothing' apart from 'we never got an answer'.
     """
+    remaining = park_remaining('Torrentio')
+    if remaining > 0:
+        # Torrentio limits by IP as well, so re-asking during a block only holds
+        # it open. Skipping costs no round trip, which is why this is
+        # ScraperParked and not a plain unavailable: the circuit breaker must
+        # not read our own skip as evidence the scraper is timing out.
+        raise ScraperParked(
+            f"torrentio parked for another {remaining:.0f}s after a 429; skipping {url}",
+            retry_after=remaining)
+
     max_retries = 4
     base_backoff_seconds = 0.5
     headers = {
@@ -98,6 +109,7 @@ def fetch_data(url: str) -> Dict:
         try:
             response = api.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             if response.status_code == 200:
+                PARKS['Torrentio'].clear()
                 return response.json()
             # Non-200 that did not raise: treat rate limits as unavailable,
             # anything else as a completed request with no payload.
@@ -105,9 +117,11 @@ def fetch_data(url: str) -> Dict:
                 # Do not retry. A 429 is upstream saying stop, and retrying it
                 # on a seconds-long backoff is what turns a brief limit into a
                 # standing block: four attempts inside five seconds, twice per
-                # item, was eight requests per coordinate per pass. Hand it to
-                # the retry ladder instead, which waits 30 minutes and — via
-                # the unavailable set — does not spend a rung on it.
+                # item, was eight requests per coordinate per pass. Park the
+                # scraper process-wide so the other items in this pass skip it
+                # outright, and hand it to the retry ladder, which waits and —
+                # via the unavailable set — does not spend a rung on it.
+                park_trip('Torrentio', f"rate limited (429) for {url}")
                 raise ScraperUnavailable(f"torrentio rate limited (429) for {url}")
             if 500 <= response.status_code <= 599:
                 last_error = f"HTTP {response.status_code}"
@@ -132,6 +146,7 @@ def fetch_data(url: str) -> Dict:
             last_error = str(e)
             status_code = getattr(getattr(e, 'response', None), 'status_code', None)
             if status_code == 429:
+                park_trip('Torrentio', f"rate limited (429) for {url}")
                 raise ScraperUnavailable(f"torrentio rate limited (429) for {url}")
             if attempt < max_retries - 1:
                 sleep_seconds = base_backoff_seconds * (2 ** attempt) + random.uniform(0, 0.25)

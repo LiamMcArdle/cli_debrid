@@ -33,6 +33,21 @@ class ScraperUnavailable(Exception):
     """A scrape did not complete. NOT the same as 'upstream returned nothing'."""
 
 
+class ScraperParked(ScraperUnavailable):
+    """We skipped the call because the scraper is already parked.
+
+    Distinct from ScraperUnavailable so the manager can tell a failure we
+    observed from one we predicted: a skip costs no round trip and is no
+    evidence that the scraper is timing out, so it must not count toward the
+    circuit breaker. ``retry_after`` is the park's remaining seconds, which the
+    retry ladder uses to hold past the block instead of waking into it.
+    """
+
+    def __init__(self, message: str, retry_after: float = 0.0):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 def reset_unavailable() -> set:
     """Start a new scope for this thread and return the live set backing it.
 

@@ -6,65 +6,33 @@ from nyaapy.nyaasi.nyaa import Nyaa
 from nyaapy.torrent import Torrent
 from scraper.functions import *
 from database.database_writing import update_anime_format, get_anime_format
-import threading
 import concurrent.futures
 import time
 import re
 import random
 import requests
-from scraper.scrape_status import ScraperUnavailable
+from scraper.scrape_status import ScraperUnavailable, ScraperParked
+from scraper.park import PARKS, park_remaining, trip as park_trip
 
 # Helper - build proxy context for limited environment
 from contextlib import contextmanager
 
-# --- Process-wide 429 cooldown ---------------------------------------------
-# Nyaa sits behind DDoS-Guard, which blocks by IP rather than throttling per
-# request: once tripped, EVERY request 429s, including a plain curl. The
-# per-scrape `unavailable` set is thread-local and only suppresses duplicate
-# attempts inside one scrape, so each new item re-attempted Nyaa and we kept
-# 203 of 203 requests failing at roughly 20/min -- traffic that does nothing
-# but hold the block open. Measured 2026-08-26.
-#
-# So the first 429 parks Nyaa for the whole process. Callers still get
-# ScraperUnavailable, which the retry ladder already reads as 'never asked'
-# rather than 'nothing found', so items are not blacklisted for it.
-_NYAA_COOLDOWN_SECONDS = 900          # 15 minutes
-_NYAA_COOLDOWN_MAX = 7200             # doubles per consecutive trip, capped at 2h
-_nyaa_block_lock = threading.Lock()
-_nyaa_blocked_until = 0.0
-_nyaa_cooldown = _NYAA_COOLDOWN_SECONDS
-
-
+# Nyaa's process-wide 429 cooldown now lives in scraper/park.py, shared with
+# Torrentio; see that module for why a park is process-wide rather than
+# per-scrape. These thin wrappers keep the call sites below readable.
 def _nyaa_cooldown_remaining() -> float:
     """Seconds left on the cooldown, 0 when Nyaa may be queried."""
-    with _nyaa_block_lock:
-        return max(0.0, _nyaa_blocked_until - time.time())
+    return park_remaining('Nyaa')
 
 
 def _nyaa_trip_cooldown() -> float:
     """Park Nyaa after a 429. Doubles on consecutive trips, capped."""
-    global _nyaa_blocked_until, _nyaa_cooldown
-    with _nyaa_block_lock:
-        now = time.time()
-        if now < _nyaa_blocked_until:
-            # Already parked; a racing thread tripped it first.
-            return _nyaa_blocked_until - now
-        if _nyaa_blocked_until and now - _nyaa_blocked_until < _nyaa_cooldown:
-            # Tripped again shortly after the last cooldown expired - back off harder.
-            _nyaa_cooldown = min(_nyaa_cooldown * 2, _NYAA_COOLDOWN_MAX)
-        else:
-            _nyaa_cooldown = _NYAA_COOLDOWN_SECONDS
-        _nyaa_blocked_until = now + _nyaa_cooldown
-        return _nyaa_cooldown
+    return PARKS['Nyaa'].trip()
 
 
 def _nyaa_clear_cooldown() -> None:
     """A successful request means the block lifted; reset the escalation."""
-    global _nyaa_blocked_until, _nyaa_cooldown
-    if _nyaa_blocked_until or _nyaa_cooldown != _NYAA_COOLDOWN_SECONDS:
-        with _nyaa_block_lock:
-            _nyaa_blocked_until = 0.0
-            _nyaa_cooldown = _NYAA_COOLDOWN_SECONDS
+    PARKS['Nyaa'].clear()
 
 
 @contextmanager
@@ -251,8 +219,9 @@ def scrape_nyaa_with_retry(query: str, category: int, subcategory: int, filters:
     if remaining > 0:
         # Do not spend a network round trip confirming a block we already know
         # about - that is the traffic that keeps DDoS-Guard holding it.
-        raise ScraperUnavailable(
-            f"nyaa parked for another {remaining:.0f}s after a 429; skipping '{query}'")
+        raise ScraperParked(
+            f"nyaa parked for another {remaining:.0f}s after a 429; skipping '{query}'",
+            retry_after=remaining)
 
     for attempt in range(max_retries):
         try:
@@ -269,33 +238,37 @@ def scrape_nyaa_with_retry(query: str, category: int, subcategory: int, filters:
             
         except Exception as e:
             error_str = str(e).lower()
+            # Read the status off the response rather than the message text.
+            # raise_for_status embeds the request URL, so a substring test for
+            # '429' parked Nyaa process-wide for any query containing that
+            # number -- One Piece episode 429, say -- on a completely unrelated
+            # failure.
+            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
 
             # A 429 is not retryable here. Retrying it a second later just
             # confirms the limit and deepens it; the escalating retry ladder
             # re-asks in 30 minutes instead, and treats an unreachable scraper
             # as "never asked" rather than spending a rung.
-            if '429' in error_str:
-                parked = _nyaa_trip_cooldown()
-                logging.warning(
-                    f"Nyaa rate limited (429) for query: {query}. "
-                    f"Parking Nyaa for {parked / 60:.0f} min - DDoS-Guard blocks by IP, "
-                    f"so further requests only hold the block open.")
+            if status_code == 429:
+                park_trip('Nyaa', f"rate limited (429) for query: {query}")
                 raise ScraperUnavailable(f"nyaa rate limited (429) for query: {query}")
 
             # Check for specific HTTP errors that should trigger retries
             is_retryable_error = (
-                '504' in error_str or  # Gateway timeout
-                '502' in error_str or  # Bad gateway
-                '503' in error_str or  # Service unavailable
-                'timeout' in error_str or
-                'connection' in error_str
+                status_code in (502, 503, 504) or
+                (status_code is None and (
+                    isinstance(e, (requests.exceptions.Timeout,
+                                   requests.exceptions.ConnectionError))
+                    or 'timeout' in error_str
+                    or 'connection' in error_str
+                ))
             )
 
             if is_retryable_error and attempt < max_retries - 1:
                 # Calculate exponential backoff with jitter
                 delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
 
-                if '504' in error_str:
+                if status_code == 504:
                     logging.warning(f"Nyaa gateway timeout (504) hit. Waiting {delay:.2f}s before retry {attempt + 1}/{max_retries}")
                 else:
                     logging.warning(f"Nyaa request failed with retryable error. Waiting {delay:.2f}s before retry {attempt + 1}/{max_retries}. Error: {str(e)}")

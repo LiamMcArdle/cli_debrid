@@ -33,7 +33,8 @@ _CIRCUIT_BACKOFF_SECONDS = 600   # backoff duration (10 min) once threshold reac
 # this circuit breaker.
 ID_BASED_SCRAPER_TYPES = {'Torrentio', 'MediaFusion', 'AIOStreams', 'AIOStreams-API'}
 
-from scraper.scrape_status import ScraperUnavailable, record_unavailable
+from scraper.scrape_status import ScraperUnavailable, ScraperParked, record_unavailable
+from scraper.park import park_remaining
 
 
 def _circuit_record_timeout(instance: str) -> None:
@@ -353,6 +354,17 @@ class ScraperManager:
                 scraper_call_duration = time.time() - scraper_call_start_time
                 logging.info(f"Scraper {instance} ({scraper_type}) call took {scraper_call_duration:.2f}s, found {len(results)} results.")
                 return instance, scraper_type, results
+            except ScraperParked as e:
+                # We declined to call a scraper we already know is blocked. That
+                # is a decision, not an observation: counting it as a timeout
+                # trips the circuit breaker off our own skips and adds a 10-min
+                # backoff tail to every park, during which no success can clear
+                # the escalation.
+                logging.info(
+                    f"Scraper {instance} ({scraper_type}) skipped: {e}"
+                )
+                record_unavailable(instance, unavailable_scope)
+                return instance, scraper_type, []
             except ScraperUnavailable as e:
                 # The scrape never completed (rate limit, timeout, unreachable).
                 # Record it so the retry ladder can tell this apart from an
@@ -442,7 +454,13 @@ class ScraperManager:
                             anime_scraper_tasks.append(fut)
                             future_instance_map[fut] = ('OldNyaa', 'OldNyaa')
                     if nyaa_enabled:
-                        if _circuit_is_open('Nyaa'):
+                        # A parked scraper is skipped here rather than inside a
+                        # worker so it costs no thread and no exception at all.
+                        nyaa_parked = park_remaining('Nyaa')
+                        if nyaa_parked > 0:
+                            logging.info(f"[Park] Skipping 'Nyaa' — parked for {nyaa_parked:.0f}s more")
+                            mark_framework_unavailable('Nyaa', 'Nyaa', 'Parked')
+                        elif _circuit_is_open('Nyaa'):
                             mark_framework_unavailable('Nyaa', 'Nyaa', 'Circuit Open')
                         else:
                             fut = executor.submit(run_scraper, 'Nyaa', 'Nyaa', nyaa_settings, is_translated_search)
@@ -532,6 +550,15 @@ class ScraperManager:
             # Alias searches only vary the title; id-based scrapers would just
             # repeat the identical request they already got for the first title.
             if skip_id_based and scraper_type in ID_BASED_SCRAPER_TYPES:
+                continue
+
+            # Park: skip scrapers we already know are rate-limiting this host.
+            # Doing it here costs no thread and no exception; run_scraper's
+            # ScraperParked branch only covers the race.
+            parked_for = park_remaining(scraper_type)
+            if parked_for > 0:
+                logging.info(f"[Park] Skipping '{instance}' ({scraper_type}) — parked for {parked_for:.0f}s more")
+                mark_framework_unavailable(instance, scraper_type, 'Parked')
                 continue
 
             # Circuit-breaker: skip scrapers that are in backoff due to repeated timeouts

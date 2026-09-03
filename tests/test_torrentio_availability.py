@@ -36,6 +36,12 @@ with patch.dict(sys.modules, {
 
 
 class TestTorrentioAvailability(unittest.TestCase):
+    def setUp(self):
+        # A 429 parks Torrentio process-wide; tests must not inherit each
+        # other's park.
+        torrentio.PARKS['Torrentio'].clear()
+        self.addCleanup(torrentio.PARKS['Torrentio'].clear)
+
     def response(self, status, payload=None):
         return SimpleNamespace(status_code=status, json=lambda: payload or {})
 
@@ -57,6 +63,21 @@ class TestTorrentioAvailability(unittest.TestCase):
                 torrentio.fetch_data('https://example.invalid/stream.json')
         get.assert_called_once()
         sleep.assert_not_called()
+        # The 429 parks Torrentio for the whole process: the next call is
+        # skipped without a round trip and reported as a park, not a failure.
+        self.assertGreater(torrentio.PARKS['Torrentio'].remaining(), 0)
+        with patch.object(torrentio.api, 'get', return_value=self.response(200, {})) as get:
+            with self.assertRaises(torrentio.ScraperParked):
+                torrentio.fetch_data('https://example.invalid/stream.json')
+        get.assert_not_called()
+
+    def test_success_clears_the_park(self):
+        torrentio.PARKS['Torrentio'].trip()
+        torrentio.PARKS['Torrentio']._blocked_until = 0.0   # park expired
+        with patch.object(torrentio.api, 'get', return_value=self.response(200, {'streams': []})):
+            torrentio.fetch_data('https://example.invalid/stream.json')
+        self.assertEqual(torrentio.PARKS['Torrentio']._cooldown,
+                         torrentio.PARKS['Torrentio'].base_seconds)
 
     def test_non_retryable_response_is_a_completed_empty_search(self):
         with patch.object(torrentio.api, 'get', return_value=self.response(404)) as get:
