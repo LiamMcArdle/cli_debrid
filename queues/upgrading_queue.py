@@ -27,9 +27,15 @@ from scraper.functions.similarity_checks import title_verdict
 # worker threads (Queue.queue_pool_workers, hard-capped at 3 in run_program) for
 # the duration of the entire call. Measured 2026-08-26: ~25s/item over 7,764 items
 # is ~54 hours with that thread unavailable throughout, and every hourly trigger in
-# between coalesced away. 25 bounds a pass at roughly ten minutes against the hourly
-# cadence. Compare SCRAPING_BATCH_SIZE = 5 per tick in QueueManager.process_scraping.
-UPGRADE_SCRAPES_PER_PASS = 25
+# between coalesced away. 50 bounds a pass at roughly twenty minutes against the
+# hourly cadence. Compare SCRAPING_BATCH_SIZE = 5 per tick in QueueManager.process_scraping.
+UPGRADE_SCRAPES_PER_PASS = 50
+
+# Collected rows whose last search was incomplete (a source was rate limited or
+# unreachable) get their own, smaller budget. Spending the upgrade budget on them
+# first meant that during an outage every freshly collected item carried the
+# marker and the hourly pass re-checked those instead of upgrading anything.
+PARTIAL_RECHECKS_PER_PASS = 5
 
 
 class UpgradingQueue:
@@ -422,10 +428,11 @@ class UpgradingQueue:
 
         # Items collected from an incomplete source search remain usable, but
         # they must be revisited even if general upgrading is disabled or their
-        # ordinary 24-hour upgrade window has elapsed.  Use the same bounded
-        # budget as normal upgrades so a recovering source cannot create a
-        # thundering herd.
-        if scrapes_remaining > 0:
+        # ordinary 24-hour upgrade window has elapsed. They spend their OWN
+        # bounded budget (PARTIAL_RECHECKS_PER_PASS), never the upgrade budget,
+        # so a recovering source cannot crowd out real upgrades.
+        partial_remaining = PARTIAL_RECHECKS_PER_PASS
+        if partial_remaining > 0:
             try:
                 conn = get_db_connection()
                 due_rows = conn.execute(
@@ -433,7 +440,7 @@ class UpgradingQueue:
                     "AND partial_scrape_sources IS NOT NULL "
                     "AND (partial_scrape_retry_at IS NULL OR partial_scrape_retry_at <= ?) "
                     "ORDER BY partial_scrape_retry_at ASC LIMIT ?",
-                    (current_time, scrapes_remaining),
+                    (current_time, partial_remaining),
                 ).fetchall()
                 conn.close()
                 for row in due_rows:
@@ -443,8 +450,8 @@ class UpgradingQueue:
                         f"{due_item.get('id')}: {due_item.get('partial_scrape_sources')}"
                     )
                     self.hourly_scrape(due_item, queue_manager)
-                    scrapes_remaining -= 1
-                    if scrapes_remaining <= 0:
+                    partial_remaining -= 1
+                    if partial_remaining <= 0:
                         break
             except Exception as partial_recheck_error:
                 logging.error(
@@ -541,7 +548,7 @@ class UpgradingQueue:
                         self.last_scrape_times[item_id] = now
                         if not any(i['id'] == item_id for i in self.items):
                             logging.info(f"Item {item_id} was removed during hub-magnet processing (likely upgraded).")
-                        elif time_in_queue > max_duration and not item.get('partial_scrape_sources'):
+                        elif time_in_queue > max_duration:
                             logging.info(f"Item {item_id} timed out after hub-magnet attempt (in queue > {queue_duration_hours} hours).")
                             self.remove_item(item)
                             from database import update_media_item_state
@@ -560,7 +567,7 @@ class UpgradingQueue:
 
                         # Nested Check: After scrape, check if item still exists AND has timed out
                         if any(i['id'] == item_id for i in self.items):
-                            if time_in_queue > max_duration and not item.get('partial_scrape_sources'):
+                            if time_in_queue > max_duration:
                                 logging.info(f"Item {item_id} timed out after scrape attempt (in queue > {queue_duration_hours} hours).")
                                 self.remove_item(item)
                                 from database import update_media_item_state
@@ -570,7 +577,7 @@ class UpgradingQueue:
                             logging.info(f"Item {item_id} was removed during hourly scrape (likely upgraded). Skipping timeout check.")
                     else:
                         # Still check timeout even when skipping the hourly scrape
-                        if time_in_queue > max_duration and not item.get('partial_scrape_sources'):
+                        if time_in_queue > max_duration:
                             logging.info(f"Item {item_id} timed out (in queue > {queue_duration_hours} hours) while waiting for next scrape window.")
                             self.remove_item(item)
                             from database import update_media_item_state
@@ -874,8 +881,10 @@ class UpgradingQueue:
 
             if not results:
                  logging.info(f"No results returned from scrape_with_fallback for {item_identifier}")
-                 # Potentially reset upgrading flag if no results consistently? Or just wait.
-                 # update_media_item(item['id'], upgrading=False) # Optional: Reset if no results?
+                 # The flag set above marks an upgrade IN PROGRESS. Left on a
+                 # Collected row it later routes a re-Wanted item through the
+                 # upgrade-failure branches, which "restore" it to Collected.
+                 update_media_item(item['id'], upgrading=False)
                  return
 
             # --- Calculate Current Item Score if needed ---

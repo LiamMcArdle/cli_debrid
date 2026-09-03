@@ -1057,6 +1057,13 @@ class ScrapingQueue:
         def persist_completeness(unavailable):
             """Remember whether every configured source answered this search."""
             try:
+                # The common case -- every source answered and no marker was set
+                # -- needs no write. Writing NULL over NULL on every scrape was
+                # one UPDATE+commit per scrape, thousands a day, for nothing.
+                # A marker that is being set or refreshed always writes, so its
+                # retry deadline moves forward and the recheck sweep rotates.
+                if not unavailable and not item.get('partial_scrape_sources'):
+                    return
                 from database.database_writing import update_partial_scrape
                 hold_minutes = int(get_setting(
                     'Queue', 'retry_unavailable_hold_minutes', 30))

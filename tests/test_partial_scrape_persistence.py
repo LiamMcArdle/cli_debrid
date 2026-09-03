@@ -70,6 +70,29 @@ class TestPartialScrapePersistence(unittest.TestCase):
         update.assert_called_once_with(42, set(), retry_minutes=30)
         self.assertIsNone(item['partial_scrape_sources'])
 
+    def test_complete_search_with_no_marker_writes_nothing(self):
+        # The common case: every source answered and the row carried no marker.
+        # Writing NULL over NULL here was one UPDATE+commit per scrape.
+        queue = ScrapingQueue()
+        manager = Mock()
+        manager.generate_identifier.return_value = 'Test Movie (2020)'
+        item = {
+            'id': 42, 'imdb_id': 'tt1234567', 'tmdb_id': '123',
+            'title': 'Test Movie', 'year': 2020, 'type': 'movie',
+            'version': 'default', 'genres': [],
+        }
+        with patch('database.get_media_item_by_id',
+                   return_value={'fall_back_to_single_scraper': False},
+                   create=True), \
+                patch('queues.scraping_queue.scrape', return_value=([{'title': 'release'}], [])), \
+                patch('scraper.scrape_status.get_unavailable', return_value=set()), \
+                patch('database.database_writing.update_partial_scrape') as update, \
+                patch('queues.scraping_queue.get_setting', return_value=30):
+            queue.scrape_with_fallback(item, False, manager, skip_filter=True)
+
+        update.assert_not_called()
+        self.assertIsNone(item.get('partial_scrape_sources'))
+
     def test_completed_search_clears_marker(self):
         connection = Mock()
         with patch('database.database_writing.get_db_connection', return_value=connection):
