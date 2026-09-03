@@ -207,8 +207,11 @@ def update_media_item_state(item_id, state, **kwargs):
 
         # Always clear scrape_results when transitioning to a terminal state —
         # scrape_results is only needed while adding/checking and can grow to
-        # hundreds of MB if left on collected/blacklisted items.
-        if state in ('Collected', 'Blacklisted', 'Ghostlisted', 'Unreleased', 'Dormant') and 'scrape_results' not in kwargs:
+        # hundreds of MB if left on collected/blacklisted items. Sleeping is in
+        # the list because a wake always re-scrapes: the candidate list an
+        # Adding failure carried into Sleeping was dead weight the sweep
+        # SELECT * dragged through memory every 30 seconds for up to a week.
+        if state in ('Collected', 'Blacklisted', 'Ghostlisted', 'Unreleased', 'Dormant', 'Sleeping') and 'scrape_results' not in kwargs:
             query += ", scrape_results = NULL"
         if state in ('Blacklisted', 'Ghostlisted', 'Unreleased', 'Dormant'):
             query += ", partial_scrape_sources = NULL, partial_scrape_retry_at = NULL"
@@ -222,6 +225,11 @@ def update_media_item_state(item_id, state, **kwargs):
                 query += ", sleep_cycles = 0"
             if 'next_retry_at' not in kwargs:
                 query += ", next_retry_at = NULL"
+        # A deadline only means something while the item is asleep. Left on a
+        # row that woke into Wanted/Scraping it reads as a live hold and
+        # misleads anyone counting them; the rung (sleep_cycles) is kept.
+        elif state in ('Wanted', 'Scraping') and 'next_retry_at' not in kwargs:
+            query += ", next_retry_at = NULL"
 
         # Complete the query
         query += " WHERE id = ?"

@@ -529,13 +529,18 @@ class QueueManager:
         wake_count = get_wake_count(item['id'])
         logging.debug(f"Wake count before moving to Wanted: {wake_count}")
 
-        # A wake from Sleeping or Dormant starts a fresh retry cycle, so lift the
-        # single-scraper fallback and let the item try season packs again. The flag
-        # exists to stop an item from re-grabbing a pack whose debrid add just
-        # failed within the current cycle; left in place it permanently bans packs
-        # for shows where packs are the only viable source.
+        # A wake that starts a fresh retry cycle lifts the single-scraper
+        # fallback and lets the item try season packs again. The flag exists to
+        # stop an item from re-grabbing a pack whose debrid add just failed within
+        # the current cycle; left in place it permanently bans packs for shows
+        # where packs are the only viable source. A wake from a HELD rung is not
+        # a fresh cycle: the scrape never completed, and re-arming a pack attempt
+        # every thirty minutes of an outage was what turned each hold into a pack
+        # scrape, a pack add and a full sibling sweep.
         wake_params = {}
-        if from_queue in ("Sleeping", "Dormant"):
+        if from_queue in ("Dormant", "Blacklisted"):
+            wake_params['fall_back_to_single_scraper'] = False
+        elif from_queue == "Sleeping" and not self._woke_from_hold(item):
             wake_params['fall_back_to_single_scraper'] = False
 
         updated_item = self._move_item_to_queue(item, from_queue, "Wanted", "Wanted", new_version=new_version,
@@ -546,6 +551,15 @@ class QueueManager:
         if updated_item:
             # No additional processing needed for Wanted queue itself
             pass
+
+    @staticmethod
+    def _woke_from_hold(item: Dict[str, Any]) -> bool:
+        """Whether the item's last failure held its rung (scraper unavailable)."""
+        try:
+            record = json.loads(item.get('last_scrape_failure') or '{}')
+        except (TypeError, ValueError):
+            return False
+        return isinstance(record, dict) and record.get('stage') == 'scrape_unavailable'
 
     def move_to_upgrading(self, item: Dict[str, Any], from_queue: str):
         item_identifier = self.generate_identifier(item)
@@ -892,13 +906,14 @@ class QueueManager:
         # disk into the retry ladder. blacklist_item had an equivalent guard;
         # without it here a Collected row whose upgrade flags were lost would
         # leave the library while its symlink stayed behind.
-        # Deliberately NOT keyed on location_on_disk: the vanished-file cleanup
-        # re-Wants a row while leaving location_on_disk populated, so that field
-        # alone would bounce a file-less item back to Collected forever.
-        # collected_at and filled_by_file are both cleared by that path, so
-        # either one still present means a genuinely collected file.
+        # Keyed on collected_at alone. location_on_disk survives the
+        # vanished-file cleanup, and filled_by_file is written by the NZB
+        # submit BEFORE the item reaches Checking -- an NZB whose every
+        # candidate failed still carried it here and was "restored" to
+        # Collected with no file. collected_at is only ever set by a real
+        # collection and cleared by the vanish path.
         if not (item.get('upgrading') or item.get('upgrading_from')):
-            if item.get('collected_at') or item.get('filled_by_file'):
+            if item.get('collected_at'):
                 logging.warning(
                     f"⛔ BLOCKED: {item_identifier} has a collected file on disk "
                     f"(collected_at={item.get('collected_at')}, "
@@ -955,9 +970,22 @@ class QueueManager:
                     current_rung = int(item.get('sleep_cycles') or 0)
                 except (TypeError, ValueError):
                     current_rung = 0
-                deadline = datetime.now() + timedelta(minutes=hold_minutes)
+                # A fixed 30-minute hold woke every held item straight back into
+                # a park that lasts up to two hours, and woke them together. Hold
+                # at least as long as the longest park, and spread the deadlines
+                # so the wakes do not arrive as one burst.
+                import math
+                import random
+                from scraper.park import longest_park_remaining
+                park_name, park_seconds = longest_park_remaining()
+                hold_total = hold_minutes
+                if park_seconds > 0:
+                    hold_total = max(hold_minutes, math.ceil(park_seconds / 60))
+                hold_total += random.uniform(0, 0.2) * hold_total
+                deadline = datetime.now() + timedelta(minutes=hold_total)
+                park_note = f", {park_name} parked {park_seconds / 60:.0f} min" if park_seconds > 0 else ""
                 logging.info(
-                    f"Item {item_identifier} could not be scraped (scraper unavailable) in "
+                    f"Item {item_identifier} could not be scraped (scraper unavailable{park_note}) in "
                     f"{from_queue}. Holding at rung {current_rung} "
                     f"({consecutive_holds}/{max_holds}), retrying at "
                     f"{deadline.isoformat(timespec='seconds')}."
