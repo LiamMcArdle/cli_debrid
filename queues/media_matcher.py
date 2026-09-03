@@ -14,7 +14,7 @@ from scraper.functions.anime_utils import detect_absolute_numbering
 from scraper.functions.season_resolution import (
     season_verdict, container_season_from_path, log_verdict,
     episode_title_verdict, episode_title_is_usable,
-    episode_identity_verdict)
+    episode_identity_verdict, delimited_anime_numbers)
 from scraper.functions.similarity_checks import (
     title_verdict, title_is_asserted, MIN_TITLE_MATCH)
 
@@ -41,6 +41,43 @@ class MediaMatcher:
         self.episode_title_cache: Dict[str, Dict[Tuple[int, int], str]] = {}
         self.official_titles_cache: Dict[str, Optional[List[str]]] = {}
         self.relaxed_matching = relaxed_matching
+        # Read once. These gate per-file work (a fuzz over every alias, a
+        # possible metadata refresh) and were being re-read from the settings
+        # file for every candidate file of every item.
+        try:
+            from utilities.settings import get_setting
+            self._enforce_file_title = bool(get_setting('Debug', 'enforce_file_title_match', False))
+            self._strict_season_zero = bool(get_setting('Debug', 'strict_season_zero_match', True))
+            self._max_single_episode_bytes = float(get_setting('Scraping', 'max_single_episode_gb', 15) or 0) * (1024 ** 3)
+        except Exception:
+            self._enforce_file_title = False
+            self._strict_season_zero = True
+            self._max_single_episode_bytes = 15 * (1024 ** 3)
+        self.season_titles_cache: Dict[str, Dict[int, List[str]]] = {}
+        # Median size of the current torrent's video files, set per index build.
+        self._median_video_bytes = 0
+
+    def _get_season_titles_cached(self, imdb_id: Optional[str]) -> Dict[int, List[str]]:
+        """season number -> provider season titles, cached for the matcher's life."""
+        if not imdb_id:
+            return {}
+        if imdb_id not in self.season_titles_cache:
+            try:
+                from cli_battery.app.direct_api import DirectAPI
+                self.season_titles_cache[imdb_id] = DirectAPI.get_show_season_titles(imdb_id) or {}
+            except Exception as e:
+                logging.debug(f"Could not load season titles for {imdb_id}: {e}")
+                self.season_titles_cache[imdb_id] = {}
+        return self.season_titles_cache[imdb_id]
+
+    def _implausibly_large_for_one_episode(self, parsed_file_info: Dict[str, Any]) -> bool:
+        """A single anime file the size of a season is a film or a remux of many episodes."""
+        size = parsed_file_info.get('bytes') or 0
+        if not size:
+            return False
+        if self._max_single_episode_bytes and size > self._max_single_episode_bytes:
+            return True
+        return bool(self._median_video_bytes) and size > 4 * self._median_video_bytes
 
     def _get_episode_titles_cached(self, imdb_id: Optional[str]) -> Dict[Tuple[int, int], str]:
         """(season, episode) -> episode title for every episode of one show.
@@ -225,6 +262,11 @@ class MediaMatcher:
         }
         date_only_files = []  # Files parsed only as date (no seasons/episodes)
 
+        # Median video size for the per-file plausibility check; only meaningful
+        # with enough files to have a typical episode.
+        sizes = sorted(pf.get('bytes') or 0 for pf in parsed_files if pf.get('bytes'))
+        self._median_video_bytes = sizes[len(sizes) // 2] if len(sizes) >= 5 else 0
+
         for parsed_file_info in parsed_files:
             parsed_info = parsed_file_info.get('parsed_info', {})
             if parsed_info.get('is_anime_special_content', False):
@@ -246,6 +288,21 @@ class MediaMatcher:
                 date_only_files.append(parsed_file_info)
 
             if not episodes:
+                # PTT drops a bare anime number when the name also carries a
+                # year ('Hunter x Hunter 1999 -81- ...' parses no episode at
+                # all). Such a file never became a candidate, so the identity
+                # verdict that knows how to read '-81-' was never reached and
+                # the item looped: add the torrent, match nothing, remove it,
+                # scrape the same torrent again. Index the delimited numbers
+                # and the filename fallback as CANDIDACY only -- these buckets
+                # carry no season authority; _check_match still decides.
+                numbers = list(delimited_anime_numbers(filename))
+                fallback = parsed_info.get('fallback_episode')
+                if isinstance(fallback, int) and fallback not in numbers:
+                    numbers.append(fallback)
+                for ep in numbers:
+                    by_episode_only[ep].append(parsed_file_info)
+                    by_season_episode[(None, ep)].append(parsed_file_info)
                 continue
 
             # Index by episode regardless of season
@@ -410,11 +467,9 @@ class MediaMatcher:
         packs - 'S01E03 - The Chelsea Girls.mkv' parses to 'The Chelsea Girls' and
         'Season 1/03 - Weapons of Science.mkv' to 'Weapons of Science'. Those are
         long enough to clear title_verdict's no-assertion floor, so the episode
-        title escape hatch below is what keeps legitimate pack members, and is the
-        reason this gate reports rather than rejects until proven on real traffic.
+        title escape hatch below is what keeps legitimate pack members. Only
+        called when Debug.enforce_file_title_match is on.
         """
-        from utilities.settings import get_setting
-
         official_titles = self._official_titles_cached(item)
         if official_titles is None:
             return True
@@ -438,9 +493,7 @@ class MediaMatcher:
         logging.warning(
             f"File '{os.path.basename(filename) or filename}' for item "
             f"'{item.get('title')}' S{item.get('season_number')}"
-            f"E{item.get('episode_number')}: {reason}"
-            + ("" if get_setting('Debug', 'enforce_file_title_match', False)
-               else " (reporting only; set Debug.enforce_file_title_match to reject)"))
+            f"E{item.get('episode_number')}': rejected, {reason}")
         return False
 
     def _season_zero_asserts_special(self, ptt_result: Dict[str, Any], item: Dict[str, Any],
@@ -531,10 +584,11 @@ class MediaMatcher:
         # symlinked into a Dr. Stone entry on an S1E3 coordinate match alone.
         # This is a backstop - filter_results is the primary gate - so it only
         # reports by default. See _file_title_agrees for why.
-        if not self._file_title_agrees(ptt_result, item, parsed_file_info):
-            from utilities.settings import get_setting as _get_setting
-            if _get_setting('Debug', 'enforce_file_title_match', False):
-                return False
+        # Only evaluated when enforcing: the check is a fuzz over every alias
+        # plus a possible metadata refresh per file, and with the setting off
+        # it was pure spend that logged a WARNING per file per candidate item.
+        if self._enforce_file_title and not self._file_title_agrees(ptt_result, item, parsed_file_info):
+            return False
 
         # Determine target season/episode: Use XEM if available, otherwise original item S/E
         target_season = item.get('season') or item.get('season_number')
@@ -559,8 +613,7 @@ class MediaMatcher:
         # Season 0 fills only on positive evidence. See
         # _season_zero_asserts_special for the measurement behind this.
         if target_season in (0, '0'):
-            from utilities.settings import get_setting as _get_setting
-            if _get_setting('Debug', 'strict_season_zero_match', True):
+            if self._strict_season_zero:
                 if not self._season_zero_asserts_special(ptt_result, item, parsed_file_info):
                     logging.info(
                         f"Season 0 rejected for '{item.get('title')}' S00E{target_episode}: "
@@ -617,6 +670,12 @@ class MediaMatcher:
             # coordinates for every file inside.  The full path is kept solely
             # for the container-season reading, which is folder semantics.
             filename = os.path.basename(file_path) or file_path
+            if is_anime and self._implausibly_large_for_one_episode(parsed_file_info):
+                logging.info(
+                    f"Rejecting '{filename}' for {item.get('title')} S{item.get('season_number')}"
+                    f"E{item.get('episode_number')}: {(parsed_file_info.get('bytes') or 0) / 1e9:.1f} GB "
+                    f"is not one episode.")
+                return False
             identity_match, identity_reason = episode_identity_verdict(
                 target_coordinates=coordinates,
                 file_seasons=ptt_result.get('seasons'),
@@ -632,6 +691,8 @@ class MediaMatcher:
                 other_episode_titles=other_titles,
                 series_title=series_title,
                 allow_bare_season_one=use_relaxed_matching,
+                season_titles=self._get_season_titles_cached(item.get('imdb_id')),
+                container_text=os.path.basename(os.path.dirname(file_path or '')) or None,
             )
             if identity_match:
                 logging.debug(
@@ -1165,34 +1226,35 @@ class MediaMatcher:
             r'(?:^|\D)(\d{1,4})(?:\D|$)',  # Matches standalone numbers like "1" or "001"
         ]
 
+        standalone = r'(?:^|\D)(\d{1,4})(?:\D|$)'
         for pattern in patterns:
-            match = re.search(pattern, basename)
-            if match:
+            # Every occurrence, not just the first: the old `continue` on a
+            # rejected occurrence moved on to the NEXT PATTERN, so a name whose
+            # first number was a year or a season never yielded its episode.
+            for match in re.finditer(pattern, basename):
                 try:
                     episode_num = int(match.group(1))
-                    if 0 < episode_num < 2000:  # Sanity check for reasonable episode numbers
-                        
-                        # Additional context check for standalone numbers to avoid season conflicts
-                        if pattern == r'(?:^|\D)(\d{1,4})(?:\D|$)':
-                            # For standalone numbers, check if it's likely part of a season number
-                            start_pos = match.start()
-                            end_pos = match.end()
-                            
-                            # Check if preceded by 's' or 'season' (likely a season number)
-                            if start_pos > 0:
-                                before_match = basename[start_pos-1:start_pos+1]
-                                if before_match.startswith('s') or before_match.startswith('season'):
-                                    continue
-                            
-                            # Check if followed by 'e' (likely part of SxxExx format)
-                            if end_pos < len(basename):
-                                after_match = basename[end_pos-1:end_pos+1]
-                                if after_match.endswith('e'):
-                                    continue
-                        
-                        return episode_num
                 except ValueError:
                     continue
+                if not 0 < episode_num < 2000:
+                    continue
+                if pattern == standalone:
+                    start_pos, end_pos = match.start(1), match.end(1)
+                    # A four-digit year is never an episode. 'Hunter x Hunter
+                    # 1999 -81-' used to fall back to episode 1999.
+                    if 1900 <= episode_num <= 2099 and len(match.group(1)) == 4:
+                        continue
+                    # Preceded by 's'/'season' -> a season number.
+                    before = basename[max(0, start_pos - 6):start_pos].lower()
+                    if before.endswith('s') or before.endswith('season'):
+                        continue
+                    # Followed by 'e' (SxxExx), or by a resolution/bit-depth
+                    # suffix ('1080p', '10bit', '576i').
+                    after = basename[end_pos:end_pos + 3].lower()
+                    if after.startswith('e') or after.startswith('p') or after.startswith('i') \
+                            or after.startswith('bit'):
+                        continue
+                return episode_num
 
         return None
 

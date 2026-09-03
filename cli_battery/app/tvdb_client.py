@@ -881,6 +881,8 @@ def _extract_seasons_from_extended(raw: dict) -> Optional[dict]:
         processed[season_number] = {
             'episode_count': len(season_episodes) if season_episodes else 0,
             'episodes': ep_dict,
+            # The season's own name, when TVDB has one; see trakt_client.
+            'title': season.get('name') or None,
         }
 
     return processed if processed else None

@@ -107,6 +107,7 @@ def filter_results(
     episode_title: Optional[str] = None,
     other_episode_titles: Optional[List[str]] = None,
     max_absolute_episode: Optional[int] = None,
+    season_titles: Optional[Dict[Any, List[str]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
 
     # --- START Logging for season_episode_counts ---
@@ -1429,6 +1430,23 @@ def filter_results(
                             except (TypeError, ValueError):
                                 target_absolute = None
 
+                        # A single file the size of a season is not an episode.
+                        # Only where the number is the whole case: anime, one
+                        # parsed number, not a recognised pack.
+                        if is_anime and len(result_episodes or []) <= 1 \
+                                and (identity_info.get('season_pack') in (None, 'N/A', 'Unknown')):
+                            try:
+                                _cap_gb = float(get_setting('Scraping', 'max_single_episode_gb', 15) or 0)
+                            except (TypeError, ValueError):
+                                _cap_gb = 15.0
+                            _raw_gb = parse_size(result.get('size', 0)) if _cap_gb > 0 else 0
+                            if _cap_gb > 0 and _raw_gb > _cap_gb:
+                                result['filter_reason'] = (
+                                    f"Episode identity mismatch: implausible single-episode size "
+                                    f"{_raw_gb:.1f}GB (cap {_cap_gb:g}GB)")
+                                logging.info(f"Rejected: {result['filter_reason']} for '{identity_text}'")
+                                continue
+
                         identity_ok, identity_reason = episode_identity_verdict(
                             target_coordinates=target_coordinates,
                             file_seasons=result_seasons,
@@ -1442,6 +1460,10 @@ def filter_results(
                             episode_title=episode_title,
                             other_episode_titles=other_episode_titles,
                             series_title=title,
+                            season_titles=season_titles,
+                            # When the identity text is a selected file, the
+                            # release title is its container and may name the arc.
+                            container_text=original_title if identity_text != original_title else None,
                         )
                         result['identity_verdict'] = identity_reason
                         if not identity_ok:

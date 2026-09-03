@@ -744,6 +744,12 @@ SETTINGS_SCHEMA = {
             "default": 3,
             "min": 0
         },
+        "max_single_episode_gb": {
+            "type": "number",
+            "description": "Reject a single anime episode file larger than this many GB when only its number identifies it (a film or full-season remux numbered like an episode). 0 disables.",
+            "default": 15,
+            "min": 0
+        },
         "max_native_query_aliases": {
             "type": "integer",
             "description": "How many native-script titles (Japanese, etc.) are sent to Nyaa per scrape. Other indexers never see them; nothing is published under a non-Latin name anywhere else.",

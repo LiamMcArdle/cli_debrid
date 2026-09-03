@@ -8,6 +8,7 @@ implementation.
 
 import json
 import logging
+import re
 import concurrent.futures
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -454,6 +455,56 @@ def _persist_item(imdb_id: str, data: dict, session: SqlAlchemySession):
         _upsert_seasons_and_episodes(item.id, seasons_data, session)
 
 
+SEASON_TITLES_KEY = 'season_titles'
+
+# Provider season names that say nothing: 'Season 3', 'Specials', 'Part 2'.
+_GENERIC_SEASON_TITLE_RE = re.compile(
+    r'^\s*(?:season|series|specials?|part|volume|vol|cour|arc)\s*\d*\s*$', re.IGNORECASE)
+
+
+def season_titles_from(seasons_data: dict) -> Dict[str, List[str]]:
+    """{season_number: [distinct, non-generic season titles]} from provider data."""
+    titles: Dict[str, List[str]] = {}
+    for season_key, season_info in (seasons_data or {}).items():
+        if not isinstance(season_info, dict):
+            continue
+        number = season_info.get('number')
+        if number is None:
+            try:
+                number = int(season_key)
+            except (TypeError, ValueError):
+                continue
+        title = season_info.get('title')
+        if not title or not isinstance(title, str) or _GENERIC_SEASON_TITLE_RE.match(title):
+            continue
+        titles.setdefault(str(number), [])
+        if title not in titles[str(number)]:
+            titles[str(number)].append(title)
+    return titles
+
+
+def _upsert_season_titles(item_id: int, seasons_data: dict, session: SqlAlchemySession) -> None:
+    """Persist the seasons' own names under one Metadata row.
+
+    The Season table has no title column and adding one is a schema change;
+    the Metadata table already carries per-show JSON blobs (aliases), and a
+    season name is read the same way an alias is -- as matching evidence.
+    """
+    titles = season_titles_from(seasons_data)
+    existing = session.query(Metadata).filter_by(item_id=item_id, key=SEASON_TITLES_KEY).first()
+    if not titles:
+        return
+    value = json.dumps(titles)
+    now = datetime.now(_get_local_tz())
+    if existing:
+        if existing.value != value:
+            existing.value = value
+            existing.last_updated = now
+    else:
+        session.add(Metadata(item_id=item_id, key=SEASON_TITLES_KEY, value=value,
+                             provider='trakt', last_updated=now))
+
+
 def _upsert_seasons_and_episodes(item_id: int, seasons_data: dict, session: SqlAlchemySession):
     """Bulk upsert seasons and episodes using SQLite ON CONFLICT."""
     import iso8601
@@ -519,6 +570,8 @@ def _upsert_seasons_and_episodes(item_id: int, seasons_data: dict, session: SqlA
         )
         session.execute(stmt)
         session.flush()
+
+    _upsert_season_titles(item_id, seasons_data, session)
 
     season_map = {
         s.season_number: s.id
@@ -1157,6 +1210,42 @@ class DirectAPI:
         except Exception as e:
             logging.error(f"DirectAPI.get_show_seasons {imdb_id}: {e}", exc_info=True)
             return None, None
+
+    @staticmethod
+    def get_show_season_titles(imdb_id: str) -> Dict[int, List[str]]:
+        """{season_number: [season titles]} the providers gave for this show.
+
+        Read-only: it never triggers a refresh. A season's name changes about
+        as often as its number, so whatever the last refresh stored is used.
+        Empty when the show is unknown or no season carries a real title.
+        """
+        if not imdb_id or not isinstance(imdb_id, str):
+            return {}
+        try:
+            with managed_session() as session:
+                item = session.query(Item).options(
+                    selectinload(Item.item_metadata),
+                ).filter_by(imdb_id=imdb_id).first()
+                if not item:
+                    return {}
+                md = next((m for m in item.item_metadata if m.key == SEASON_TITLES_KEY), None)
+                if not md or not md.value:
+                    return {}
+                raw = md.value
+                if isinstance(raw, str):
+                    raw = json.loads(raw)
+                if isinstance(raw, str):          # older double-encoded rows
+                    raw = json.loads(raw)
+                out: Dict[int, List[str]] = {}
+                for key, names in (raw or {}).items():
+                    try:
+                        out[int(key)] = [n for n in (names or []) if isinstance(n, str) and n]
+                    except (TypeError, ValueError):
+                        continue
+                return {k: v for k, v in out.items() if v}
+        except Exception as e:
+            logging.debug(f"DirectAPI.get_show_season_titles {imdb_id}: {e}")
+            return {}
 
     @staticmethod
     def get_show_aliases(imdb_id: str) -> Tuple[Optional[dict], Optional[str]]:

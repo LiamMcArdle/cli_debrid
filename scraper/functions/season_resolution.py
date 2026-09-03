@@ -144,11 +144,36 @@ TITLE_AMBIGUOUS = 'another episode of this show also fits this filename'
 
 IDENTITY_COORDINATE = 'file names the requested coordinate'
 IDENTITY_ABSOLUTE = 'file names the requested absolute episode'
+IDENTITY_SEASON_TITLE = 'file names the requested season by its title'
 IDENTITY_DATE = 'file airdate identifies the requested episode'
 IDENTITY_TITLE = TITLE_MATCH
 IDENTITY_EXPLICIT_CONFLICT = 'file explicitly names a conflicting coordinate'
 IDENTITY_BEYOND_SERIES = 'episode range exceeds the known series extent'
+IDENTITY_MOVIE = 'file names a film, its number is not an episode'
+IDENTITY_FRACTIONAL = 'file carries a fractional episode number (a special), not this episode'
 IDENTITY_MISSING = 'file does not identify the requested episode'
+
+# A number is only evidence of an episode when the file is an episode. Fansub
+# groups number films and specials as '147,5' / '13.5' and PTT reads the
+# integer part; a 28.9 GB Spanish BD remux of Naruto Movie 2 filled S04E16 that
+# way. Both guards apply only where the NUMBER is the whole case -- the anime
+# bare-number and absolute-number paths -- never where an explicit coordinate,
+# an airdate or an episode title identifies the file.
+_MOVIE_TOKEN_RE = re.compile(
+    r'(?<![a-z])(?:the movie(?!\s*[a-z])|movie\s*\d+|film\b|pel[ií]cula\b|gekijou-?ban\b|劇場版)',
+    re.IGNORECASE,
+)
+_FRACTIONAL_EPISODE_RE = re.compile(r'(?<![A-Za-z0-9])(?P<episode>\d{1,4})[.,]5(?!\d)(?!\s*(?:gb|mb|gib|mib|mbps|kbps)\b)',
+                                    re.IGNORECASE)
+
+
+def _film_token(text: Optional[str]) -> bool:
+    return bool(text) and _MOVIE_TOKEN_RE.search(text) is not None
+
+
+def _fractional_numbers(text: Optional[str]) -> List[int]:
+    """Integer parts of every 'N,5' / 'N.5' in the text."""
+    return [int(m.group('episode')) for m in _FRACTIONAL_EPISODE_RE.finditer(text or '')]
 
 MIN_TITLE_CHARS = 12
 MIN_TITLE_WORDS = 2
@@ -258,11 +283,15 @@ _EXPLICIT_X_RE = re.compile(
     re.IGNORECASE,
 )
 _EXPLICIT_ANIME_SEASON_RE = re.compile(
-    # The trailing guard also refuses a resolution suffix letter: without it
-    # "Show - S01 - 1080p" reads as the explicit coordinate S01E1080 and the
-    # conflict short-circuit rejects every correctly numbered file in the pack.
+    # The trailing guards refuse the things that follow a season marker but
+    # are not an episode number: a resolution ('S01 - 1080p'), a bit depth or
+    # frame rate ('S01 - 10bit', 'S01 - 60fps'), a channel layout ('S01 - 5.1')
+    # or a decimal of any kind. Without them "Show - S01 - 1080p" read as the
+    # explicit coordinate S01E1080 and the conflict short-circuit rejected every
+    # correctly numbered file in the pack. Years are refused in
+    # explicit_coordinates, where the value is known.
     r'(?<![A-Za-z0-9])S(?P<season>\d{1,2})\s*[-–—]\s*'
-    r'(?P<episode>\d{1,4})(?![\dpi])',
+    r'(?P<episode>\d{1,4})(?!\d)(?![.,]\d)(?![pik])(?!\s*(?:bit|fps|hz)\b)',
     re.IGNORECASE,
 )
 
@@ -310,7 +339,14 @@ def explicit_coordinates(text: Optional[str]) -> List[Tuple[int, int]]:
     for pattern in (_EXPLICIT_COORD_RE, _EXPLICIT_X_RE, _EXPLICIT_ANIME_SEASON_RE):
         for match in pattern.finditer(src):
             season = int(match.group('season'))
-            episodes = [int(match.group('episode'))]
+            first = int(match.group('episode'))
+            # 'Show - S01 - 2019 - 03' names a year after the season marker,
+            # not episode 2019. One Piece really does reach S21 - 1000, so only
+            # the four-digit year band is refused.
+            if pattern is _EXPLICIT_ANIME_SEASON_RE and 1900 <= first <= 2099 \
+                    and len(match.group('episode')) == 4:
+                continue
+            episodes = [first]
             # Read multi-episode continuations (S01E01E02, S01E01-E02, ...)
             # so every episode of the span counts as explicitly named.
             pos = match.end()
@@ -349,6 +385,8 @@ def episode_identity_verdict(
     other_episode_titles: Optional[List[str]] = None,
     series_title: Optional[str] = None,
     allow_bare_season_one: bool = True,
+    season_titles: Optional[Dict[Any, List[str]]] = None,
+    container_text: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """Decide whether one file identifies one requested episode.
 
@@ -356,6 +394,16 @@ def episode_identity_verdict(
     not offer separate "original season" and "original episode" fallbacks;
     doing so admitted Cartesian combinations such as mapped S02 + stored E25.
     Explicit coordinates in the filename outrank all softer evidence.
+
+    ``season_titles`` maps season number -> the provider's names for that
+    season ('Thousand-Year Blood War'). Sequel seasons are released under
+    their arc name with numbering restarted at 01; nothing carries the
+    absolute number rule 5 demands, so without this tier they were
+    unobtainable. A distinctive season title in the filename (or in
+    ``container_text``, the pack folder or release title) is an explicit
+    season claim for that season and lets the in-season number decide. A file
+    naming no season title is unaffected, so a season-1 release still cannot
+    be promoted.
     """
     coordinates = []
     for season, episode in target_coordinates or []:
@@ -389,6 +437,51 @@ def episode_identity_verdict(
                 numbers.append(number)
     seasons = [s for s in (file_seasons or []) if isinstance(s, int)]
 
+    # Number-only evidence is disqualified when the file says it is a film or
+    # carries a fractional number. Checked here, after explicit coordinates,
+    # so an episode genuinely titled 'Movie Night' with an S02E05 tag is safe.
+    film = _film_token(filename) or _film_token(container_text)
+    fractional = set(_fractional_numbers(filename))
+
+    def _number_blocked(number):
+        if film:
+            return IDENTITY_MOVIE
+        if number in fractional:
+            return IDENTITY_FRACTIONAL
+        return None
+
+    # Season-title tier: a distinctive season name in the file or its
+    # container is an explicit claim for that season.
+    if season_titles:
+        by_season = {}
+        for key, names in season_titles.items():
+            try:
+                by_season[int(key)] = [n for n in (names or []) if n]
+            except (TypeError, ValueError):
+                continue
+        for target_season, target_episode in coordinates:
+            if target_season is None or target_season < 2:
+                continue
+            names = by_season.get(target_season) or []
+            if not names:
+                continue
+            others = [n for s, ns in by_season.items() if s != target_season for n in ns]
+            for name in names:
+                claimed = False
+                for text in (filename, container_text):
+                    if not text:
+                        continue
+                    ok, _ = episode_title_verdict(name, text, other_episode_titles=others,
+                                                  series_title=series_title)
+                    if ok:
+                        claimed = True
+                        break
+                if claimed and target_episode in numbers:
+                    blocked = _number_blocked(target_episode) if is_anime else None
+                    if blocked:
+                        return False, blocked
+                    return True, IDENTITY_SEASON_TITLE
+
     # A complete/batch range can contain both the requested in-season number
     # and its absolute number while still belonging to a different adaptation.
     # Hunter x Hunter (2011) batches advertise 01-148, which used to satisfy
@@ -414,11 +507,20 @@ def episode_identity_verdict(
             allow_bare_season_one=allow_bare_season_one,
         )
         if season_ok and target_episode in numbers:
+            # For anime this is a bare (or PTT-guessed) number; the film and
+            # fractional guards apply. Non-anime reached here through a stated
+            # season, where a number is a number.
+            blocked = _number_blocked(target_episode) if is_anime else None
+            if blocked:
+                return False, blocked
             return True, IDENTITY_COORDINATE
 
     # Absolute numbering is one show-global identity, independent of which
     # legitimate S/E coordinate was used to reach the result.
     if is_anime and absolute_episode is not None and absolute_episode in numbers:
+        blocked = _number_blocked(absolute_episode)
+        if blocked:
+            return False, blocked
         return True, IDENTITY_ABSOLUTE
 
     if target_air_date and file_air_date and target_air_date == file_air_date:
@@ -446,16 +548,19 @@ def container_season_from_path(file_path: str) -> Optional[int]:
     # seasons, and a pattern that ate the '+' as S01's trailing delimiter would
     # leave nothing for S02 to match, reporting a two-season pack as season 1.
     season_re = re.compile(r'(?<![A-Za-z0-9])S(\d{1,2})(?![0-9])', re.I)
-    word_re = re.compile(r'(?<![A-Za-z0-9])Season\s*(\d{1,2})(?![0-9])', re.I)
+    word_re = re.compile(r'(?<![A-Za-z0-9])Seasons?\s*(\d{1,2})(?![0-9])', re.I)
+    # A span names more than one season however it is written: 'S01-S03',
+    # 'Season 1 to 3', 'Seasons 1-5'.
     span_re = re.compile(
-        r'(?<![A-Za-z0-9])(?:S|Season\s*)\d{1,2}\s*[-+&,~]\s*(?:S|Season\s*)?\d{1,2}', re.I)
-    multi = ('complete', 'seasons', 'batch', ' to ', 'collection', 'colection')
+        r'(?<![A-Za-z0-9])(?:S|Seasons?\s*)\d{1,2}\s*(?:[-+&,~]|to)\s*(?:S|Season\s*)?\d{1,2}', re.I)
 
     folder = os.path.basename(os.path.dirname(file_path or ''))
     if not folder:
         return None
-    if any(w in folder.lower() for w in multi):
-        return None
+    # Only a span or two different season numbers make the folder ambiguous.
+    # Words like 'batch' or 'complete' used to disqualify the folder outright,
+    # which sent 'Show S02 [Batch]/Show - 03.mkv' to the absolute-number rule
+    # and rejected every per-season bare-numbered file for S2+.
     if span_re.search(folder):
         return None
     hits = {int(m) for m in season_re.findall(folder)}

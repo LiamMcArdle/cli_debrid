@@ -166,19 +166,35 @@ def get_absolute_episode_from_database(imdb_id: str, season: int, episode: int) 
 
 
 def get_max_absolute_episode_from_database(imdb_id: str) -> Optional[int]:
-    """Return the metadata battery's known show-global absolute maximum."""
+    """Return the metadata battery's known show-global absolute maximum.
+
+    None when the battery's picture of a still-running show is stale: the
+    ceiling is used to reject batches that run past the series, and for an
+    ongoing show a stale ceiling rejects every batch that contains the newest
+    episodes. An ended show's ceiling is final and is returned regardless.
+    """
     if not imdb_id:
         return None
     try:
         from sqlalchemy import func
         from cli_battery.app.database import Session, Item, Season, Episode
+        from cli_battery.app.staleness import is_stale
 
         with Session() as session:
+            item = session.query(Item).filter_by(imdb_id=imdb_id).first()
+            if item is None:
+                return None
+            status = (item.media_status or '').lower()
+            if status not in ('ended', 'canceled', 'cancelled') and \
+                    is_stale('show', item.media_status, item.last_trakt_fetch):
+                logging.debug(
+                    f"Absolute-episode ceiling for {imdb_id} withheld: metadata is stale "
+                    f"for a show that is still airing.")
+                return None
             maximum = (
                 session.query(func.max(Episode.absolute_episode))
                 .join(Season, Episode.season_id == Season.id)
-                .join(Item, Season.item_id == Item.id)
-                .filter(Item.imdb_id == imdb_id)
+                .filter(Season.item_id == item.id)
                 .scalar()
             )
             return int(maximum) if maximum is not None else None
@@ -409,10 +425,18 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
     target_episode_title = None
     other_episode_titles = []
     max_absolute_episode = None
+    season_titles = None
     if content_type.lower() == 'episode':
         target_episode_title, other_episode_titles = get_episode_title_context(
             imdb_id, original_season, original_episode)
         max_absolute_episode = get_max_absolute_episode_from_database(imdb_id)
+        # Arc-named sequel seasons ('Thousand-Year Blood War - 01') carry no
+        # absolute number; the season's own title is the evidence instead.
+        try:
+            season_titles = DirectAPI.get_show_season_titles(imdb_id) or None
+        except Exception as season_title_err:
+            logging.debug(f"Season titles unavailable for {imdb_id}: {season_title_err}")
+            season_titles = None
 
     # NEW: Fetch show's season episode structure for accurate num_items calculation in ranking
     show_season_episode_counts_for_query = {} # Default to empty
@@ -1446,6 +1470,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 episode_title=target_episode_title,
                 other_episode_titles=other_episode_titles,
                 max_absolute_episode=max_absolute_episode,
+                season_titles=season_titles,
             )
             filtered_out_results = [result for result in normalized_results if result not in filtered_results]
             task_timings['filtering'] = time.time() - task_start

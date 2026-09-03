@@ -455,3 +455,145 @@ class TestEpisodeIdentityVerdict(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+# --- Wave 2 identity-gate rework -------------------------------------------
+
+explicit_coordinates = _sr.explicit_coordinates
+IDENTITY_SEASON_TITLE = _sr.IDENTITY_SEASON_TITLE
+IDENTITY_MOVIE = _sr.IDENTITY_MOVIE
+IDENTITY_FRACTIONAL = _sr.IDENTITY_FRACTIONAL
+IDENTITY_ABSOLUTE = _sr.IDENTITY_ABSOLUTE
+IDENTITY_COORDINATE = _sr.IDENTITY_COORDINATE
+IDENTITY_MISSING = _sr.IDENTITY_MISSING
+IDENTITY_EXPLICIT_CONFLICT = _sr.IDENTITY_EXPLICIT_CONFLICT
+IDENTITY_BEYOND_SERIES = _sr.IDENTITY_BEYOND_SERIES
+
+
+class ExplicitAnimeSeasonMarkerGuards(unittest.TestCase):
+    """'S01 - <number>' is a coordinate only when the number is an episode."""
+
+    def test_bit_depth_channel_layout_and_year_are_not_episodes(self):
+        self.assertEqual(explicit_coordinates('Show - S01 - 10bit - 05.mkv'), [])
+        self.assertEqual(explicit_coordinates('Show S01 - 5.1 - 03.mkv'), [])
+        self.assertEqual(explicit_coordinates('Show S01 - 2019 - 03.mkv'), [])
+        self.assertEqual(explicit_coordinates('Show S01 - 60fps.mkv'), [])
+
+    def test_real_marker_still_reads(self):
+        self.assertEqual(explicit_coordinates('Show - S02 - 07.mkv'), [(2, 7)])
+        self.assertEqual(explicit_coordinates('One Piece S21 - 1000.mkv'), [(21, 1000)])
+
+
+class ContainerSeasonBatchFolders(unittest.TestCase):
+    def test_single_season_batch_folder_names_its_season(self):
+        self.assertEqual(container_season_from_path('Show S02 Batch (1080p)/Show - 03.mkv'), 2)
+        self.assertEqual(container_season_from_path('[Grp] Show Season 3 [Complete]/Show - 03.mkv'), 3)
+
+    def test_spans_and_multi_season_folders_stay_ambiguous(self):
+        self.assertIsNone(container_season_from_path('Show S01-S03 Complete/Show - 03.mkv'))
+        self.assertIsNone(container_season_from_path('Show Season 1 to 3/Show - 03.mkv'))
+        self.assertIsNone(container_season_from_path('Show Seasons 1-5/Show - 03.mkv'))
+        self.assertIsNone(container_season_from_path('Show Complete/Show - 03.mkv'))
+
+
+class SeasonTitleTier(unittest.TestCase):
+    TITLES = {17: ['Thousand-Year Blood War'],
+              18: ['Thousand-Year Blood War - The Separation']}
+
+    def _verdict(self, filename, target=(17, 1), container=None, numbers=(1,)):
+        return episode_identity_verdict(
+            target_coordinates=[target], file_seasons=[], file_numbers=list(numbers),
+            filename=filename, absolute_episode=367, is_anime=True,
+            series_title='Bleach', season_titles=self.TITLES, container_text=container)
+
+    def test_arc_named_release_with_restart_numbering_is_the_season(self):
+        ok, reason = self._verdict('[SubsPlease] Bleach - Thousand-Year Blood War - 01 (1080p).mkv')
+        self.assertTrue(ok)
+        self.assertEqual(reason, IDENTITY_SEASON_TITLE)
+
+    def test_longer_sibling_title_wins(self):
+        # 'The Separation' names S18; its file must not satisfy S17.
+        ok, _ = self._verdict('Bleach - Thousand-Year Blood War - The Separation - 01.mkv', target=(17, 1))
+        self.assertFalse(ok)
+        ok, reason = self._verdict('Bleach - Thousand-Year Blood War - The Separation - 01.mkv', target=(18, 1))
+        self.assertTrue(ok)
+        self.assertEqual(reason, IDENTITY_SEASON_TITLE)
+
+    def test_bare_number_is_not_promoted(self):
+        ok, reason = self._verdict('[SubsPlease] Bleach - 01 (1080p).mkv')
+        self.assertFalse(ok)
+        self.assertEqual(reason, IDENTITY_MISSING)
+
+    def test_explicit_coordinate_still_outranks_the_title(self):
+        ok, reason = self._verdict('Bleach TYBW S01E01 - Thousand-Year Blood War.mkv')
+        self.assertFalse(ok)
+        self.assertEqual(reason, IDENTITY_EXPLICIT_CONFLICT)
+
+    def test_container_folder_may_carry_the_title(self):
+        ok, reason = self._verdict('Bleach - 01.mkv',
+                                   container='[Judas] Bleach - Thousand-Year Blood War (Season 17)')
+        self.assertTrue(ok)
+        self.assertEqual(reason, IDENTITY_SEASON_TITLE)
+
+    def test_wrong_in_season_number_is_not_rescued(self):
+        ok, _ = self._verdict('Bleach - Thousand-Year Blood War - 05.mkv', target=(17, 1), numbers=(5,))
+        self.assertFalse(ok)
+
+    def test_season_one_target_never_uses_the_tier(self):
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(1, 1)], file_seasons=[], file_numbers=[1],
+            filename='Bleach - Thousand-Year Blood War - 01.mkv', is_anime=True,
+            season_titles={1: ['Thousand-Year Blood War']}, series_title='Bleach')
+        self.assertTrue(ok)
+        self.assertEqual(reason, IDENTITY_COORDINATE)
+
+
+class FilmAndFractionalGuards(unittest.TestCase):
+    def _verdict(self, filename, numbers, target=(4, 16), absolute=147, anime=True):
+        return episode_identity_verdict(
+            target_coordinates=[target], file_seasons=[], file_numbers=list(numbers),
+            filename=filename, absolute_episode=absolute, is_anime=anime,
+            series_title='Naruto')
+
+    def test_fractional_number_is_a_special_not_the_episode(self):
+        ok, reason = self._verdict(
+            '[Ryuichi] Naruto - 147,5 - Las ruinas ilusorias [1080p BDREMUX].mkv', numbers=[147])
+        self.assertFalse(ok)
+        self.assertEqual(reason, IDENTITY_FRACTIONAL)
+        ok, reason = self._verdict('Naruto - 13.5.mkv', numbers=[13], target=(1, 13), absolute=13)
+        self.assertEqual(reason, IDENTITY_FRACTIONAL)
+
+    def test_film_token_disqualifies_number_only_evidence(self):
+        for name in ('Naruto - Película 2 - 147.mkv', 'Naruto Shippuden Movie 2 - 147.mkv',
+                     'Naruto Gekijouban - 147.mkv', 'Naruto The Movie - 147.mkv'):
+            with self.subTest(name=name):
+                ok, reason = self._verdict(name, numbers=[147])
+                self.assertFalse(ok)
+                self.assertEqual(reason, IDENTITY_MOVIE)
+
+    def test_plain_absolute_number_still_matches(self):
+        ok, reason = self._verdict('Naruto - 147.mkv', numbers=[147])
+        self.assertTrue(ok)
+        self.assertEqual(reason, IDENTITY_ABSOLUTE)
+
+    def test_size_and_codec_decimals_are_not_fractional_episodes(self):
+        ok, reason = self._verdict('Naruto - 147 [2.5GB] [H.265] [DDP5.1] v1.5.mkv', numbers=[147])
+        self.assertTrue(ok)
+        self.assertEqual(reason, IDENTITY_ABSOLUTE)
+
+    def test_episode_titled_movie_night_with_explicit_tag_is_fine(self):
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(2, 5)], file_seasons=[2], file_numbers=[5],
+            filename='Show - S02E05 - The Movie Night.mkv', is_anime=True, series_title='Show')
+        self.assertTrue(ok)
+        self.assertEqual(reason, IDENTITY_COORDINATE)
+
+    def test_non_anime_stated_season_ignores_the_guards(self):
+        ok, reason = self._verdict('Show - Season 2 - 05 The Movie.mkv', numbers=[5],
+                                   target=(2, 5), absolute=None, anime=False)
+        # Non-anime with no stated season is rejected by rule 5 regardless.
+        self.assertFalse(ok)
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(2, 5)], file_seasons=[2], file_numbers=[5],
+            filename='Show - S02 - 05 The Movie.mkv', is_anime=False, series_title='Show')
+        self.assertTrue(ok)

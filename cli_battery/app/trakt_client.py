@@ -268,6 +268,9 @@ def get_show_seasons_and_episodes(imdb_id: str, include_specials: bool = False) 
             'plex_guid': season_plex.get('guid') if isinstance(season_plex, dict) else None,
             'tmdb_id': str(season_ids['tmdb']) if season_ids.get('tmdb') else None,
             'tvdb_id': str(season_ids['tvdb']) if season_ids.get('tvdb') else None,
+            # The season's own name ('Thousand-Year Blood War'); sequel seasons
+            # are released under it with numbering restarted at 01.
+            'title': season.get('title') or None,
         }
     return processed, 'trakt'
 
