@@ -597,3 +597,129 @@ class FilmAndFractionalGuards(unittest.TestCase):
             target_coordinates=[(2, 5)], file_seasons=[2], file_numbers=[5],
             filename='Show - S02 - 05 The Movie.mkv', is_anime=False, series_title='Show')
         self.assertTrue(ok)
+
+
+class TestAbsoluteCandidates(unittest.TestCase):
+    """The absolute number may be known by more than one route.
+
+    Every case below is taken from the 2026-09-05 incident, where the identity
+    gate rejected 4,947 releases with TITLE_ABSENT and confirmed exactly zero by
+    absolute number. Pokemon's provider metadata folds several series into a
+    136-episode "season 19", so the scene absolute stamped on a result and the
+    absolute derived from the provider's season lengths disagree -- and the
+    derived one was never consulted, because a stamped value suppressed it.
+    """
+
+    POKEMON_FILE = '[Anime Time] Pokemon - 1143 - On Land In The Sea And To The Future.mkv'
+
+    def test_normalisation_accepts_int_sequence_or_none(self):
+        self.assertEqual(_sr.absolute_candidates(1143), (1143,))
+        self.assertEqual(_sr.absolute_candidates([900, 1143]), (900, 1143))
+        self.assertEqual(_sr.absolute_candidates([1143, 1143]), (1143,))
+        self.assertEqual(_sr.absolute_candidates(None), ())
+        self.assertEqual(_sr.absolute_candidates([]), ())
+        self.assertEqual(_sr.absolute_candidates(['1143', None, 'x']), (1143,))
+
+    def test_derived_absolute_identifies_the_episode(self):
+        # Sum of Pokemon seasons 1..18 is 1084; + episode 59 = 1143.
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(19, 59)], file_seasons=[], file_numbers=[1143],
+            filename=self.POKEMON_FILE, absolute_episode=1143, is_anime=True,
+            episode_title='When a House is Not a Home!', series_title='Pokemon')
+        self.assertTrue(ok)
+        self.assertEqual(reason, IDENTITY_ABSOLUTE)
+
+    def test_a_wrong_stamped_absolute_no_longer_hides_the_derived_one(self):
+        """The regression itself: scene value present but wrong, derived correct."""
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(19, 59)], file_seasons=[], file_numbers=[1143],
+            filename=self.POKEMON_FILE, absolute_episode=[900, 1143], is_anime=True,
+            episode_title='When a House is Not a Home!', series_title='Pokemon')
+        self.assertTrue(ok)
+        self.assertEqual(reason, IDENTITY_ABSOLUTE)
+
+    def test_unknown_absolute_is_still_inconclusive_not_a_match(self):
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(19, 59)], file_seasons=[], file_numbers=[1143],
+            filename=self.POKEMON_FILE, absolute_episode=None, is_anime=True,
+            episode_title='When a House is Not a Home!', series_title='Pokemon')
+        self.assertFalse(ok)
+        self.assertIn(reason, _sr.INCONCLUSIVE_IDENTITY_REASONS)
+
+    def test_candidates_that_all_miss_do_not_match(self):
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(19, 59)], file_seasons=[], file_numbers=[1143],
+            filename=self.POKEMON_FILE, absolute_episode=[900, 901], is_anime=True,
+            episode_title='When a House is Not a Home!', series_title='Pokemon')
+        self.assertFalse(ok)
+
+    def test_season_verdict_accepts_a_candidate_sequence(self):
+        ok, reason = season_verdict(
+            file_seasons=[], target_season=19, file_numbers=[1143],
+            absolute_episode=[900, 1143], is_anime=True)
+        self.assertTrue(ok)
+        self.assertEqual(reason, ABSOLUTE_MATCH)
+
+        ok, reason = season_verdict(
+            file_seasons=[], target_season=19, file_numbers=[1143],
+            absolute_episode=[900, 901], is_anime=True)
+        self.assertFalse(ok)
+        self.assertEqual(reason, ABSOLUTE_MISMATCH)
+
+        ok, reason = season_verdict(
+            file_seasons=[], target_season=19, file_numbers=[1143],
+            absolute_episode=[], is_anime=True)
+        self.assertFalse(ok)
+        self.assertEqual(reason, ABSOLUTE_UNKNOWN)
+
+
+class TestConclusiveVerdictsStillReject(unittest.TestCase):
+    """Softening the fallback must not soften real evidence of a mismatch.
+
+    These are the 20,775 rejections from the same logs that were CORRECT and
+    have to stay rejections.
+    """
+
+    def test_conflicting_explicit_coordinate_is_conclusive(self):
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(19, 59)], file_seasons=[25], file_numbers=[57],
+            filename="Pokemon - S25E57 - L'arc-en-ciel et le maitre Pokemon.mp4",
+            absolute_episode=[1143], is_anime=True,
+            episode_title='When a House is Not a Home!', series_title='Pokemon')
+        self.assertFalse(ok)
+        self.assertEqual(reason, IDENTITY_EXPLICIT_CONFLICT)
+        self.assertNotIn(reason, _sr.INCONCLUSIVE_IDENTITY_REASONS)
+
+    def test_wrong_absolute_numbered_file_is_not_rescued(self):
+        # Pocket Monsters 065 is not Pokemon S19E59 by any numbering.
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(19, 59)], file_seasons=[], file_numbers=[65],
+            filename="[PM]Pocket_Monsters_-_065_-_Rougela_no_Christmas.mkv",
+            absolute_episode=[1143], is_anime=True,
+            episode_title='When a House is Not a Home!', series_title='Pokemon')
+        self.assertFalse(ok)
+
+    def test_beyond_series_extent_stays_conclusive(self):
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(4, 3)], file_seasons=[], file_numbers=[3, 81, 148],
+            filename='Hunter x Hunter 01-148 Complete Batch.mkv',
+            absolute_episode=[81], max_absolute_episode=92, is_anime=True,
+            series_title='Hunter x Hunter')
+        self.assertFalse(ok)
+        self.assertEqual(reason, IDENTITY_BEYOND_SERIES)
+        self.assertNotIn(reason, _sr.INCONCLUSIVE_IDENTITY_REASONS)
+
+    def test_ambiguous_title_stays_conclusive(self):
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(1, 41)], file_seasons=[], file_numbers=[],
+            filename='Show - Showdown at the Gates of Warp.mkv', is_anime=False,
+            episode_title='The Gates of Warp',
+            other_episode_titles=['Showdown at the Gates of Warp'],
+            series_title='Show')
+        self.assertFalse(ok)
+        self.assertEqual(reason, TITLE_AMBIGUOUS)
+        self.assertNotIn(reason, _sr.INCONCLUSIVE_IDENTITY_REASONS)
+
+
+if __name__ == '__main__':
+    unittest.main()

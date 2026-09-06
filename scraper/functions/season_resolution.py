@@ -19,7 +19,7 @@ already-parsed facts, which is what makes this testable in isolation.
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # Verdict reasons, for logging and tests.
 EXPLICIT_MATCH = 'explicit season match'
@@ -33,11 +33,40 @@ ABSOLUTE_MISMATCH = 'number is an in-season number, not the absolute'
 ABSOLUTE_UNKNOWN = 'absolute episode unknown, refusing to guess for S2+'
 NO_TARGET = 'no target season to check against'
 
+
+def absolute_candidates(absolute_episode: Any) -> Tuple[int, ...]:
+    """Normalise the absolute-episode argument to distinct candidate numbers.
+
+    A caller may know more than one plausible absolute number for the same
+    target: the scene/XEM number stamped on the result, and the number derived
+    from the metadata provider's own season lengths. These disagree whenever
+    the provider's season boundaries differ from the scene's, and neither is
+    authoritative, so a caller may pass both and any one of them matching is
+    proof. An int (or None) is still accepted unchanged, so every existing
+    caller keeps its meaning.
+    """
+    if absolute_episode is None:
+        return ()
+    if isinstance(absolute_episode, bool):
+        return ()
+    if isinstance(absolute_episode, int):
+        return (absolute_episode,)
+    candidates: List[int] = []
+    for value in absolute_episode:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number not in candidates:
+            candidates.append(number)
+    return tuple(candidates)
+
+
 def season_verdict(
     file_seasons: Optional[List[int]],
     target_season: Optional[int],
     file_numbers: Optional[List[int]],
-    absolute_episode: Optional[int],
+    absolute_episode: Union[int, Sequence[int], None],
     container_season: Optional[int] = None,
     is_anime: bool = False,
     allow_bare_season_one: bool = True,
@@ -53,7 +82,9 @@ def season_verdict(
             may be an in-season number or an absolute one.
         absolute_episode: the absolute episode number the target S/E corresponds
             to, or None if it could not be established. None is *not* treated as
-            zero-offset: see rule 5.
+            zero-offset: see rule 5. A sequence may be passed when more than one
+            numbering is plausible (scene/XEM and provider-derived); any one of
+            them matching is proof.
         container_season: season declared by the containing folder, when the
             folder pins down exactly one.
         is_anime: only anime releases get the absolute-numbering allowance.
@@ -118,9 +149,11 @@ def season_verdict(
     #    season of the show.
     if not is_anime:
         return False, ABSOLUTE_UNKNOWN
-    if absolute_episode is None:
+    absolutes = absolute_candidates(absolute_episode)
+    if not absolutes:
         return False, ABSOLUTE_UNKNOWN
-    if absolute_episode in (file_numbers or []):
+    numbers = file_numbers or []
+    if any(candidate in numbers for candidate in absolutes):
         return True, ABSOLUTE_MATCH
     return False, ABSOLUTE_MISMATCH
 
@@ -152,6 +185,24 @@ IDENTITY_BEYOND_SERIES = 'episode range exceeds the known series extent'
 IDENTITY_MOVIE = 'file names a film, its number is not an episode'
 IDENTITY_FRACTIONAL = 'file carries a fractional episode number (a special), not this episode'
 IDENTITY_MISSING = 'file does not identify the requested episode'
+
+# Verdicts that mean "could not prove this is the episode", as opposed to
+# "proved this is a different episode". Only the second kind is evidence of
+# wrongness and may reject a release on its own.
+#
+# The distinction is load bearing. Numbered anime releases carry no episode
+# title, so once the absolute-number rule cannot answer -- an unknown absolute,
+# or a provider whose season boundaries disagree with the scene's -- the title
+# fallback is guaranteed to come back TITLE_ABSENT. Treating that silence as a
+# rejection made the gate discard every candidate for a whole show, which then
+# exhausted the retry ladder and was blacklisted. An inconclusive verdict must
+# hand the decision back to the season/episode checks that ran before this gate
+# existed, not pre-empt them.
+INCONCLUSIVE_IDENTITY_REASONS = frozenset({
+    TITLE_ABSENT,
+    TITLE_NOT_DISTINCTIVE,
+    IDENTITY_MISSING,
+})
 
 # A number is only evidence of an episode when the file is an episode. Fansub
 # groups number films and specials as '147,5' / '13.5' and PTT reads the
@@ -375,7 +426,7 @@ def episode_identity_verdict(
     file_seasons: Optional[List[int]],
     file_numbers: Optional[List[int]],
     filename: Optional[str] = None,
-    absolute_episode: Optional[int] = None,
+    absolute_episode: Union[int, Sequence[int], None] = None,
     max_absolute_episode: Optional[int] = None,
     container_season: Optional[int] = None,
     is_anime: bool = False,
@@ -425,8 +476,8 @@ def episode_identity_verdict(
         # S01E112 even when metadata stores it in a later logical season.
         # This is still exact evidence, but only when BOTH the conventional
         # season-one marker and the known absolute number agree.
-        if is_anime and absolute_episode is not None \
-                and (1, int(absolute_episode)) in explicit:
+        if is_anime and any((1, candidate) in explicit
+                            for candidate in absolute_candidates(absolute_episode)):
             return True, IDENTITY_ABSOLUTE
         return False, IDENTITY_EXPLICIT_CONFLICT
 
@@ -517,11 +568,14 @@ def episode_identity_verdict(
 
     # Absolute numbering is one show-global identity, independent of which
     # legitimate S/E coordinate was used to reach the result.
-    if is_anime and absolute_episode is not None and absolute_episode in numbers:
-        blocked = _number_blocked(absolute_episode)
-        if blocked:
-            return False, blocked
-        return True, IDENTITY_ABSOLUTE
+    if is_anime:
+        for candidate in absolute_candidates(absolute_episode):
+            if candidate not in numbers:
+                continue
+            blocked = _number_blocked(candidate)
+            if blocked:
+                return False, blocked
+            return True, IDENTITY_ABSOLUTE
 
     if target_air_date and file_air_date and target_air_date == file_air_date:
         return True, IDENTITY_DATE

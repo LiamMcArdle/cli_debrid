@@ -10,6 +10,7 @@ from scraper.functions.other_functions import smart_search
 from scraper.functions.adult_terms import adult_terms
 from scraper.functions.season_resolution import (
     season_verdict, log_verdict, episode_identity_verdict,
+    INCONCLUSIVE_IDENTITY_REASONS,
 )
 from scraper.functions.common import *
 from scraper.functions.common import detect_season_episode_info
@@ -1418,17 +1419,37 @@ def filter_results(
                                 and original_episode is not None \
                                 and (original_season, original_episode) != (season, episode):
                             target_coordinates.append((original_season, original_episode))
-                        target_absolute = result.get('target_abs_episode')
-                        if target_absolute is None and is_anime \
-                                and season is not None and episode is not None:
+                        # Both absolutes the target could plausibly carry, not
+                        # one in preference to the other. target_abs_episode is
+                        # the scene/XEM number stamped in scraper.py; the second
+                        # is derived from the provider's own season lengths.
+                        # They disagree wherever the provider's season
+                        # boundaries differ from the scene's -- Pokemon's "S19"
+                        # holds 136 episodes spanning two different series --
+                        # and neither is authoritative. Letting the stamped one
+                        # suppress the derived one left the correct number
+                        # unasked: every absolute-numbered release then reached
+                        # the episode-title fallback, which numbered anime
+                        # releases never satisfy, so the whole show was rejected
+                        # and eventually blacklisted.
+                        target_absolute = []
+                        _stamped_abs = result.get('target_abs_episode')
+                        if _stamped_abs is not None:
+                            target_absolute.append(_stamped_abs)
+                        if is_anime and season is not None and episode is not None:
                             try:
                                 preceding = [int(s) for s in range(1, int(season))]
+                                # Still all-or-nothing: a partial map sums short
+                                # and would claim a number the target does not
+                                # have. See rule 5 in season_verdict.
                                 if all(s in season_episode_counts for s in preceding):
-                                    target_absolute = sum(
+                                    _derived_abs = sum(
                                         int(season_episode_counts[s]) for s in preceding
                                     ) + int(episode)
+                                    if _derived_abs not in target_absolute:
+                                        target_absolute.append(_derived_abs)
                             except (TypeError, ValueError):
-                                target_absolute = None
+                                pass
 
                         # A single file the size of a season is not an episode.
                         # Only where the number is the whole case: anime, one
@@ -1467,13 +1488,24 @@ def filter_results(
                         )
                         result['identity_verdict'] = identity_reason
                         if not identity_ok:
-                            result['filter_reason'] = f"Episode identity mismatch: {identity_reason}"
-                            logging.info(
-                                f"Rejected: {result['filter_reason']} for '{identity_text}' "
-                                f"while targeting S{season}E{episode}"
+                            # Only a verdict that proves the file is a DIFFERENT
+                            # episode may reject on its own. "Could not prove it"
+                            # falls through to the season and episode checks
+                            # below, which are what decided this before the gate
+                            # existed -- see INCONCLUSIVE_IDENTITY_REASONS.
+                            if identity_reason not in INCONCLUSIVE_IDENTITY_REASONS:
+                                result['filter_reason'] = f"Episode identity mismatch: {identity_reason}"
+                                logging.info(
+                                    f"Rejected: {result['filter_reason']} for '{identity_text}' "
+                                    f"while targeting S{season}E{episode}"
+                                )
+                                continue
+                            logging.debug(
+                                f"Identity inconclusive ({identity_reason}) for '{identity_text}' "
+                                f"while targeting S{season}E{episode}; deferring to season/episode checks"
                             )
-                            continue
-                        identity_confirmed = True
+                        else:
+                            identity_confirmed = True
 
                     # --- Season Check --- 
                     season_match = False
