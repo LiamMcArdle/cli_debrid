@@ -16,6 +16,14 @@ from scraper.functions.common import trim_magnet
 _NZB_CACHE: Dict[str, tuple] = {}   # key -> (timestamp, results)
 _NZB_CACHE_LOCK = threading.Lock()
 _NZB_CACHE_TTL = 600  # 10 minutes
+# A TTL enforced only on read expires nothing here. The key is the query, and a
+# queue working through a backlog asks a different question every time, so
+# almost every entry is written once and never looked up again -- _cache_get
+# never runs for it, so its delete never runs either. Each entry holds a
+# ~500-element result list whose dicts carry Prowlarr's recursive category
+# tree, which is how the process reached 6 GB in 17 hours. The cache has to
+# sweep on write, and be bounded, or it outlives its own TTL forever.
+_NZB_CACHE_MAX = 512
 
 
 def _cache_key(endpoint: str, params: dict) -> str:
@@ -35,7 +43,18 @@ def _cache_get(key: str) -> Optional[List]:
 
 def _cache_set(key: str, results: List) -> None:
     with _NZB_CACHE_LOCK:
-        _NZB_CACHE[key] = (time.monotonic(), results)
+        now = time.monotonic()
+        if len(_NZB_CACHE) >= _NZB_CACHE_MAX:
+            for stale in [k for k, e in _NZB_CACHE.items()
+                          if now - e[0] >= _NZB_CACHE_TTL]:
+                del _NZB_CACHE[stale]
+            # Still full means the entries are genuinely live, not stale, so
+            # age them out oldest-first rather than letting the cap be advisory.
+            if len(_NZB_CACHE) >= _NZB_CACHE_MAX:
+                oldest = sorted(_NZB_CACHE.items(), key=lambda kv: kv[1][0])
+                for k, _ in oldest[:max(1, _NZB_CACHE_MAX // 8)]:
+                    del _NZB_CACHE[k]
+        _NZB_CACHE[key] = (now, results)
 
 
 def _build_prowlarr_params_list(
