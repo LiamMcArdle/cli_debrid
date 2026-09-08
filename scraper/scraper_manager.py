@@ -341,9 +341,18 @@ class ScraperManager:
                          common_args["tmdb_id"] = tmdb_id
                          # Prowlarr's scrape_prowlarr_instance function signature:
                          # (instance, settings, imdb_id, title, year, content_type,
-                         #  season, episode, multi, tmdb_id)
+                         #  season, episode, multi, tmdb_id, episode_formats)
                          # Most are in common_args. tmdb_id is added here.
                          # It doesn't take 'genres' or 'is_translated_search'.
+                         #
+                         # episode_formats carries the absolute numbering anime is
+                         # actually published under. It was built for every anime
+                         # scrape but only ever handed to Nyaa, so Prowlarr was
+                         # asked for 'One Piece S19E10' when the releases are all
+                         # named 'One Piece 1069'.
+                         common_args["episode_formats"] = (
+                             episode_formats if is_anime and is_episode else None
+                         )
                     elif scraper_type in ['AIOStreams', 'AIOStreams-API']:
                          common_args["tmdb_id"] = tmdb_id
                          # AIOStreams supports both IMDB and TMDB IDs

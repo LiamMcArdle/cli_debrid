@@ -12,6 +12,21 @@ import re
 import json
 from scraper.functions.common import trim_magnet
 
+# Anime is published by absolute episode number ("One Piece 1069"), not SxxExx,
+# so the structured tvsearch below finds nothing for most shows. These are the
+# formats worth spending a keyword search on. 'regular' (S04E01) is already what
+# the tvsearch asks for; 'combined' (S04E60) is not a convention any release
+# group uses -- it exists only so filter_results can match a stray one; 'batch'
+# is an empty marker rather than a search term; 'season' (S02) duplicates the
+# title query. Measured 2026-09-08 over the 12 shows that were blacklisting:
+# the SxxExx query yielded 30 usable results from 817 raw and NOTHING AT ALL for
+# 6 of the 12, while these keyword queries yielded 191 usable from 438 raw.
+_SKIP_ANIME_FORMATS = frozenset({'regular', 'combined', 'batch', 'season'})
+_MAX_ANIME_KEYWORD_QUERIES = 2
+# The useful anime responses measured 1-140 results; 1000 is for index dumps.
+_ANIME_KEYWORD_LIMIT = 200
+
+
 # Query result cache — reduces API hits for duplicate NZB searches within TTL window
 _NZB_CACHE: Dict[str, tuple] = {}   # key -> (timestamp, results)
 _NZB_CACHE_LOCK = threading.Lock()
@@ -57,6 +72,30 @@ def _cache_set(key: str, results: List) -> None:
         _NZB_CACHE[key] = (now, results)
 
 
+def _anime_keyword_queries(clean_title: str, episode_formats: Dict[str, str]) -> List[str]:
+    """Absolute-numbering keyword searches for an anime episode.
+
+    episode_formats is already built for every anime scrape by
+    scraper.convert_anime_episode_format; it was simply never offered to
+    anything but Nyaa. Values are deduplicated because the XEM 'orig_' variants
+    frequently repeat a pattern already present.
+    """
+    queries: List[str] = []
+    for key, pattern in (episode_formats or {}).items():
+        base = key[5:] if key.startswith('orig_') else key
+        if base in _SKIP_ANIME_FORMATS:
+            continue
+        pattern = str(pattern or '').strip()
+        if not pattern:
+            continue
+        query = f"{clean_title} {pattern}"
+        if query not in queries:
+            queries.append(query)
+        if len(queries) >= _MAX_ANIME_KEYWORD_QUERIES:
+            break
+    return queries
+
+
 def _build_prowlarr_params_list(
     title: str,
     year: int,
@@ -67,6 +106,7 @@ def _build_prowlarr_params_list(
     episode: Optional[int],
     multi: bool,
     tags_setting: str,
+    episode_formats: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """Always build both ID-based and title-based queries to run simultaneously."""
     base = {'limit': 1000, 'offset': 0}
@@ -82,16 +122,18 @@ def _build_prowlarr_params_list(
     clean_title = rename_special_characters(title)
 
     if content_type.lower() == 'movie':
-        # 1. ID search
+        q = f"{clean_title} {year or ''}".strip()
+        # 1. ID search. The title rides along: an indexer that implements the ID
+        # search still uses the ID, and one that does not now gets a real search
+        # term instead of a request to dump its most recent `limit` entries.
         if imdb_id or tmdb_id:
-            p = {**base, 'type': 'movie', 'query': ''}
+            p = {**base, 'type': 'movie', 'query': q}
             if imdb_id:
                 p['imdbId'] = imdb_id.replace('tt', '')
             elif tmdb_id:
                 p['tmdbId'] = tmdb_id
             params_list.append(p)
         # 2. Title search
-        q = f"{clean_title} {year or ''}".strip()
         params_list.append({**base, 'type': 'movie', 'query': q})
 
     elif content_type.lower() == 'episode':
@@ -100,9 +142,10 @@ def _build_prowlarr_params_list(
             season_ep['season'] = season
             if episode is not None and not multi:
                 season_ep['episode'] = episode
-        # 1. ID search (empty query, structured season/ep)
+        # 1. ID search, structured season/ep. The title rides along for the same
+        # reason as the movie branch above.
         if imdb_id or tmdb_id:
-            p = {**base, 'type': 'tvsearch', 'query': '', **season_ep}
+            p = {**base, 'type': 'tvsearch', 'query': clean_title, **season_ep}
             if imdb_id:
                 p['imdbId'] = imdb_id.replace('tt', '')
             elif tmdb_id:
@@ -116,12 +159,23 @@ def _build_prowlarr_params_list(
             else:
                 q_parts.append(f'S{season:02d}')
         params_list.append({**base, 'type': 'tvsearch', 'query': ' '.join(q_parts), **season_ep})
+        # 3. Anime absolute numbering. A plain keyword search, because no
+        # Newznab category expresses "episode 1069 of a show with 23 seasons".
+        for anime_q in _anime_keyword_queries(clean_title, episode_formats):
+            params_list.append({**base, 'limit': _ANIME_KEYWORD_LIMIT,
+                                'type': 'search', 'query': anime_q})
 
     else:
         q = f"{clean_title} {year or ''}".strip()
         params_list.append({**base, 'type': 'search', 'query': q})
 
-    return params_list
+    # An empty search term asks any indexer that does not implement the ID
+    # search to return its most recent `limit` entries instead. Measured
+    # 2026-09-08: one such query returned the same 557-result index page for all
+    # 12 shows tested -- the same "Limitless"/XXX/soap-opera dump -- with ~zero
+    # relevant hits, and it accounted for roughly 74% of all results Prowlarr
+    # returned. Dropping the query is not enough; nothing may reintroduce one.
+    return [p for p in params_list if str(p.get('query') or '').strip()]
 
 
 def scrape_prowlarr_instance(
@@ -134,7 +188,8 @@ def scrape_prowlarr_instance(
     season: Optional[int] = None,
     episode: Optional[int] = None,
     multi: bool = False,
-    tmdb_id: Optional[str] = None
+    tmdb_id: Optional[str] = None,
+    episode_formats: Optional[Dict[str, str]] = None
 ) -> List[Dict[str, Any]]:
     logging.info(f"Scraping Prowlarr instance: {instance} for '{title}' ({year})")
     prowlarr_url = settings.get('url', '').rstrip('/')
@@ -157,7 +212,8 @@ def scrape_prowlarr_instance(
     seeders_only = get_setting('Scraping', 'prowlarr_seeders_only', get_setting('Scraping', 'jackett_seeders_only', True))
 
     params_list = _build_prowlarr_params_list(
-        title, year, content_type, imdb_id, tmdb_id, season, episode, multi, tags_setting
+        title, year, content_type, imdb_id, tmdb_id, season, episode, multi, tags_setting,
+        episode_formats=episode_formats
     )
 
     def _fetch(query_params):
