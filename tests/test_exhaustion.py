@@ -63,6 +63,50 @@ class KthDormantEntryBlacklists(unittest.TestCase):
         self.assertEqual(record['stage'], 'exhausted')
         self.assertEqual(update.call_args.kwargs['dormant_cycles'], 3)
 
+    def test_unanswered_scrape_neither_blacklists_nor_counts(self):
+        """A scrape where no scraper answered is not evidence of unavailability.
+
+        Nyaa spent 2026-09-06/08 parked behind a 429 while the general indexers
+        returned thousands of unrelated results, so every anime item failed with
+        real results in hand and burned a cycle it had not earned. The ladder's
+        hold covers the first few; this is the terminal guarantee.
+        """
+        qm = _manager()
+        with patch('queues.queue_manager.get_setting',
+                   side_effect=lambda s, key, d=None: 3 if key == 'dormant_cycles_before_blacklist' else d), \
+                patch('database.update_media_item', create=True):
+            qm.move_to_dormant(dict(_ITEM, dormant_cycles=2), "Scraping",
+                               failure_record=json.dumps(
+                                   {'stage': 'scrape_unavailable', 'raw': 4168,
+                                    'unavail': ['Nyaa']}))
+        qm.move_to_blacklisted.assert_not_called()
+        self.assertEqual(qm._move_item_to_queue.call_args.kwargs['dormant_cycles'], 2)
+
+    def test_unanswered_scrape_read_from_the_item_when_no_record_passed(self):
+        qm = _manager()
+        with patch('queues.queue_manager.get_setting',
+                   side_effect=lambda s, key, d=None: 3 if key == 'dormant_cycles_before_blacklist' else d), \
+                patch('database.update_media_item', create=True):
+            qm.move_to_dormant(
+                dict(_ITEM, dormant_cycles=2,
+                     last_scrape_failure=json.dumps({'stage': 'scrape_unavailable'})),
+                "Scraping")
+        qm.move_to_blacklisted.assert_not_called()
+        self.assertEqual(qm._move_item_to_queue.call_args.kwargs['dormant_cycles'], 2)
+
+    def test_a_fresh_answered_scrape_overrides_a_stale_unavailable_record(self):
+        """The record for THIS attempt wins over whatever the row still carries."""
+        qm = _manager()
+        with patch('queues.queue_manager.get_setting',
+                   side_effect=lambda s, key, d=None: 3 if key == 'dormant_cycles_before_blacklist' else d), \
+                patch('database.update_media_item', create=True):
+            qm.move_to_dormant(
+                dict(_ITEM, dormant_cycles=2,
+                     last_scrape_failure=json.dumps({'stage': 'scrape_unavailable'})),
+                "Scraping",
+                failure_record=json.dumps({'stage': 'scrape', 'raw': 12}))
+        qm.move_to_blacklisted.assert_called_once()
+
     def test_zero_cap_never_blacklists(self):
         qm, _ = self._dormant(40, k=0)
         qm.move_to_blacklisted.assert_not_called()

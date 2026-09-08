@@ -879,7 +879,25 @@ class QueueManager:
             exhaust_after = int(get_setting("Queue", "dormant_cycles_before_blacklist", 3))
         except (TypeError, ValueError):
             exhaust_after = 3
-        if exhaust_after > 0 and cycles_done + 1 >= exhaust_after:
+        # A scrape that never got an answer is not evidence the item is
+        # unavailable, so it must not spend the item's budget. The ladder already
+        # applies this rule one level up (advance_retry_ladder's hold_rung), but
+        # holds are capped and fall through to here, so the guarantee belongs at
+        # the single terminal site: retry budget is only ever spent on an answer
+        # we actually received. Without this, a scraper outage blacklists a whole
+        # library slowly instead of quickly.
+        from queues.states import failure_stage
+        never_answered = failure_stage(
+            {'last_scrape_failure': failure_record} if failure_record is not None else item
+        ) == 'scrape_unavailable'
+        if never_answered:
+            logging.info(
+                f"Item {item_identifier} reached Dormant on a scrape where no scraper "
+                f"answered; not counting the cycle (still {cycles_done}) and not "
+                f"blacklisting."
+            )
+
+        if not never_answered and exhaust_after > 0 and cycles_done + 1 >= exhaust_after:
             record = build_failure_record(
                 stage='exhausted', error=f"{cycles_done + 1} Dormant cycles without a usable result")
             logging.info(
@@ -896,7 +914,8 @@ class QueueManager:
         next_retry_at = datetime.now() + get_dormant_interval()
         logging.info(
             f"Moving item {item_identifier} to Dormant from {from_queue} "
-            f"(cycle {cycles_done + 1}, next re-check {next_retry_at.isoformat(timespec='seconds')})"
+            f"(cycle {cycles_done if never_answered else cycles_done + 1}, "
+            f"next re-check {next_retry_at.isoformat(timespec='seconds')})"
         )
 
         # sleep_cycles is left at its terminal value on purpose: a Dormant item
@@ -908,7 +927,7 @@ class QueueManager:
         # with a genuinely Collected row in the reconcile_queues duplicate sweep.
         extra = {
             'next_retry_at': next_retry_at,
-            'dormant_cycles': cycles_done + 1,
+            'dormant_cycles': cycles_done if never_answered else cycles_done + 1,
             'filled_by_title': None,
             'filled_by_magnet': None,
             'filled_by_torrent_id': None,
