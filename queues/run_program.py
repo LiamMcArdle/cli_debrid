@@ -113,10 +113,6 @@ except ImportError:
 queue_logger = logging.getLogger('queue_logger')
 program_runner = None
 
-# RSS above which task_trim_memory also logs a heap census. Baseline after a
-# restart is ~600 MB, so this only fires once the process has actually grown.
-CENSUS_RSS_THRESHOLD_KB = 700 * 1024
-
 # Database migration check at startup
 migrate_plex_removal_database()
 
@@ -9175,29 +9171,6 @@ class ProgramRunner:
             logging.debug(f"[TRIM_MEMORY] Could not evict RD library cache: {e}")
 
         collected = gc.collect()
-
-        # Heap census, the same one /debug/api/memory_snapshot returns, written
-        # to the log instead. That endpoint is admin_required and takes no API
-        # token, so the census is unreachable without a browser session -- but
-        # this task already runs hourly, already holds the GIL and has already
-        # just collected, so counting live objects here costs one extra pass and
-        # only when RSS is high enough to be worth reading.
-        #
-        # Counts alone do not name a leak; the DELTA between two hourly lines
-        # does. Whichever type climbs in step with RSS is the retained one.
-        try:
-            if before_rss and before_rss > CENSUS_RSS_THRESHOLD_KB:
-                from collections import Counter as _Counter
-                _objects = gc.get_objects()
-                _counts = _Counter(type(o).__name__ for o in _objects)
-                _total = len(_objects)
-                del _objects
-                logging.info(
-                    f"[TRIM_MEMORY] Heap census at {before_rss // 1024} MB: "
-                    f"{_total} live objects; top types: {_counts.most_common(25)}"
-                )
-        except Exception as _census_err:
-            logging.debug(f"[TRIM_MEMORY] Heap census skipped: {_census_err}")
 
         trim_ok = False
         try:
