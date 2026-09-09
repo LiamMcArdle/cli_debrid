@@ -84,6 +84,12 @@ class TitleDecides(unittest.TestCase):
         self.assertEqual((verdict, candidates), (_sr.ABS_AMBIGUOUS, (36, 1630)))
         self.assertEqual(absolute, 36)
 
+    def test_identical_two_parter_titles_keep_the_positional_as_primary(self):
+        rows = [row(18, 58, 'Performing with Fiery Charm!', '2015-01-08', 1001),
+                row(18, 59, 'Performing with Fiery Charm!', '2015-01-08', 1002)]
+        self.assertEqual(resolve(rows, 18, 59, 'Performing with Fiery Charm!', '2015-01-08'),
+                         (1002, _sr.ABS_AMBIGUOUS, (1001, 1002)))
+
     def test_consistent_dual_rows_at_one_absolute_are_not_ambiguous(self):
         rows = [row(1, 27, 'Same', '2009-10-11', 27), row(2, 1, 'Same', '2009-10-11', 27)]
         self.assertEqual(resolve(rows, 2, 1, 'Same', '2009-10-10'), (27, _sr.ABS_VERIFIED_TITLE, ()))

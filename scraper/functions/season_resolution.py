@@ -846,7 +846,11 @@ def absolute_episode_from_identity(
                 return by_date[0], ABS_AMBIGUOUS_DATE, found
             if estimate is not None and estimate in found:
                 return int(estimate), ABS_AMBIGUOUS_ESTIMATE, found
-            return found[0], ABS_AMBIGUOUS, found
+            # Every candidate is asked for; the primary is the one the
+            # positional row already names when it is among them (a
+            # two-parter with identical titles), else the lowest.
+            primary = positional_abs if positional_abs in found else found[0]
+            return primary, ABS_AMBIGUOUS, found
 
     if positional_abs is not None:
         positional_date = parse_utc_date(_row_field(positional, 'first_aired'))
