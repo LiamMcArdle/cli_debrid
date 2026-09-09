@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 import time
+import unicodedata
 from typing import List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,6 +24,12 @@ import database  # noqa: F401  (circular import: must be imported first)
 from cli_battery.app import direct_api
 from cli_battery.app.database import Item, Metadata
 from cli_battery.app.direct_api import SEASON_TITLES_KEY, _merge_season_titles_row, _trakt_season_titles
+
+
+def _fold(text: Optional[str]) -> str:
+    """Accent-insensitive, case-insensitive: 'Pokemon' finds 'Pokémon'."""
+    decomposed = unicodedata.normalize('NFKD', text or '')
+    return ''.join(c for c in decomposed if not unicodedata.combining(c)).lower()
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -38,7 +45,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         for show in shows:
             if not show.imdb_id:
                 continue
-            if args.show and args.show.lower() not in (show.title or '').lower():
+            if args.show and _fold(args.show) not in _fold(show.title):
                 continue
             row = session.query(Metadata).filter_by(item_id=show.id, key=SEASON_TITLES_KEY).first()
             sources = set(filter(None, (row.provider or '').split(','))) if row else set()
