@@ -40,6 +40,53 @@ class SeasonTitlesFromProviderData(unittest.TestCase):
         self.assertEqual(season_titles_from(None), {})
 
 
+class TraktSupplementsUnnamedSeasons(unittest.TestCase):
+    """TVDB names almost no seasons; Trakt names Pokemon's 25. One request per
+    refresh, only when the active source gave nothing."""
+
+    NAMED = {1: {'title': 'Indigo League', 'episodes': {}}}
+    UNNAMED = {1: {'title': None, 'episodes': {}}, 2: {'episodes': {}}}
+
+    def _run(self, seasons, trakt_titles=None, trakt_error=None, active=None, imdb_id='tt0168366'):
+        session = MagicMock()
+        session.query.return_value.filter_by.return_value.first.return_value = None
+        active = active or direct_api.tvdb_client
+        with patch.object(direct_api, '_get_metadata_client', return_value=active), \
+                patch.object(direct_api.trakt_client, 'get_show_season_titles',
+                             side_effect=trakt_error, return_value=trakt_titles) as trakt, \
+                patch.object(direct_api, '_merge_season_titles_row') as merge:
+            direct_api._upsert_season_titles(7, seasons, session, imdb_id=imdb_id)
+        return trakt, merge
+
+    def test_provider_names_win_without_asking_trakt(self):
+        trakt, merge = self._run(self.NAMED, trakt_titles={1: 'Other'})
+        trakt.assert_not_called()
+        merge.assert_called_once()
+        self.assertEqual(merge.call_args.args[3], {'1': ['Indigo League']})
+        self.assertEqual(merge.call_args.kwargs['source'], 'provider')
+
+    def test_unnamed_seasons_take_trakt_names(self):
+        trakt, merge = self._run(self.UNNAMED, trakt_titles={0: 'Specials', 1: 'Indigo League', 18: 'XY: Kalos Quest'})
+        trakt.assert_called_once_with('tt0168366')
+        self.assertEqual(merge.call_args.args[3], {'1': ['Indigo League'], '18': ['XY: Kalos Quest']})
+        self.assertEqual(merge.call_args.kwargs['source'], 'trakt')
+
+    def test_trakt_silence_or_failure_writes_nothing(self):
+        for kwargs in ({'trakt_titles': None}, {'trakt_titles': {}}, {'trakt_error': RuntimeError('down')}):
+            _, merge = self._run(self.UNNAMED, **kwargs)
+            merge.assert_not_called()
+
+    def test_trakt_as_the_active_source_is_not_asked_twice(self):
+        trakt, merge = self._run(self.UNNAMED, trakt_titles={1: 'X'}, active=direct_api.trakt_client)
+        trakt.assert_not_called()
+        merge.assert_not_called()
+
+    def test_no_imdb_id_means_no_lookup(self):
+        trakt, merge = self._run(self.UNNAMED, trakt_titles={1: 'X'}, imdb_id=None)
+        trakt.assert_not_called()
+        merge.assert_not_called()
+
+
 class GetShowSeasonTitles(unittest.TestCase):
     def _session_with(self, item):
         session = MagicMock()

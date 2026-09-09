@@ -275,6 +275,27 @@ def get_show_seasons_and_episodes(imdb_id: str, include_specials: bool = False) 
     return processed, 'trakt'
 
 
+def get_show_season_titles(imdb_id: str) -> Optional[Dict[int, str]]:
+    """{season_number: title} from Trakt's seasons list, without episodes.
+
+    TVDB's season list carries no names for most shows (every Pokemon season
+    comes back ``name: null``), so when it is the active source the battery
+    supplements the names from here: one request per show refresh.
+    """
+    url = f"{TRAKT_BASE_URL}/shows/{imdb_id}/seasons?extended=full"
+    resp = _make_request(url)
+    if not resp or resp.status_code != 200:
+        return None
+    titles: Dict[int, str] = {}
+    for season in resp.json() or []:
+        if not isinstance(season, dict) or season.get('number') is None:
+            continue
+        title = season.get('title')
+        if isinstance(title, str) and title.strip():
+            titles[int(season['number'])] = title.strip()
+    return titles
+
+
 def get_show_aliases(slug: str) -> Optional[dict]:
     url = f"{TRAKT_BASE_URL}/shows/{slug}/aliases"
     resp = _make_request(url)

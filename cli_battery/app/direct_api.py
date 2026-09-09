@@ -452,7 +452,7 @@ def _persist_item(imdb_id: str, data: dict, session: SqlAlchemySession):
 
     # Seasons + episodes (shows only)
     if seasons_data and isinstance(seasons_data, dict):
-        _upsert_seasons_and_episodes(item.id, seasons_data, session)
+        _upsert_seasons_and_episodes(item.id, seasons_data, session, imdb_id=imdb_id)
 
 
 SEASON_TITLES_KEY = 'season_titles'
@@ -483,18 +483,39 @@ def season_titles_from(seasons_data: dict) -> Dict[str, List[str]]:
     return titles
 
 
-def _upsert_season_titles(item_id: int, seasons_data: dict, session: SqlAlchemySession) -> None:
+def _trakt_season_titles(imdb_id: str) -> Dict[str, List[str]]:
+    """Season names from Trakt, filtered like the provider's own."""
+    try:
+        titles = trakt_client.get_show_season_titles(imdb_id)
+    except Exception as exc:
+        logger.debug(f"Trakt season titles unavailable for {imdb_id}: {exc}")
+        return {}
+    return season_titles_from({number: {'title': title} for number, title in (titles or {}).items()})
+
+
+def _upsert_season_titles(item_id: int, seasons_data: dict, session: SqlAlchemySession,
+                          imdb_id: Optional[str] = None) -> None:
     """Persist the seasons' own names under one Metadata row.
 
     The Season table has no title column and adding one is a schema change;
     the Metadata table already carries per-show JSON blobs (aliases), and a
     season name is read the same way an alias is -- as matching evidence.
+
+    TVDB's season list names almost nothing (measured 2026-09-09: 74 of 1,569
+    shows had any season name, all of them from TheXEM; Pokemon's 25 named
+    seasons all came back ``name: null``). When the active source gave no
+    names and ``imdb_id`` is known, Trakt's seasons list supplies them -- one
+    request per show refresh.
     """
     titles = season_titles_from(seasons_data)
+    source = 'provider'
+    if not titles and imdb_id and _get_metadata_client() is not trakt_client:
+        titles = _trakt_season_titles(imdb_id)
+        source = 'trakt'
     if not titles:
         return
     existing = session.query(Metadata).filter_by(item_id=item_id, key=SEASON_TITLES_KEY).first()
-    _merge_season_titles_row(session, item_id, existing, titles, source='provider')
+    _merge_season_titles_row(session, item_id, existing, titles, source=source)
 
 
 def _decode_titles(value) -> Dict[str, List[str]]:
@@ -538,7 +559,8 @@ def _merge_season_titles_row(session: SqlAlchemySession, item_id: int, existing,
                              provider=provider, last_updated=now))
 
 
-def _upsert_seasons_and_episodes(item_id: int, seasons_data: dict, session: SqlAlchemySession):
+def _upsert_seasons_and_episodes(item_id: int, seasons_data: dict, session: SqlAlchemySession,
+                                 imdb_id: Optional[str] = None):
     """Bulk upsert seasons and episodes using SQLite ON CONFLICT."""
     import iso8601
 
@@ -604,7 +626,7 @@ def _upsert_seasons_and_episodes(item_id: int, seasons_data: dict, session: SqlA
         session.execute(stmt)
         session.flush()
 
-    _upsert_season_titles(item_id, seasons_data, session)
+    _upsert_season_titles(item_id, seasons_data, session, imdb_id=imdb_id)
 
     season_map = {
         s.season_number: s.id
@@ -1251,7 +1273,7 @@ class DirectAPI:
                 # Fetch from metadata provider (may open nested sessions)
                 seasons_data, source = _get_metadata_client().get_show_seasons_and_episodes(imdb_id, include_specials=True)
                 if seasons_data and item_id is not None:
-                    _upsert_seasons_and_episodes(item_id, seasons_data, session)
+                    _upsert_seasons_and_episodes(item_id, seasons_data, session, imdb_id=imdb_id)
                     session.query(Item).filter_by(id=item_id).update(
                         {'updated_at': datetime.now(_get_local_tz())}
                     )
