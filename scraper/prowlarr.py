@@ -408,17 +408,26 @@ def parse_prowlarr_results(data: List[Dict[str, Any]], ins_name: str, seeders_on
 
     return results
 
+# Characters that must not reach an indexer as part of a search term. Prowlarr's
+# Zilean definition percent-encodes the keywords a second time, so anything that
+# needs escaping arrives as literal '%C3%97' and returns nothing: measured
+# 2026-09-08, 2,167 of 2,167 non-ASCII queries to Zilean came back empty, and
+# 58.6% of all queries carried a trigger. The body below shipped commented out
+# inside a docstring in e7b37abb, so the function returned its input unchanged.
+#
+# '×' becomes ' x ' rather than nothing: 'HUNTER HUNTER' finds a 2020 film,
+# 'Hunter x Hunter' finds the show (129 of 129 results named it).
+_SPECIAL_CHARACTER_REPLACEMENTS = (
+    ("&", ""), ("\u00fc", "ue"), ("\u00e4", "ae"), ("\u00e2", "a"),
+    ("\u00e1", "a"), ("\u00e0", "a"), ("\u00f6", "oe"), ("\u00f4", "o"),
+    ("\u00e8", "e"), ("\u00e9", "e"), ("\u00ea", "e"), ("\u00d7", " x "),
+    (":", ""), ("(", ""), (")", ""), ("[", ""), ("]", ""), ("`", ""),
+    (",", ""), ("!", ""), ("?", ""), (" - ", " "), ("'", ""), ("\u2019", ""),
+    ("*", ""), (".", " "),
+)
+
+
 def rename_special_characters(text: str) -> str:
-    '''
-    replacements = [
-        ("&", ""), ("\u00fc", "ue"), ("\u00e4", "ae"), ("\u00e2", "a"),
-        ("\u00e1", "a"), ("\u00e0", "a"), ("\u00f6", "oe"), ("\u00f4", "o"),
-        ("\u00e8", "e"), (":", ""), ("(", ""), (")", ""), ("`", ""),
-        (",", ""), ("!", ""), ("?", ""), (" - ", " "), ("'", ""),
-        ("*", ""), (".", " "),
-    ]
-    for old, new in replacements:
+    for old, new in _SPECIAL_CHARACTER_REPLACEMENTS:
         text = text.replace(old, new)
-    text = text.replace("'", "")
-    '''
-    return text
+    return " ".join(text.split())

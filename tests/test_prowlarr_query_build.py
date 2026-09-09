@@ -143,3 +143,38 @@ class TestUnchangedBehaviour(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestSearchTermSanitiser(unittest.TestCase):
+    """rename_special_characters shipped with its body inside a docstring and
+    returned its input unchanged; Zilean double-encodes anything that needs
+    escaping, so punctuated and accented titles returned nothing (2,167 of
+    2,167 non-ASCII queries on 2026-09-08)."""
+
+    def _clean(self, s):
+        from scraper.prowlarr import rename_special_characters
+        return rename_special_characters(s)
+
+    def test_multiplication_sign_becomes_x_not_nothing(self):
+        # 'HUNTER HUNTER' finds a 2020 film; 'HUNTER x HUNTER' finds the show.
+        self.assertEqual(self._clean('HUNTER×HUNTER'), 'HUNTER x HUNTER')
+
+    def test_accents_colons_and_parentheses_are_stripped(self):
+        self.assertEqual(self._clean('Pokémon: Indigo League (1998)'), 'Pokemon Indigo League 1998')
+        self.assertEqual(self._clean('One Piece: Egghead Island (1089-Current)'), 'One Piece Egghead Island 1089-Current')
+        self.assertEqual(self._clean("JoJo's Bizarre Adventure"), 'JoJos Bizarre Adventure')
+
+    def test_plain_titles_are_untouched(self):
+        self.assertEqual(self._clean('One Piece'), 'One Piece')
+        self.assertEqual(self._clean('Bleach'), 'Bleach')
+
+    def test_no_query_leaves_the_builder_with_a_trigger_character(self):
+        from scraper.prowlarr import _build_prowlarr_params_list
+        params = _build_prowlarr_params_list('Pokémon: Indigo League (1998)', 1998, 'episode',
+                                             'tt0168366', None, 18, 53, False, '',
+                                             episode_formats={'absolute': '1146'})
+        self.assertTrue(params)
+        for p in params:
+            q = p.get('query', '')
+            for ch in ':()é×':
+                self.assertNotIn(ch, q, f"{ch!r} reached the query: {q!r}")
