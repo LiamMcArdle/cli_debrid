@@ -14,6 +14,10 @@ from utilities.settings import get_setting
 from .torrent_processor import TorrentProcessor
 from .media_matcher import MediaMatcher
 from database.torrent_tracking import update_adding_error
+from scraper.park import debrid_park_remaining
+
+# Error prefix that routes _handle_failed_item to the provider_blocked hold.
+PROVIDER_BLOCKED_PREFIX = "all candidates refused: "
 
 
 def _related_fill_candidates(item):
@@ -256,6 +260,16 @@ class AddingQueue:
              if _tid.startswith('nzb:') and _tid[4:] in self._nzb_downloading_job_ids:
                  continue
 
+             # A parked debrid provider cannot add anything. Leave the item queued:
+             # an outage is not the item's failure and must not cost it a rung.
+             _prov = getattr(self.debrid_provider, 'PROVIDER_NAME', None)
+             _park = debrid_park_remaining(_prov)
+             if _park > 0 and not _tid.startswith('nzb:'):
+                 if time.time() - getattr(self, '_last_park_log', 0) > 60:
+                     self._last_park_log = time.time()
+                     logging.warning(f"[AddingQueue] {_prov} is parked for another {_park / 60:.0f} min; holding {len(self.items)} item(s) in place.")
+                 continue
+
              items_to_process.append(item)
 
         if not items_to_process:
@@ -470,6 +484,10 @@ class AddingQueue:
                     self.remove_item(item) # Remove from memory queue
                     continue # Move to next item
 
+                # Side channels written by process_results for this pass only.
+                _pb = item.pop('_provider_blocked', None) or {}
+                item.pop('_cache_memo', None)
+
                 # Use torrent_info and magnet for the check, chosen_result_info is handled later
                 if (not torrent_info or not magnet): # Check again after potential uncached attempt
                     logging.error(f"No valid torrent info or magnet found for {item_identifier} after checking cache/uncached modes.")
@@ -498,6 +516,14 @@ class AddingQueue:
                             self.items.append(item)
                         except Exception:
                             pass
+                        continue
+                    # Every torrent candidate refused by the provider's takedown list:
+                    # neither a matching failure nor ours. Held, not failed.
+                    if _pb.get('total') and _pb.get('blocked') == _pb.get('total'):
+                        self._handle_failed_item(
+                            item,
+                            f"{PROVIDER_BLOCKED_PREFIX}{_pb['blocked']} candidate(s) refused by {', '.join(_pb['providers'])}",
+                            queue_manager)
                         continue
                     # All NZB candidates exhausted — distinguish missing-segments (expired usenet)
                     # from general failure so _handle_failed_item can route to Sleeping instead of Blacklist
@@ -931,6 +957,19 @@ class AddingQueue:
                 return # Exit after handling upgrade failure
 
             # --- Non-upgrade failure handling ---
+
+            if error.startswith(PROVIDER_BLOCKED_PREFIX):
+                # Every candidate is on the provider's takedown list. Not a matching
+                # failure (no single-scraper sibling sweep), not our failure (no
+                # rung): hold the item visibly and re-scrape on the dormant cadence.
+                # A new release, or a new provider, makes it eligible again.
+                from queues.retry_ladder import build_failure_record
+                logging.warning(f"{item_identifier}: {error}. Holding as provider_blocked.")
+                queue_manager.advance_retry_ladder(
+                    item, "Adding",
+                    failure_record=build_failure_record(stage='provider_blocked', error=error),
+                    hold_rung=True)
+                return
 
             # Check for specific matching failure errors (adjust strings if needed)
             if "No matching files found in torrent" in error or \

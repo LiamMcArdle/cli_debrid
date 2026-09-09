@@ -559,12 +559,14 @@ class QueueManager:
 
     @staticmethod
     def _woke_from_hold(item: Dict[str, Any]) -> bool:
-        """Whether the item's last failure held its rung (scraper unavailable)."""
+        """Whether the item's last failure held its rung rather than spending it
+        (no scraper answered, or the debrid provider refused every candidate)."""
+        from queues.states import HELD_STAGES
         try:
             record = json.loads(item.get('last_scrape_failure') or '{}')
         except (TypeError, ValueError):
             return False
-        return isinstance(record, dict) and record.get('stage') == 'scrape_unavailable'
+        return isinstance(record, dict) and record.get('stage') in HELD_STAGES
 
     def move_to_upgrading(self, item: Dict[str, Any], from_queue: str):
         item_identifier = self.generate_identifier(item)
@@ -886,15 +888,15 @@ class QueueManager:
         # the single terminal site: retry budget is only ever spent on an answer
         # we actually received. Without this, a scraper outage blacklists a whole
         # library slowly instead of quickly.
-        from queues.states import failure_stage
+        from queues.states import failure_stage, HELD_STAGES
         never_answered = failure_stage(
             {'last_scrape_failure': failure_record} if failure_record is not None else item
-        ) == 'scrape_unavailable'
+        ) in HELD_STAGES
         if never_answered:
             logging.info(
-                f"Item {item_identifier} reached Dormant on a scrape where no scraper "
-                f"answered; not counting the cycle (still {cycles_done}) and not "
-                f"blacklisting."
+                f"Item {item_identifier} reached Dormant on a failure that was not its own "
+                f"(scraper unavailable / provider refused every candidate); not counting "
+                f"the cycle (still {cycles_done}) and not blacklisting."
             )
 
         if not never_answered and exhaust_after > 0 and cycles_done + 1 >= exhaust_after:
@@ -984,6 +986,33 @@ class QueueManager:
                 return
 
         if hold_rung:
+            import json as _json
+            try:
+                held_stage = _json.loads(failure_record or '{}').get('stage')
+            except (TypeError, ValueError, AttributeError):
+                held_stage = None
+            if held_stage == 'provider_blocked':
+                # Every candidate refused by the debrid provider's takedown list.
+                # Unlike a scraper outage this has no cap: there is nothing to wait
+                # out, only new releases (or a new provider) to look for, so the
+                # item re-scrapes on the dormant cadence at its current rung.
+                import random
+                from queues.retry_ladder import get_dormant_interval
+                try:
+                    current_rung = int(item.get('sleep_cycles') or 0)
+                except (TypeError, ValueError):
+                    current_rung = 0
+                hold = get_dormant_interval()
+                hold = hold + hold * random.uniform(0, 0.2)
+                deadline = datetime.now() + hold
+                logging.info(
+                    f"Item {item_identifier}: every candidate is refused by the debrid provider. "
+                    f"Holding at rung {current_rung}, re-scraping for new releases at "
+                    f"{deadline.isoformat(timespec='seconds')}."
+                )
+                self.move_to_sleeping(item, from_queue, rung=current_rung, next_retry_at=deadline,
+                                      failure_record=failure_record)
+                return
             # Bound consecutive holds. Holding is right during a genuine
             # outage, but a permanently unreachable or misconfigured scraper
             # produces the same signal forever -- without a cap every affected

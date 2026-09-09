@@ -13,6 +13,11 @@ RELATED_FILL_STATES = ('Wanted', 'Scraping', 'Sleeping', 'Dormant', 'Blacklisted
 
 EXHAUSTED_STAGE = 'exhausted'
 
+# Failure stages that hold an item's rung instead of spending it: the answer
+# was "unknown" (no scraper replied) or "not here" (the debrid provider refuses
+# every candidate). Neither is evidence the item cannot be filled.
+HELD_STAGES = ('scrape_unavailable', 'provider_blocked')
+
 
 def failure_stage(item: Dict[str, Any]):
     """The ``stage`` recorded in the item's last_scrape_failure, or None."""

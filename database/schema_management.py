@@ -719,6 +719,10 @@ def migrate_schema():
             WHERE filled_by_file IS NOT NULL
         ''')
 
+        # Hashes a debrid provider has refused (HTTP 451), per provider.
+        from database.provider_blocks import CREATE_SQL as _provider_blocks_sql
+        cursor.execute(_provider_blocks_sql)
+
         # Add new table for tracking tv shows
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS tv_shows (
@@ -1087,6 +1091,9 @@ def create_tables():
             )
         ''')
         
+        from database.provider_blocks import CREATE_SQL as _provider_blocks_sql
+        cursor.execute(_provider_blocks_sql)
+
         # Add new table for tracking symlinked files for Plex verification
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS symlinked_files_verification (

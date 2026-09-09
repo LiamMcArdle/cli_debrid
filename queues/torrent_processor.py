@@ -16,7 +16,8 @@ import inspect
 from datetime import datetime, timedelta
 
 from debrid import get_debrid_providers
-from debrid.base import DebridProvider, TooManyDownloadsError, ProviderUnavailableError
+from debrid.base import DebridProvider, TooManyDownloadsError, ProviderUnavailableError, ContentBlockedError
+from database.provider_blocks import record_block, is_blocked_everywhere, hash_from_magnet
 from debrid.common import (
     extract_hash_from_magnet,
     extract_hash_from_file,
@@ -414,27 +415,14 @@ class TorrentProcessor:
         caller_info = f"{caller_frame.f_code.co_filename}:{caller_frame.f_code.co_name}:{caller_frame.f_lineno}"
         logging.info(f"TorrentProcessor.add_to_account called from {caller_info}")
 
-        def _remember_blocked(magnet_str: Optional[str], reason: str) -> None:
-            """Record a permanently-unaddable hash so ranking skips it next scrape.
-
-            Without this, a DMCA-blocked release stays the top-ranked result and
-            every retry/sibling/wake re-attempts the identical add forever
-            (observed: 800+ RD 451 responses in one evening).
-            """
-            import re as _re
-            try:
-                m = _re.search(r'btih:([a-fA-F0-9]{40})', magnet_str or '')
-                if m:
-                    add_to_not_wanted(m.group(1).lower())
-                    logging.warning(f"Hash {m.group(1).lower()} is permanently blocked ({reason}); added to not_wanted.")
-            except Exception as nw_err:
-                logging.error(f"Could not record blocked hash: {nw_err}")
-
         try:
             magnet, temp_file = self.process_torrent(magnet_or_url)
             if not magnet and not temp_file:
                 logging.warning(f"Could not process {magnet_or_url}. Aborting add_to_account.")
                 return None
+            # A refusal is recorded against the provider that refused, so ranking
+            # skips the hash there next scrape while a fallback may still serve it.
+            add_hash = hash_from_magnet(magnet) or (extract_hash_from_file(temp_file) if temp_file else None)
 
             providers = self._providers
             last_error = None
@@ -460,6 +448,13 @@ class TorrentProcessor:
                             logging.error(f"[{provider.PROVIDER_NAME}] Attempt {attempt + 1}: no torrent ID returned.")
                             if attempt == add_max_retries - 1:
                                 last_error = "no ID returned"
+                    except ContentBlockedError as blocked:
+                        record_block(blocked.hash_value or add_hash, provider.PROVIDER_NAME,
+                                     reason=blocked.error or 'HTTP 451', error_code=blocked.error_code)
+                        logging.warning(f"[{provider.PROVIDER_NAME}] refuses this content (HTTP 451) — trying next provider.")
+                        last_error = f"451 ({provider.PROVIDER_NAME})"
+                        blocked_451 = True
+                        break
                     except ProviderUnavailableError as pue:
                         err_str = str(pue)
                         if "451" in err_str:
@@ -517,13 +512,11 @@ class TorrentProcessor:
                     # behavior for blocked content, not a transient failure.
                     if "404" in str(e):
                         vanished_after_add = True
+                        record_block(add_hash, provider.PROVIDER_NAME,
+                                     reason='deleted by provider immediately after add')
                     logging.error(f"[{provider.PROVIDER_NAME}] Error fetching torrent info: {e}", exc_info=True)
 
             logging.error(f"All providers failed to add torrent. Last error: {last_error}")
-            if blocked_451:
-                _remember_blocked(magnet, "451 DMCA")
-            elif vanished_after_add:
-                _remember_blocked(magnet, "deleted by provider immediately after add")
             return None
 
         except Exception as e:
@@ -940,7 +933,16 @@ class TorrentProcessor:
         """
         item_identifier = item.get('title', 'Unknown') if item else 'Unknown'
         logging.info(f"[{item_identifier}] Starting to process {len(results)} results (accept_uncached={accept_uncached})")
-        
+
+        # One cache check per hash per item. The Adding queue calls this twice
+        # (cached-only, then hybrid) and the same hash arrives from several
+        # sources, so without a memo each candidate cost 2-4 add/info/delete
+        # round trips (one One Piece hash: 98). Kept on the item dict because
+        # both passes share it; primitives only, it may be serialised.
+        cache_memo = item.setdefault('_cache_memo', {}) if item is not None else {}
+        provider_names = [p.PROVIDER_NAME for p in self._providers]
+        refused_candidates = 0
+
         for idx, result in enumerate(results, 1):
             chosen_result_for_return = None # Initialize variable to hold the chosen result
             try:
@@ -979,7 +981,14 @@ class TorrentProcessor:
                 if not magnet and not temp_file:
                     logging.warning(f"[{item_identifier}] [Result {idx}/{len(results)}] Failed to process magnet/torrent")
                     continue
-                    
+
+                result_hash = extract_hash_from_magnet(magnet) if magnet else extract_hash_from_file(temp_file)
+                result_hash = result_hash.lower() if result_hash else None
+                if result_hash and is_blocked_everywhere(result_hash, provider_names):
+                    refused_candidates += 1
+                    logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] Refused by {', '.join(provider_names)} on an earlier attempt, skipping")
+                    continue
+
                 logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] PHASE: Cache Check - Starting cache status check")
 
                 # Create a temporary item dict for passing to check_cache_status
@@ -1008,7 +1017,14 @@ class TorrentProcessor:
                         logging.warning(f"[{prov.PROVIDER_NAME}] cache check error: {_e}")
                         return prov, None, 'error'
 
-                if not providers:
+                memo_hit = cache_memo.get(result_hash) if result_hash else None
+                if memo_hit is not None:
+                    is_cached, cache_source, memo_provider = memo_hit
+                    winning_provider = next((p for p in providers if p.PROVIDER_NAME == memo_provider), self.debrid_provider)
+                    if is_cached:
+                        self.debrid_provider = winning_provider
+                    logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] Reusing this pass's cache result ({'cached' if is_cached else 'not cached' if is_cached is False else 'error'})")
+                elif not providers:
                     # usenet-only setup: no debrid provider to cache-check a
                     # torrent result. Leave is_cached False (ThreadPoolExecutor
                     # would raise on max_workers=0).
@@ -1028,11 +1044,18 @@ class TorrentProcessor:
                                 # Update processor's active provider so add_to_account uses same one
                                 self.debrid_provider = _prov
 
+                if result_hash and memo_hit is None:
+                    cache_memo[result_hash] = (is_cached, cache_source, getattr(winning_provider, 'PROVIDER_NAME', None))
+
                 if is_cached:
                     logging.info(f"[{item_identifier}] Cached on {winning_provider.PROVIDER_NAME}")
-                    
+
                 if is_cached is None:
-                    logging.warning(f"[{item_identifier}] [Result {idx}/{len(results)}] Cache check returned None, skipping result")
+                    if result_hash and is_blocked_everywhere(result_hash, provider_names):
+                        refused_candidates += 1
+                        logging.warning(f"[{item_identifier}] [Result {idx}/{len(results)}] Refused by {', '.join(provider_names)}, skipping result")
+                    else:
+                        logging.warning(f"[{item_identifier}] [Result {idx}/{len(results)}] Cache check returned None, skipping result")
                     continue
                     
                 logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] Cache status: {'Cached' if is_cached else 'Not cached'}")
@@ -1394,4 +1417,9 @@ class TorrentProcessor:
                 continue
                 
         logging.info(f"[{item_identifier}] No suitable results found after processing all options")
+        if item is not None:
+            # The Adding queue reads this to tell "every candidate refused by the
+            # provider" apart from "nothing usable": the former is held, not failed.
+            item['_provider_blocked'] = {'blocked': refused_candidates, 'total': len(results),
+                                         'providers': provider_names}
         return None, None, None # Return None for all three if no suitable result found

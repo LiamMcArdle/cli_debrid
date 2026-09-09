@@ -55,6 +55,25 @@ class RateLimitError(DebridProviderError):
     """Exception raised when the debrid service rate limit is exceeded"""
     pass
 
+class ContentBlockedError(DebridProviderError):
+    """The provider refuses this specific content.
+
+    Real-Debrid answers HTTP 451 (numeric error 35, "Infringing file") to
+    addMagnet/addTorrent for a hash on its takedown list, and keeps answering
+    it while other hashes add fine in the same second. That is a property of
+    the hash on that provider -- neither an outage (nothing to wait for) nor a
+    broken torrent (another provider may serve it) -- so it carries its own
+    type instead of hiding inside ProviderUnavailableError.
+    """
+    def __init__(self, message: str, hash_value: Optional[str] = None,
+                 provider: Optional[str] = None, error: Optional[str] = None,
+                 error_code: Optional[int] = None):
+        super().__init__(message)
+        self.hash_value = hash_value
+        self.provider = provider
+        self.error = error
+        self.error_code = error_code
+
 class DebridProvider(ABC):
     """Abstract base class that defines the interface for debrid providers.
 

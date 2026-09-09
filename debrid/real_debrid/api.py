@@ -7,7 +7,7 @@ import threading
 from typing import Optional, Dict, Any, Union, List
 from pathlib import Path
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from ..base import ProviderUnavailableError, RateLimitError
+from ..base import ProviderUnavailableError, RateLimitError, ContentBlockedError
 from .exceptions import RealDebridAPIError, RealDebridAuthError
 from utilities.settings import get_setting
 from routes.api_tracker import api
@@ -52,13 +52,31 @@ def should_retry_error(exception: Exception) -> bool:
         return exception.response.status_code in [503, 504]  # Service Unavailable, Gateway Timeout
     return isinstance(exception, (api.exceptions.Timeout, api.exceptions.ConnectionError))
 
-@retry(
+def _error_body(response):
+    """(error, error_code) from an RD error body, or (text, None) when not JSON."""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        code = body.get('error_code')
+        try:
+            code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code = None
+        return body.get('error'), code
+    text = (response.text or '').strip()
+    return (text[:200] or None), None
+
+
+_RETRY_POLICY = dict(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
     retry=retry_if_exception_type((api.exceptions.RequestException, RealDebridAPIError, RateLimitError, api.exceptions.HTTPError)),
-    retry_error_callback=lambda retry_state: None  # Return None on final failure
 )
-def make_request(
+
+
+def _make_request(
     method: str,
     endpoint: str,
     api_key: str,
@@ -142,9 +160,15 @@ def make_request(
                 raise RealDebridAPIError(f"Service temporarily unavailable (HTTP {response.status_code})")
             elif response.status_code == 451:
                 # RD /user returns 451 with malformed body but valid user data — let it fall through.
-                # RD /torrents/addMagnet returns 451 for DMCA blocks — raise so callers can try fallback.
+                # On the torrent endpoints 451 is RD's takedown list refusing this hash
+                # (numeric error 35). The body is logged because RD does not document
+                # the status; the hash and provider are filled in by the caller.
                 if endpoint != '/user':
-                    raise ProviderUnavailableError("Request failed: 451 Client Error: Unavailable For Legal Reasons")
+                    error, error_code = _error_body(response)
+                    logging.warning(f"Real-Debrid 451 on {endpoint}: error={error!r} error_code={error_code}")
+                    raise ContentBlockedError(
+                        f"Real-Debrid refuses this content (HTTP 451, {error or 'no body'})",
+                        error=error, error_code=error_code)
             else:
                 response.raise_for_status()
         
@@ -202,6 +226,15 @@ def make_request(
         if should_retry_error(e):
             raise RealDebridAPIError(f"Temporary service error: {str(e)}")
         raise ProviderUnavailableError(f"Request failed: {str(e)}")
+
+# Two faces of the same call. The legacy form returns None once retries are
+# exhausted, and most callers lean on that (`make_request(...) or []`). add_torrent
+# cannot: it reads None as RD's 404-for-duplicate, so an exhausted 5xx or timeout
+# on the legacy form came back as "torrent not cached" and the item paid for an
+# outage. The strict form re-raises the last error instead.
+make_request = retry(**_RETRY_POLICY, retry_error_callback=lambda retry_state: None)(_make_request)
+make_request_strict = retry(**_RETRY_POLICY, reraise=True)(_make_request)
+
 
 async def get_all_items(endpoint: str, api_key: str, limit: int = 500, extra_params: Optional[Dict] = None) -> Optional[List[Dict]]:
     """

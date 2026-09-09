@@ -108,3 +108,38 @@ def clear(name: str) -> None:
     park = PARKS.get(name)
     if park is not None:
         park.clear()
+
+
+# Debrid providers are parked separately from scrapers. A parked scraper means
+# "search elsewhere"; a parked debrid provider means "nothing can be added right
+# now", and the Adding queue answers that by leaving its items queued rather than
+# spending their retry budget on an outage. Entries are created on first use so
+# a fallback provider configured later needs nothing here.
+DEBRID_PARKS: Dict[str, ScraperPark] = {}
+_DEBRID_PARK_BASE_SECONDS = 120     # 2 min, doubling to
+_DEBRID_PARK_MAX_SECONDS = 1800     # 30 min
+
+
+def debrid_park_remaining(provider: Optional[str]) -> float:
+    """Seconds left on a debrid provider's park, 0 when adds may proceed."""
+    park = DEBRID_PARKS.get(provider) if provider else None
+    return park.remaining() if park else 0.0
+
+
+def trip_debrid(provider: str, reason: str) -> float:
+    park = DEBRID_PARKS.get(provider)
+    if park is None:
+        park = DEBRID_PARKS.setdefault(
+            provider, ScraperPark(provider, _DEBRID_PARK_BASE_SECONDS, _DEBRID_PARK_MAX_SECONDS))
+    seconds = park.trip()
+    logging.warning(
+        f"{provider} {reason}. Pausing adds for {seconds / 60:.0f} min; queued items "
+        f"wait, no retry budget is spent, no hash is recorded."
+    )
+    return seconds
+
+
+def clear_debrid(provider: Optional[str]) -> None:
+    park = DEBRID_PARKS.get(provider) if provider else None
+    if park is not None:
+        park.clear()

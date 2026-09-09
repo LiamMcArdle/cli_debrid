@@ -11,7 +11,12 @@ import asyncio
 import math
 import json
 
-from ..base import DebridProvider, TooManyDownloadsError, ProviderUnavailableError, TorrentAdditionError
+import requests
+
+from ..base import (DebridProvider, TooManyDownloadsError, ProviderUnavailableError,
+                    TorrentAdditionError, ContentBlockedError, RateLimitError)
+from database.provider_blocks import record_block
+from scraper.park import trip_debrid, clear_debrid
 from ..common import (
     extract_hash_from_magnet,
     download_and_extract_hash,
@@ -21,11 +26,16 @@ from ..common import (
     is_unwanted_file
 )
 from ..status import TorrentStatus
-from .api import make_request, get_all_torrents, get_all_downloads
+from .api import make_request, make_request_strict, get_all_torrents, get_all_downloads
 from database.not_wanted_magnets import add_to_not_wanted, add_to_not_wanted_urls
 from utilities.phalanx_db_cache_manager import PhalanxDBClassManager
 from utilities.settings import get_setting
 from .exceptions import RealDebridAuthError, RealDebridAPIError
+
+# The provider is unreachable or refusing service as a whole. None of these say
+# anything about the hash being added, so none may record it anywhere.
+PROVIDER_DOWN_ERRORS = (ProviderUnavailableError, RealDebridAPIError, RateLimitError,
+                        requests.exceptions.RequestException)
 
 # Import the new types and function from the .torrent module
 from .torrent import (
@@ -344,10 +354,14 @@ class RealDebridProvider(DebridProvider):
                             break
                 
                 if not info:
+                    # RD accepted the add but will not describe it: that is the
+                    # provider misbehaving, not the hash. Park adds and clean up;
+                    # recording the hash here poisoned good releases during outages.
                     logging.error(f"{log_prefix} Failed to get torrent info for ID: {torrent_id}")
+                    trip_debrid(self.PROVIDER_NAME, "answered the add but not the info request")
                     try:
-                        add_to_not_wanted(hash_value)
-                        self.remove_torrent(torrent_id, "Failed to get torrent info during cache check")
+                        if not torrent_was_preexisting:
+                            self.remove_torrent(torrent_id, "Failed to get torrent info during cache check")
                     except Exception as e:
                         logging.error(f"{log_prefix} Error in cleanup after info fetch failure: {str(e)}")
                         self.update_status(torrent_id, TorrentStatus.CLEANUP_NEEDED)
@@ -450,6 +464,25 @@ class RealDebridProvider(DebridProvider):
                 
                 results[hash_value] = is_cached
                 
+            except ContentBlockedError as blocked:
+                # This hash, on this provider. Nothing was added, so nothing to
+                # remove; record it against the provider (not in not_wanted, which
+                # is global) and answer None so the caller tries the next candidate.
+                record_block(hash_value, self.PROVIDER_NAME,
+                             reason=blocked.error or 'HTTP 451', error_code=blocked.error_code)
+                results[hash_value] = None
+            except PROVIDER_DOWN_ERRORS as down:
+                # The provider, not the hash. Park adds so the Adding queue holds its
+                # items instead of spending their retry budget on an outage.
+                logging.error(f"{log_prefix} {self.PROVIDER_NAME} unavailable during cache check: {down}")
+                trip_debrid(self.PROVIDER_NAME, f"unavailable ({down})")
+                if torrent_id and not torrent_was_preexisting:
+                    try:
+                        self.remove_torrent(torrent_id, f"Provider unavailable during cache check: {down}")
+                    except Exception as rm_err:
+                        logging.error(f"{log_prefix} Error removing torrent after provider error: {str(rm_err)}")
+                        self.update_status(torrent_id, TorrentStatus.CLEANUP_NEEDED)
+                results[hash_value] = None
             except Exception as e:
                 logging.error(f"{log_prefix} Error checking cache: {str(e)}")
                 if torrent_id and not torrent_was_preexisting:
@@ -514,7 +547,7 @@ class RealDebridProvider(DebridProvider):
                 # Add the torrent file directly
                 with open(temp_file_path, 'rb') as f:
                     file_content = f.read()
-                    result = make_request('PUT', '/torrents/addTorrent', self.api_key, data=file_content)
+                    result = make_request_strict('PUT', '/torrents/addTorrent', self.api_key, data=file_content)
             # Handle magnet link only if no temp file was used
             elif magnet_link:
                 # Don't URL decode - requests library handles encoding for POST form data
@@ -523,7 +556,7 @@ class RealDebridProvider(DebridProvider):
                 # Add magnet link
                 logging.debug(f"Adding magnet with hash {hash_value[:16] if hash_value else 'unknown'}...")
                 data = {'magnet': magnet_link}
-                result = make_request('POST', '/torrents/addMagnet', self.api_key, data=data)
+                result = make_request_strict('POST', '/torrents/addMagnet', self.api_key, data=data)
             else:
                 logging.error("Neither magnet_link nor temp_file_path provided")
                 raise ValueError("Either magnet_link or temp_file_path must be provided")
@@ -538,7 +571,8 @@ class RealDebridProvider(DebridProvider):
                 raise TorrentAdditionError(f"Failed to add torrent - response: {result}")
                 
             torrent_id = result['id']
-            
+            clear_debrid(self.PROVIDER_NAME)
+
             # Wait for files to be available
             max_attempts = 30  # Increase timeout to 30 seconds
             success = False
@@ -694,6 +728,11 @@ class RealDebridProvider(DebridProvider):
                     
                 return torrent_id
                 
+        except ContentBlockedError as blocked:
+            blocked.hash_value = blocked.hash_value or hash_value
+            blocked.provider = blocked.provider or self.PROVIDER_NAME
+            logging.warning(f"{self.PROVIDER_NAME} refuses hash {(hash_value or '?')[:16]}: {blocked}")
+            raise
         except Exception as e:
             logging.error(f"Error adding torrent: {str(e)}")
             raise

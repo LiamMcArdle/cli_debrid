@@ -10,6 +10,7 @@ from utilities.settings import get_setting
 from scraper.scraper import scrape
 from database.core import retry_on_db_lock
 from database.not_wanted_magnets import is_magnet_not_wanted, is_url_not_wanted, is_nzb_guid_not_wanted
+from database.provider_blocks import is_result_blocked_everywhere
 from cli_battery.app.direct_api import DirectAPI
 from routes.notifications import send_upgrade_failed_notification
 
@@ -744,6 +745,8 @@ class ScrapingQueue:
                                     continue
                                 if result.get('nzb_url') and is_nzb_guid_not_wanted(result.get('parsed_info', {}).get('guid') or result.get('nzb_url')):
                                     continue
+                            if is_result_blocked_everywhere(result.get('magnet')):
+                                continue
                             filtered_results.append(result)
 
                     # --- START: Delayed Scrape Based on Score Logic ---
@@ -852,6 +855,8 @@ class ScrapingQueue:
                         if fallback_results: # Only filter if there are raw results from fallback
                             current_filtered_fallback_results = []
                             for result in fallback_results:
+                                if is_result_blocked_everywhere(result.get('magnet')):
+                                    continue
                                 if not item_to_process.get('disable_not_wanted_check'):
                                     if is_magnet_not_wanted(result.get('magnet') or result.get('nzb_url')):
                                         continue
@@ -1109,7 +1114,7 @@ class ScrapingQueue:
             # Filter out unwanted magnets, URLs and NZB guids
             results = [
                 r for r in results
-                if not (
+                if not is_result_blocked_everywhere(r.get('magnet')) and not (
                     not item.get('disable_not_wanted_check') and (
                         is_magnet_not_wanted(r.get('magnet') or r.get('nzb_url')) or
                         is_url_not_wanted(r.get('magnet') or r.get('nzb_url')) or
@@ -1203,6 +1208,9 @@ class ScrapingQueue:
             temp_individual_results = []
             for r_idx, r_val in enumerate(individual_results):
                 logging.debug(f"  Checking individual result #{r_idx + 1} ('{r_val.get('original_title', 'N/A')}') for not_wanted/rescrape filters.")
+                if is_result_blocked_everywhere(r_val.get('magnet')):
+                    logging.info(f"    Filtered out '{r_val.get('original_title')}': refused by every configured debrid provider.")
+                    continue
                 if not item.get('disable_not_wanted_check'):
                     if is_magnet_not_wanted(r_val.get('magnet') or r_val.get('nzb_url')):
                         logging.info(f"    Filtered out '{r_val.get('original_title')}' due to is_magnet_not_wanted.")
