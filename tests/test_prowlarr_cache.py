@@ -95,5 +95,36 @@ class TestCacheStillCaches(unittest.TestCase):
         self.assertIsNone(_pc._cache_get('never-written'))
 
 
+class WhatIsCached(unittest.TestCase):
+    """Empties are the queries asked again most; an outage is a raise."""
+
+    def setUp(self):
+        _pc._NZB_CACHE.clear()
+
+    def test_an_empty_list_is_a_hit(self):
+        _pc._cache_set('k', [])
+        self.assertEqual(_pc._cache_get('k'), [])
+
+    def test_an_outage_round_trips_with_its_reason(self):
+        _pc._cache_set('k', _pc._Unavailable('prowlarr down'), ttl=_pc._NZB_CACHE_UNAVAILABLE_TTL)
+        cached = _pc._cache_get('k')
+        self.assertIsInstance(cached, _pc._Unavailable)
+        self.assertEqual(cached.reason, 'prowlarr down')
+
+    def test_an_outage_expires_while_an_empty_of_the_same_age_is_live(self):
+        _pc._cache_set('outage', _pc._Unavailable('x'), ttl=_pc._NZB_CACHE_UNAVAILABLE_TTL)
+        _pc._cache_set('empty', [])
+        real = _pc.time.monotonic
+        _pc.time.monotonic = lambda: real() + _pc._NZB_CACHE_UNAVAILABLE_TTL + 1
+        try:
+            self.assertIsNone(_pc._cache_get('outage'))
+            self.assertEqual(_pc._cache_get('empty'), [])
+        finally:
+            _pc.time.monotonic = real
+
+    def test_the_cap_stays_well_under_the_leak_ceiling(self):
+        self.assertLess(_pc._NZB_CACHE_MAX, 2000)
+
+
 if __name__ == '__main__':
     unittest.main()

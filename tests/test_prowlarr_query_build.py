@@ -104,6 +104,11 @@ class TestAnimeAbsoluteNumbering(unittest.TestCase):
             if p['type'] == 'search':
                 self.assertLess(p['limit'], 1000)
 
+    def test_every_request_asks_for_what_an_indexer_can_return(self):
+        """No configured indexer returns more than 200 rows (7 days of history)."""
+        for p in build(episode_formats={'absolute': '1069'}):
+            self.assertEqual(p['limit'], 200)
+
     def test_xem_orig_variants_are_deduplicated(self):
         params = build(episode_formats={'absolute': '1069', 'orig_absolute': '1069'})
         queries = [p['query'] for p in params if p['type'] == 'search']

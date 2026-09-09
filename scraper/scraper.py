@@ -14,6 +14,7 @@ from database.database_reading import (
 from scraper.functions.season_resolution import (
     absolute_episode_from_identity, ABS_AMBIGUOUS,
 )
+from scraper.prowlarr import rename_special_characters
 from types import SimpleNamespace
 from database.database_writing import update_anime_format, update_preferred_alias, get_preferred_alias
 from fuzzywuzzy import fuzz
@@ -64,6 +65,80 @@ _SPINOFF_ALIAS_RE = re.compile(
     r'\((?:OAV|OVA|ONA|Specials?|Movie|Film|TV)\)|\b(?:OVA|OAV|Movie|Special|Gekijouban)\s*$',
     re.IGNORECASE,
 )
+
+
+_TRAILING_YEAR_RE = re.compile(r'\s*\((\d{4})\)\s*$')
+
+
+def _query_title_key(text) -> str:
+    """The form two search titles collapse under: what the indexers see.
+
+    rename_special_characters is the sanitiser every Prowlarr query already
+    passes through, so 'Hunter × Hunter', 'Hunter x Hunter' and 'HUNTER×HUNTER'
+    are one query, not three. Non-Latin letters survive it, so native names
+    keep distinct keys.
+    """
+    return ' '.join(rename_special_characters(str(text or '')).lower().split())
+
+
+def prune_query_aliases(aliases, title, year, season_titles, season=None):
+    """Drop the aliases that would only repeat a search already being sent.
+
+    Measured on 2026-09-09: 37% of a day's tvsearch volume was arc/season
+    names and 'Title (YYYY)' forms -- 'Pokémon: Indigo League' alone went out
+    1,698 times, for S16-S18 items. Removed:
+
+    - an alias whose key equals the title's or an earlier alias's;
+    - 'Title (YYYY)' where YYYY is the item's own year (a different year is a
+      remake or a sequel series, a different search space, and stays);
+    - an arc or season name, alone or as 'Title Arc', for every season other
+      than the one being scraped. The scraped season's own names stay:
+      'Pokemon Indigo League' is how season 1 packs are named.
+
+    Everything else stays: romaji and alternate romanisations ('Wan Pisu' is a
+    real release name), acronyms, native-script names, prefix-sharing aliases.
+    The matching-alias list this is drawn from is untouched; it feeds the
+    identity gate, which wants every name.
+    """
+    title_key = _query_title_key(title)
+    try:
+        own_year = int(year) if year else None
+    except (TypeError, ValueError):
+        own_year = None
+    other_season_keys = set()
+    for season_number, names in (season_titles or {}).items():
+        try:
+            if season is not None and int(season_number) == int(season):
+                continue
+        except (TypeError, ValueError):
+            pass
+        for name in (names if isinstance(names, (list, tuple, set)) else [names]):
+            name_key = _query_title_key(name)
+            if name_key:
+                other_season_keys.add(name_key)
+                other_season_keys.add(f"{title_key} {name_key}".strip())
+    kept, dropped = [], []
+    seen = {title_key}
+    for alias in aliases or []:
+        if not alias:
+            continue
+        candidate = alias
+        year_match = _TRAILING_YEAR_RE.search(alias)
+        if year_match and own_year is not None and int(year_match.group(1)) == own_year:
+            candidate = alias[:year_match.start()]
+        key = _query_title_key(candidate)
+        if not key or key in seen:
+            dropped.append((alias, 'duplicate' if key else 'empty'))
+            continue
+        if key in other_season_keys:
+            dropped.append((alias, 'another season\'s name'))
+            seen.add(key)
+            continue
+        seen.add(key)
+        kept.append(alias)
+    if dropped:
+        logging.info("Alias hygiene dropped " + ', '.join(f"'{a}' ({why})" for a, why in dropped))
+    return kept
 
 
 def select_query_aliases(matching_aliases, origin_names, max_latin, max_native):
@@ -645,7 +720,8 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                 except (TypeError, ValueError):
                     max_latin, max_native = DEFAULT_MAX_QUERY_ALIASES, DEFAULT_MAX_NATIVE_QUERY_ALIASES
                 query_aliases, native_query_aliases = select_query_aliases(
-                    matching_aliases, origin_names, max(0, max_latin), max(0, max_native))
+                    prune_query_aliases(matching_aliases, title, year, season_titles, season),
+                    origin_names, max(0, max_latin), max(0, max_native))
                 if len(query_aliases) + len(native_query_aliases) < len(matching_aliases):
                     logging.info(f"Using {len(query_aliases)} Latin + {len(native_query_aliases)} native "
                                  f"of {len(matching_aliases)} aliases as scrape queries "
@@ -1622,18 +1698,21 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
 
         # Determine titles to scrape with
         titles_to_try = []
+        # Keyed the way the indexers see a title (see _query_title_key), so
+        # the translated title, a romanised alias and the preferred alias
+        # collapse when they are the same search.
         tried_titles_lower = set()
 
         # 1. Add original title
         logging.info(f"Adding original title for scraping: {title}")
         titles_to_try.append(('original', title))
-        tried_titles_lower.add(title.lower())
+        tried_titles_lower.add(_query_title_key(title))
 
         # 2. Add translated title
-        if translated_title and translated_title.lower() not in tried_titles_lower:
+        if translated_title and _query_title_key(translated_title) not in tried_titles_lower:
             logging.info(f"Adding translated title: {translated_title}")
             titles_to_try.append(('translated_title', translated_title))
-            tried_titles_lower.add(translated_title.lower())
+            tried_titles_lower.add(_query_title_key(translated_title))
 
         # 3. Add original language title from metadata (especially important for anime)
         # For anime content, we always try both original and romanized titles to ensure comprehensive results
@@ -1650,7 +1729,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                         if isinstance(alias_list, list):
                             for alias in alias_list:
                                 # Check if this alias looks like a romanized Japanese title
-                                if alias and re.match(r'^[a-zA-Z\s\-]+$', alias) and alias.lower() not in tried_titles_lower:
+                                if alias and re.match(r'^[a-zA-Z\s\-]+$', alias) and _query_title_key(alias) not in tried_titles_lower:
                                     # Skip if it's just the English title again
                                     if alias.lower() != title.lower():
                                         # Check for Japanese romanization patterns (common Japanese words/patterns)
@@ -1671,7 +1750,7 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                                         if is_likely_japanese and not has_english_words:
                                             logging.info(f"Adding Japanese romanized alias for anime: {alias}")
                                             titles_to_try.append(('romanized_alias', alias))
-                                            tried_titles_lower.add(alias.lower())
+                                            tried_titles_lower.add(_query_title_key(alias))
                                             romanized_found = True
                                             break
                         if romanized_found:
@@ -1701,48 +1780,48 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                                     romanized_title = romanized_title.title()
                                 
                                 logging.info(f"Romanized Japanese title '{original_title_from_metadata}' to '{romanized_title}'")
-                                if romanized_title.lower() not in tried_titles_lower:
+                                if _query_title_key(romanized_title) not in tried_titles_lower:
                                     logging.info(f"Adding romanized title for anime: {romanized_title}")
                                     titles_to_try.append(('original_language_romanized', romanized_title))
-                                    tried_titles_lower.add(romanized_title.lower())
+                                    tried_titles_lower.add(_query_title_key(romanized_title))
                             except Exception as romanize_err:
                                 logging.warning(f"Failed to romanize Japanese title '{original_title_from_metadata}': {romanize_err}")
                         else:
                             # Not Japanese, use as-is. A native-script name in
                             # any other script (Hangul, Cyrillic, ...) is a Nyaa
                             # query only, like the country aliases below.
-                            if original_title_from_metadata.lower() not in tried_titles_lower:
+                            if _query_title_key(original_title_from_metadata) not in tried_titles_lower:
                                 source_kind = ('native_alias'
                                                if has_non_latin_letter(original_title_from_metadata)
                                                else 'original_language')
                                 logging.info(f"Adding original language title from metadata for anime: {original_title_from_metadata}")
                                 titles_to_try.append((source_kind, original_title_from_metadata))
-                                tried_titles_lower.add(original_title_from_metadata.lower())
+                                tried_titles_lower.add(_query_title_key(original_title_from_metadata))
             except Exception as e:
                 logging.warning(f"Failed to get original title from metadata for {imdb_id}: {e}")
 
         # 4. Add preferred alias
-        if not aliases_disabled and preferred_alias and preferred_alias.lower() not in tried_titles_lower:
+        if not aliases_disabled and preferred_alias and _query_title_key(preferred_alias) not in tried_titles_lower:
             logging.info(f"Adding preferred alias: {preferred_alias}")
             titles_to_try.append(('preferred_alias', preferred_alias))
-            tried_titles_lower.add(preferred_alias.lower())
+            tried_titles_lower.add(_query_title_key(preferred_alias))
 
         # 5. Add all other matching country aliases (query subset -- see where
         # query_aliases is built for why this is not the full matching list)
         if not aliases_disabled and query_aliases:
             for alias in query_aliases:
-                if alias.lower() not in tried_titles_lower:
+                if _query_title_key(alias) not in tried_titles_lower:
                     logging.info(f"Adding country alias: {alias}")
                     titles_to_try.append(('country_alias', alias))
-                    tried_titles_lower.add(alias.lower())
+                    tried_titles_lower.add(_query_title_key(alias))
 
         # 6. The origin country's native-script names, for Nyaa's raws only.
         if not aliases_disabled and native_query_aliases:
             for alias in native_query_aliases:
-                if alias.lower() not in tried_titles_lower:
+                if _query_title_key(alias) not in tried_titles_lower:
                     logging.info(f"Adding native-script alias (Nyaa only): {alias}")
                     titles_to_try.append(('native_alias', alias))
-                    tried_titles_lower.add(alias.lower())
+                    tried_titles_lower.add(_query_title_key(alias))
 
         # Execute scraping based on the determined titles with threading and deduplication protection
         logging.info(f"Will search with {len(titles_to_try)} titles: {[source for source, _ in titles_to_try]}")

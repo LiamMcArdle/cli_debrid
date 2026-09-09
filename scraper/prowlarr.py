@@ -23,12 +23,15 @@ from scraper.functions.common import trim_magnet
 # 6 of the 12, while these keyword queries yielded 191 usable from 438 raw.
 _SKIP_ANIME_FORMATS = frozenset({'regular', 'combined', 'batch', 'season'})
 _MAX_ANIME_KEYWORD_QUERIES = 2
-# The useful anime responses measured 1-140 results; 1000 is for index dumps.
+# No configured indexer returns more than 200 rows whatever is asked for:
+# Zilean and AnimeTosho cap at 200, TPB at 100, LimeTorrents at 40 (7 days of
+# Prowlarr history, 2026-09-09). 200 changes nothing that comes back; it
+# only bounds the parse and the cache entry.
 _ANIME_KEYWORD_LIMIT = 200
 
 
 # Query result cache — reduces API hits for duplicate NZB searches within TTL window
-_NZB_CACHE: Dict[str, tuple] = {}   # key -> (timestamp, results)
+_NZB_CACHE: Dict[str, tuple] = {}   # key -> (expires_at, results)
 _NZB_CACHE_LOCK = threading.Lock()
 _NZB_CACHE_TTL = 600  # 10 minutes
 # A TTL enforced only on read expires nothing here. The key is the query, and a
@@ -38,7 +41,24 @@ _NZB_CACHE_TTL = 600  # 10 minutes
 # ~500-element result list whose dicts carry Prowlarr's recursive category
 # tree, which is how the process reached 6 GB in 17 hours. The cache has to
 # sweep on write, and be bounded, or it outlives its own TTL forever.
-_NZB_CACHE_MAX = 512
+#
+# Sized for ~8 scrape() calls a minute at ~16-20 keys each: the hits that
+# matter are the same item's fallback re-entries seconds to two minutes
+# later, and 75-80% of entries are empty lists (measured 2026-09-09).
+_NZB_CACHE_MAX = 1024
+# An outage is remembered only briefly: the item that saw it is already held
+# for thirty minutes, and two minutes cannot mask a retry.
+_NZB_CACHE_UNAVAILABLE_TTL = 120
+
+
+class _Unavailable:
+    """A cached outage. Served as a raise, never as an empty result: after the
+    ladder learned to hold a rung for a scrape nobody answered, an empty list
+    here would spend that rung on the outage instead."""
+    __slots__ = ('reason',)
+
+    def __init__(self, reason: str):
+        self.reason = reason
 
 
 def _cache_key(endpoint: str, params: dict) -> str:
@@ -46,30 +66,43 @@ def _cache_key(endpoint: str, params: dict) -> str:
     return hashlib.sha256(stable.encode()).hexdigest()
 
 
-def _cache_get(key: str) -> Optional[List]:
+def _cache_get(key: str):
     with _NZB_CACHE_LOCK:
         entry = _NZB_CACHE.get(key)
-        if entry and (time.monotonic() - entry[0]) < _NZB_CACHE_TTL:
+        if entry and time.monotonic() < entry[0]:
             return entry[1]
         if entry:
             del _NZB_CACHE[key]
     return None
 
 
-def _cache_set(key: str, results: List) -> None:
+def _cache_set(key: str, results, ttl: float = _NZB_CACHE_TTL) -> None:
+    """Store a result list -- empty ones included, since an empty answer is
+    the one most often asked again -- or an _Unavailable marker."""
     with _NZB_CACHE_LOCK:
         now = time.monotonic()
         if len(_NZB_CACHE) >= _NZB_CACHE_MAX:
-            for stale in [k for k, e in _NZB_CACHE.items()
-                          if now - e[0] >= _NZB_CACHE_TTL]:
+            for stale in [k for k, e in _NZB_CACHE.items() if now >= e[0]]:
                 del _NZB_CACHE[stale]
             # Still full means the entries are genuinely live, not stale, so
-            # age them out oldest-first rather than letting the cap be advisory.
+            # age them out soonest-expiring first rather than letting the cap
+            # be advisory.
             if len(_NZB_CACHE) >= _NZB_CACHE_MAX:
                 oldest = sorted(_NZB_CACHE.items(), key=lambda kv: kv[1][0])
                 for k, _ in oldest[:max(1, _NZB_CACHE_MAX // 8)]:
                     del _NZB_CACHE[k]
-        _NZB_CACHE[key] = (now, results)
+        _NZB_CACHE[key] = (now + ttl, results)
+
+
+# Prowlarr disables an indexer on its own after a 429 and says nothing about
+# it in a search response; the merged list is simply shorter. This is read so
+# an empty answer can be logged against what Prowlarr was actually able to
+# ask. It is never a reason to hold an item: AnimeTosho is disabled dozens of
+# times a day and TPB escalates to 24-hour disables, so "an indexer is down"
+# is the normal state, not an outage (measured 2026-09-09).
+_INDEXER_STATUS_TTL = 60
+_INDEXER_STATUS_CACHE: Dict[str, tuple] = {}   # url -> (expires_at, {name: until})
+_INDEXER_STATUS_LOCK = threading.Lock()
 
 
 def _anime_keyword_queries(clean_title: str, episode_formats: Dict[str, str]) -> List[str]:
@@ -109,7 +142,7 @@ def _build_prowlarr_params_list(
     episode_formats: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """Always build both ID-based and title-based queries to run simultaneously."""
-    base = {'limit': 1000, 'offset': 0}
+    base = {'limit': 200, 'offset': 0}
     if tags_setting:
         try:
             ids = [int(t.strip()) for t in tags_setting.split(',') if t.strip().isdigit()]
@@ -220,7 +253,11 @@ def scrape_prowlarr_instance(
         ck = _cache_key(search_endpoint, query_params)
         cached = _cache_get(ck)
         if cached is not None:
-            logging.info(f"Prowlarr '{instance}' cache hit for {query_params.get('type')} query")
+            if isinstance(cached, _Unavailable):
+                logging.info(f"Prowlarr '{instance}' cache hit for {query_params.get('type')} query: unavailable")
+                raise ScraperUnavailable(f"{cached.reason} (cached)")
+            logging.info(f"Prowlarr '{instance}' cache hit for {query_params.get('type')} query: "
+                         f"{'empty' if not cached else f'{len(cached)} results'}")
             return cached
         try:
             logging.debug(f"Prowlarr '{instance}' query: {query_params}")
@@ -229,8 +266,9 @@ def scrape_prowlarr_instance(
                 data = response.json()
                 if isinstance(data, list):
                     results = parse_prowlarr_results(data, instance, seeders_only)
-                    if results:
-                        _cache_set(ck, results)
+                    # Empty included: the emptiest queries are the ones every
+                    # fallback re-entry and every sibling asks again.
+                    _cache_set(ck, results)
                     return results
                 logging.error(f"Prowlarr '{instance}' unexpected response type: {type(data)}")
             elif response.status_code in (429, 502, 503, 504) or response.status_code >= 500:
@@ -239,17 +277,23 @@ def scrape_prowlarr_instance(
                 )
             else:
                 logging.error(f"Prowlarr '{instance}' HTTP {response.status_code}: {response.text[:300]}")
-        except ScraperUnavailable:
+        except ScraperUnavailable as e:
+            _cache_set(ck, _Unavailable(str(e)), ttl=_NZB_CACHE_UNAVAILABLE_TTL)
             raise
         except api.exceptions.Timeout:
             logging.error(f"Prowlarr '{instance}' timed out")
-            raise ScraperUnavailable(f"prowlarr '{instance}' timed out")
+            reason = f"prowlarr '{instance}' timed out"
+            _cache_set(ck, _Unavailable(reason), ttl=_NZB_CACHE_UNAVAILABLE_TTL)
+            raise ScraperUnavailable(reason)
         except api.exceptions.RequestException as e:
             # Connection refused, DNS failure, TLS error: Prowlarr is down, not
             # empty. Returning [] here would tell the retry ladder the indexers
-            # genuinely had nothing and cost the item a rung.
+            # genuinely had nothing and cost the item a rung. newznab.py caches
+            # [] on these; here that would spend the rung from the cache.
             logging.error(f"Prowlarr '{instance}' unreachable: {e}")
-            raise ScraperUnavailable(f"prowlarr '{instance}' unreachable: {e}")
+            reason = f"prowlarr '{instance}' unreachable: {e}"
+            _cache_set(ck, _Unavailable(reason), ttl=_NZB_CACHE_UNAVAILABLE_TTL)
+            raise ScraperUnavailable(reason)
         except Exception as e:
             logging.error(f"Prowlarr '{instance}' error: {e}", exc_info=True)
         return []
@@ -286,7 +330,52 @@ def scrape_prowlarr_instance(
             unique_results.append(result)
 
     logging.info(f"Found {len(unique_results)} unique results from Prowlarr instance {instance} for '{title}' ({len(all_instance_results)} total before dedup)")
+    if not unique_results:
+        disabled = _disabled_indexers(prowlarr_url, headers)
+        if disabled:
+            logging.info(f"Prowlarr '{instance}': 0 results; disabled inside Prowlarr: "
+                         + ', '.join(f"{name} (until {until})" for name, until in sorted(disabled.items())))
     return unique_results
+
+
+def _disabled_indexers(prowlarr_url: str, headers: Dict[str, str]) -> Dict[str, str]:
+    """Indexers Prowlarr has disabled right now, name -> disabled-until.
+
+    /api/v1/indexerstatus lists only disabled indexers; /api/v1/indexer maps
+    their ids to names. Cached for a minute per instance; any failure is an
+    empty answer, because this only feeds a log line.
+    """
+    now = time.monotonic()
+    with _INDEXER_STATUS_LOCK:
+        entry = _INDEXER_STATUS_CACHE.get(prowlarr_url)
+        if entry and now < entry[0]:
+            return entry[1]
+    disabled: Dict[str, str] = {}
+    try:
+        status = api.get(f"{prowlarr_url}/api/v1/indexerstatus", headers=headers, timeout=10)
+        if status.status_code == 200:
+            rows = status.json() or []
+            if rows:
+                names: Dict[int, str] = {}
+                listing = api.get(f"{prowlarr_url}/api/v1/indexer", headers=headers, timeout=10)
+                if listing.status_code == 200:
+                    for indexer in listing.json() or []:
+                        if isinstance(indexer, dict) and indexer.get('id') is not None:
+                            names[int(indexer['id'])] = str(indexer.get('name') or indexer['id'])
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    indexer_id = row.get('indexerId')
+                    until = str(row.get('disabledTill') or '?')
+                    if len(until) >= 16:
+                        until = until[:16].replace('T', ' ') + 'Z'
+                    disabled[names.get(indexer_id, f"indexer {indexer_id}")] = until
+    except Exception as e:
+        logging.debug(f"Prowlarr indexer status unavailable: {e}")
+        disabled = {}
+    with _INDEXER_STATUS_LOCK:
+        _INDEXER_STATUS_CACHE[prowlarr_url] = (now + _INDEXER_STATUS_TTL, disabled)
+    return disabled
 
 def parse_prowlarr_results(data: List[Dict[str, Any]], ins_name: str, seeders_only: bool) -> List[Dict[str, Any]]:
     results = []
