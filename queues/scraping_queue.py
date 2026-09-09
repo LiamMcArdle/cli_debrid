@@ -843,7 +843,8 @@ class ScrapingQueue:
                             item_to_process, 
                             is_multi_pack=True, # Force multi-pack
                             queue_manager=queue_manager, 
-                            check_pack_wantedness=False # Disable pack wantedness
+                            check_pack_wantedness=False, # Disable pack wantedness
+                            force_multi_pack=True # ... even when the single-scraper flag is set
                         )
                         
                         fallback_results = fallback_results if fallback_results is not None else []
@@ -1054,7 +1055,8 @@ class ScrapingQueue:
         # Or if we actually processed an item in this call (even if it resulted in removal)
         return len(self.items) > 0 or processed_an_item_this_cycle
 
-    def scrape_with_fallback(self, item, is_multi_pack, queue_manager, skip_filter=False, check_pack_wantedness: bool = False):
+    def scrape_with_fallback(self, item, is_multi_pack, queue_manager, skip_filter=False, check_pack_wantedness: bool = False,
+                             force_multi_pack: bool = False):
         item_identifier = queue_manager.generate_identifier(item)
         original_season = item.get('season_number')
         original_episode = item.get('episode_number')
@@ -1086,8 +1088,16 @@ class ScrapingQueue:
         # Get the stored original torrent title for comparison if this is a rescrape
         stored_rescrape_title = item.get('rescrape_original_torrent_title')
 
+        # fall_back_to_single_scraper stops an item re-grabbing a pack whose add
+        # just failed within this cycle. It is also swept onto every later
+        # episode of the season, and it used to win here even for the final
+        # pack attempt -- so one failed pack add put whole seasons into
+        # single-episode mode, where every pack is rejected on sight, until a
+        # wake cleared it: 1,286 pending rows on 2026-09-09, One Piece 280 of
+        # 282. The caller's final fallback now says so and keeps pack mode; the
+        # failed pack itself is in not_wanted and cannot be re-grabbed.
         from database import get_media_item_by_id
-        if get_media_item_by_id(item['id']).get('fall_back_to_single_scraper'):
+        if not force_multi_pack and get_media_item_by_id(item['id']).get('fall_back_to_single_scraper'):
             is_multi_pack = False
 
         results, filtered_out = scrape(
