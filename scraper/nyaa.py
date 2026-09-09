@@ -444,6 +444,19 @@ def test_nyaa_scraper(title: str, year: int, content_type: str, season: int = No
         print(f"Error testing Nyaa scraper: {str(e)}")
         return []
 
+# The second absolute number a dual-tree episode is known by. It exists for
+# the Prowlarr keyword search; Nyaa must neither request it (one more
+# sequential call against a host that blocks by burst) nor learn it as the
+# show's anime_format preference.
+_ALTERNATE_ABSOLUTE_KEY = 'absolute_alt'
+
+
+def _without_alternate_absolute(episode_formats: Dict[str, str]) -> Dict[str, str]:
+    if not episode_formats or _ALTERNATE_ABSOLUTE_KEY not in episode_formats:
+        return episode_formats
+    return {key: value for key, value in episode_formats.items() if key != _ALTERNATE_ABSOLUTE_KEY}
+
+
 def pick_single_format(episode_formats: Dict[str, str], tmdb_id: Optional[str]) -> Dict[str, str]:
     """Reduce a format map to the one format most likely to hit for this show.
 
@@ -453,6 +466,7 @@ def pick_single_format(episode_formats: Dict[str, str], tmdb_id: Optional[str]) 
     """
     if not episode_formats:
         return episode_formats
+    episode_formats = _without_alternate_absolute(episode_formats)
     preferred = None
     if tmdb_id:
         try:
@@ -481,6 +495,7 @@ def scrape_nyaa_anime_episode(title: str, year: int, season: int, episode: int, 
             'absolute': f"{((season - 1) * 13) + episode:03d}",  # Using default 13 episodes per season
             'combined': f"S{season:02d}E{((season - 1) * 13) + episode:03d}"  # Using default 13 episodes per season
         }
+    episode_formats = _without_alternate_absolute(episode_formats)
     if single_format:
         episode_formats = pick_single_format(episode_formats, tmdb_id)
         logging.info(f"Alias search for {title}: using single Nyaa format {list(episode_formats)[0]}")

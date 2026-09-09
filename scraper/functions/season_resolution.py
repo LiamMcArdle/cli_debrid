@@ -635,3 +635,230 @@ def log_verdict(matches: bool, reason: str, filename: str,
         logging.debug(msg)
     else:
         logging.info(msg)
+
+
+# ---------------------------------------------------------------------------
+# Absolute episode number by identity
+# ---------------------------------------------------------------------------
+#
+# The metadata battery and media_items hold different season layouts for the
+# same show: Trakt re-splits a long-running series, an episode moves to
+# season 0, a dual numbering tree is merged, seasons are reordered. Reading
+# the battery's absolute_episode by positional (season, episode) then lands on
+# a different real episode -- Dragon Ball Kai S2E1 read 99 where the episode
+# the library row names is 27 -- and every search goes out with a number no
+# release carries. The episode's own title and air date identify it across
+# layouts; these functions resolve the absolute number from that evidence.
+#
+# Title evidence decides; date evidence only confirms. Measured over the 9,493
+# pending anime rows on 2026-09-09, a draft that verified the positional row
+# first returned the wrong tree for 391 rows (the same title also sat at the
+# number the releases carry), and a draft that remapped by date moved 63 rows
+# onto their neighbours because media_items' dates were stale.
+
+from datetime import date as _date, datetime as _datetime
+
+ABS_VERIFIED_TITLE = 'ABS_VERIFIED_TITLE'
+ABS_REMAPPED_TITLE = 'ABS_REMAPPED_TITLE'
+ABS_AMBIGUOUS_DATE = 'ABS_AMBIGUOUS_DATE'
+ABS_AMBIGUOUS_ESTIMATE = 'ABS_AMBIGUOUS_ESTIMATE'
+ABS_AMBIGUOUS = 'ABS_AMBIGUOUS'
+ABS_VERIFIED_DATE = 'ABS_VERIFIED_DATE'
+ABS_POSITIONAL_UNCONFIRMED = 'ABS_POSITIONAL_UNCONFIRMED'
+ABS_REMAPPED_DATE = 'ABS_REMAPPED_DATE'
+ABS_UNVERIFIED = 'ABS_UNVERIFIED'
+ABS_UNRESOLVED = 'ABS_UNRESOLVED'
+ABS_NO_ROWS = 'ABS_NO_ROWS'
+
+_LEADING_DATE_RE = re.compile(r'^\s*(\d{4})-(\d{2})-(\d{2})')
+
+
+def _leading_date(text: str) -> Optional[_date]:
+    match = _LEADING_DATE_RE.match(text or '')
+    if not match:
+        return None
+    try:
+        return _date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
+def parse_local_date(value: Any) -> Optional[_date]:
+    """A media_items release_date as a calendar day.
+
+    Accepts date/datetime objects and 'YYYY-MM-DD' with an optional time part.
+    Rejects None, '' and the 'Unknown' placeholder that metadata writes when a
+    provider has no date.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, _datetime):
+        return value.date()
+    if isinstance(value, _date):
+        return value
+    text = str(value).strip()
+    if not text or text.lower() in ('unknown', 'none', 'null'):
+        return None
+    return _leading_date(text)
+
+
+def parse_utc_date(value: Any) -> Optional[_date]:
+    """A battery first_aired (a UTC instant) as the UTC calendar day.
+
+    No timezone conversion: the caller compares with a one-day tolerance that
+    absorbs the offset between a UTC instant and a local calendar day.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, _datetime):
+        return value.date()
+    if isinstance(value, _date):
+        return value
+    return _leading_date(str(value).strip().rstrip('Zz'))
+
+
+def dates_within_a_day(a: Optional[_date], b: Optional[_date]) -> bool:
+    """Same day or adjacent days. Weekly episodes are seven apart, so this
+    cannot bridge two episodes; it only absorbs the UTC/local offset."""
+    if a is None or b is None:
+        return False
+    return abs((a - b).days) <= 1
+
+
+def episode_title_key(title: Any, strip_part: bool = False) -> str:
+    """Comparison key for an episode title.
+
+    Exact by default. Two-parters differ only by a trailing '(1)' / '(2)',
+    so stripping the marker up front makes every one of them ambiguous; the
+    stripped form is a fallback for when the exact key finds nothing.
+    """
+    text = title if isinstance(title, str) else ('' if title is None else str(title))
+    if strip_part:
+        text = _strip_part_marker(text)
+    return normalize_title_text(text)
+
+
+def episode_title_is_specific(title: Any) -> bool:
+    """Whether a title can identify an episode among the show's own rows.
+
+    Looser than episode_title_is_distinctive on purpose: that guard protects a
+    substring search inside filenames; here the comparison is exact equality
+    against the show's own episode list with uniqueness enforced, so a short
+    title is fine and only placeholders ('Episode 18') are excluded.
+    """
+    key = episode_title_key(title)
+    return bool(key) and not _GENERIC_TITLE_RE.match(key)
+
+
+def _row_field(row: Any, name: str) -> Any:
+    if isinstance(row, dict):
+        return row.get(name)
+    return getattr(row, name, None)
+
+
+def absolute_episode_from_identity(
+    rows: Sequence[Any],
+    season: int,
+    episode: int,
+    episode_title: Any,
+    release_date: Any,
+    estimate: Optional[int] = None,
+) -> Tuple[Optional[int], str, Tuple[int, ...]]:
+    """Resolve the absolute number of S{season}E{episode} from the show's rows.
+
+    ``rows`` are the battery's episodes for the show, each exposing
+    season_number, episode_number, title, first_aired and absolute_episode
+    (attributes or dict keys). ``episode_title`` and ``release_date`` are the
+    library row's own identity. ``estimate`` is the arithmetic number derived
+    from the library's season layout; it is the weakest evidence and only ever
+    breaks a tie.
+
+    Returns (absolute, verdict, candidates). ``candidates`` is non-empty only
+    for the ambiguous verdicts and lists every absolute the title sits at; for
+    ABS_AMBIGUOUS the caller should ask for every one of them. ``absolute`` is
+    None only for ABS_UNRESOLVED, where the caller falls back to its other
+    sources.
+
+    Order of evidence:
+      1. The title, searched over every non-special row. One absolute:
+         verified (equals the positional) or remapped. Several: the one whose
+         air date matches, else the estimate if it is among them, else
+         ambiguous with every candidate returned. The positional row never
+         short-circuits this search -- on dual numbering trees the positional
+         title matches and the number releases carry is the OTHER one.
+      2. No title hit and a positional row with an absolute: kept, verified by
+         date when the dates agree, otherwise unconfirmed. A stale library
+         date is not evidence of a different episode.
+      3. No positional absolute: a single row on the library's date, else
+         unresolved.
+    """
+    positional = None
+    for row in rows or ():
+        if _row_field(row, 'season_number') == season and _row_field(row, 'episode_number') == episode:
+            positional = row
+            break
+    positional_abs = _row_field(positional, 'absolute_episode') if positional is not None else None
+    if positional_abs is not None:
+        try:
+            positional_abs = int(positional_abs)
+        except (TypeError, ValueError):
+            positional_abs = None
+
+    candidates = []
+    for row in rows or ():
+        absolute = _row_field(row, 'absolute_episode')
+        if absolute is None:
+            continue
+        row_season = _row_field(row, 'season_number')
+        if not (isinstance(row_season, int) and row_season > 0) and season != 0:
+            # Specials reuse titles (recaps) and manufacture ambiguity.
+            continue
+        try:
+            candidates.append((int(absolute), row))
+        except (TypeError, ValueError):
+            continue
+    if not candidates:
+        return positional_abs, ABS_NO_ROWS, ()
+
+    media_date = parse_local_date(release_date)
+    title_specific = episode_title_is_specific(episode_title)
+    if not title_specific and media_date is None:
+        return positional_abs, ABS_UNVERIFIED, ()
+
+    if title_specific:
+        exact_key = episode_title_key(episode_title)
+        hits = [(absolute, row) for absolute, row in candidates
+                if episode_title_key(_row_field(row, 'title')) == exact_key]
+        if not hits:
+            stripped_key = episode_title_key(episode_title, strip_part=True)
+            hits = [(absolute, row) for absolute, row in candidates
+                    if episode_title_key(_row_field(row, 'title'), strip_part=True) == stripped_key]
+        found = tuple(sorted({absolute for absolute, _ in hits}))
+        if len(found) == 1:
+            verdict = ABS_VERIFIED_TITLE if found[0] == positional_abs else ABS_REMAPPED_TITLE
+            return found[0], verdict, ()
+        if len(found) > 1:
+            by_date = tuple(sorted({
+                absolute for absolute, row in hits
+                if dates_within_a_day(media_date, parse_utc_date(_row_field(row, 'first_aired')))
+            }))
+            if len(by_date) == 1:
+                return by_date[0], ABS_AMBIGUOUS_DATE, found
+            if estimate is not None and estimate in found:
+                return int(estimate), ABS_AMBIGUOUS_ESTIMATE, found
+            return found[0], ABS_AMBIGUOUS, found
+
+    if positional_abs is not None:
+        positional_date = parse_utc_date(_row_field(positional, 'first_aired'))
+        if dates_within_a_day(media_date, positional_date):
+            return positional_abs, ABS_VERIFIED_DATE, ()
+        return positional_abs, ABS_POSITIONAL_UNCONFIRMED, ()
+
+    if media_date is not None:
+        on_date = tuple(sorted({
+            absolute for absolute, row in candidates
+            if dates_within_a_day(media_date, parse_utc_date(_row_field(row, 'first_aired')))
+        }))
+        if len(on_date) == 1:
+            return on_date[0], ABS_REMAPPED_DATE, ()
+    return None, ABS_UNRESOLVED, ()

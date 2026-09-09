@@ -1436,6 +1436,12 @@ def filter_results(
                         _stamped_abs = result.get('target_abs_episode')
                         if _stamped_abs is not None:
                             target_absolute.append(_stamped_abs)
+                        # The second number a dual-tree episode is known by
+                        # (Pokemon S18E119 is 162 on one tree and 1061 on the
+                        # other); one more candidate, same rule.
+                        _stamped_alt = result.get('target_abs_episode_alt')
+                        if _stamped_alt is not None and _stamped_alt not in target_absolute:
+                            target_absolute.append(_stamped_alt)
                         if is_anime and season is not None and episode is not None:
                             try:
                                 preceding = [int(s) for s in range(1, int(season))]
@@ -1561,6 +1567,8 @@ def filter_results(
                             if _abs is None and season_episode_counts and episode is not None:
                                 _abs = sum(c for s_, c in season_episode_counts.items()
                                            if isinstance(s_, int) and 0 < s_ < season) + episode
+                            elif _abs is not None and result.get('target_abs_episode_alt') is not None:
+                                _abs = [_abs, result['target_abs_episode_alt']]
                             season_match, _reason = season_verdict(
                                 file_seasons=result_seasons,
                                 target_season=season,

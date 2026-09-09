@@ -125,6 +125,23 @@ class TestAnimeAbsoluteNumbering(unittest.TestCase):
         self.assertEqual(_keyword_queries('X', None), [])
 
 
+class TestAlternateAbsolute(unittest.TestCase):
+    """A dual-tree episode is asked for under both of its numbers."""
+
+    FORMATS = {'regular': 'S18E119', 'absolute': '162', 'absolute_alt': '1061',
+               'combined': 'S18E162', 'absolute_padded': '162'}
+
+    def test_both_numbers_are_keyword_searches(self):
+        queries = [p['query'] for p in build(season=18, episode=119, episode_formats=self.FORMATS)
+                   if p['type'] == 'search']
+        self.assertIn('One Piece 162', queries)
+        self.assertIn('One Piece 1061', queries)
+
+    def test_the_cap_still_holds(self):
+        from scraper.prowlarr import _MAX_ANIME_KEYWORD_QUERIES
+        self.assertLessEqual(len(_keyword_queries('One Piece', self.FORMATS)), _MAX_ANIME_KEYWORD_QUERIES)
+
+
 class TestUnchangedBehaviour(unittest.TestCase):
     def test_title_text_search_still_uses_sxxexx(self):
         queries = [p['query'] for p in build() if p['type'] == 'tvsearch']

@@ -130,5 +130,29 @@ class SingleFormatForAliasTitles(unittest.TestCase):
         self.assertEqual(self._episode_scrape(single_format=False), len(self.FORMATS))
 
 
+class AlternateAbsoluteIsNotForNyaa(unittest.TestCase):
+    """'absolute_alt' exists for the Prowlarr keyword search. Nyaa neither
+    requests it nor learns it as the show's format preference."""
+
+    FORMATS = {'regular': 'S18E119', 'absolute': '162', 'absolute_alt': '1061', 'combined': 'S18E162'}
+
+    def test_single_format_never_picks_the_alternate(self):
+        with patch('scraper.nyaa.get_anime_format', return_value='absolute_alt'):
+            self.assertEqual(nyaa.pick_single_format(dict(self.FORMATS), 'tmdb1'), {'absolute': '162'})
+
+    def test_episode_search_skips_the_alternate_and_never_learns_it(self):
+        with patch('scraper.nyaa._scrape_nyaa_with_format', return_value=[{'title': 'x'}]) as fmt, \
+                patch('scraper.nyaa.contains_target_episode', return_value=True), \
+                patch('scraper.nyaa.get_anime_format', return_value=None), \
+                patch('scraper.nyaa.update_anime_format') as learn, \
+                patch('scraper.nyaa.time.sleep', return_value=None):
+            nyaa.scrape_nyaa_anime_episode('Show', 2020, 18, 119, dict(self.FORMATS), 'tmdb1')
+        patterns = [call.args[2] for call in fmt.call_args_list]
+        self.assertEqual(len(patterns), len(self.FORMATS) - 1)
+        self.assertNotIn('1061', patterns)
+        for call in learn.call_args_list:
+            self.assertNotEqual(call.args[1], 'absolute_alt')
+
+
 if __name__ == '__main__':
     unittest.main()

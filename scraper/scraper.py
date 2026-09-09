@@ -9,7 +9,12 @@ from datetime import datetime, timedelta, timezone
 from database.database_reading import (
     get_movie_runtime, get_episode_runtime, get_episode_count,
     get_all_season_episode_counts, get_episode_title_context,
+    get_episode_details,
 )
+from scraper.functions.season_resolution import (
+    absolute_episode_from_identity, ABS_AMBIGUOUS,
+)
+from types import SimpleNamespace
 from database.database_writing import update_anime_format, update_preferred_alias, get_preferred_alias
 from fuzzywuzzy import fuzz
 import os
@@ -128,41 +133,80 @@ def normalize_episode_format_for_dedup(episode_format: str) -> str:
     
     return normalized
 
-def get_absolute_episode_from_database(imdb_id: str, season: int, episode: int) -> Optional[int]:
-    """Get the absolute episode number from the database if available."""
+def load_battery_episode_rows(imdb_id: str) -> Optional[List[SimpleNamespace]]:
+    """Every episode the metadata battery holds for a show, in one query.
+
+    Rows expose season_number, episode_number, title, first_aired and
+    absolute_episode -- the fields absolute_episode_from_identity reads.
+    None when the show is unknown to the battery; an empty list when it is
+    known but has no episodes.
+    """
+    if not imdb_id:
+        return None
     try:
         from cli_battery.app.database import Session, Item, Season, Episode
-        
+
         with Session() as session:
-            # Find the item by IMDB ID
             item = session.query(Item).filter_by(imdb_id=imdb_id).first()
             if not item:
                 logging.debug(f"Item not found in database for IMDB ID: {imdb_id}")
                 return None
-            
-            # Find the season
-            season_obj = session.query(Season).filter_by(item_id=item.id, season_number=season).first()
-            if not season_obj:
-                logging.debug(f"Season {season} not found for item {imdb_id}")
-                return None
-            
-            # Find the episode
-            episode_obj = session.query(Episode).filter_by(season_id=season_obj.id, episode_number=episode).first()
-            if not episode_obj:
-                logging.debug(f"Episode S{season}E{episode} not found for item {imdb_id}")
-                return None
-            
-            # Check if absolute episode number exists
-            if episode_obj.absolute_episode is not None:
-                logging.info(f"Found absolute episode number {episode_obj.absolute_episode} for S{season}E{episode} in database")
-                return episode_obj.absolute_episode
-            else:
-                logging.debug(f"Episode S{season}E{episode} exists but has no absolute episode number")
-                return None
-                
+            fetched = (
+                session.query(Episode.episode_number, Episode.title, Episode.first_aired,
+                              Episode.absolute_episode, Season.season_number)
+                .join(Season, Episode.season_id == Season.id)
+                .filter(Season.item_id == item.id)
+                .all()
+            )
+            # Materialised inside the session: the tuples are plain values, but
+            # keeping the loop here means nothing lazy escapes.
+            return [
+                SimpleNamespace(season_number=season_number, episode_number=episode_number,
+                                title=title, first_aired=first_aired,
+                                absolute_episode=absolute_episode)
+                for episode_number, title, first_aired, absolute_episode, season_number in fetched
+            ]
     except Exception as e:
-        logging.warning(f"Error getting absolute episode from database: {e}")
+        logging.warning(f"Error reading battery episodes for {imdb_id}: {e}")
         return None
+
+
+def get_absolute_episode_from_database(
+    imdb_id: str, season: int, episode: int,
+    episode_title: Optional[str] = None, release_date: Any = None,
+    estimate: Optional[int] = None,
+) -> Tuple[Optional[int], Tuple[int, ...]]:
+    """The absolute number of S{season}E{episode}, resolved by identity.
+
+    The battery and media_items hold different season layouts for the same
+    show, so the positional (season, episode) key alone lands on the wrong
+    episode for re-split and dual-numbered shows (Dragon Ball Kai S2E1 read 99
+    where the library row is episode 27). The library row's own title and
+    date identify it across layouts; see absolute_episode_from_identity.
+
+    Returns (absolute, alternates). ``alternates`` is non-empty only when the
+    title sits at more than one absolute and nothing breaks the tie -- both
+    numbers are then worth asking for. ``absolute`` is None when the battery
+    does not know the show or the identity could not be resolved, and the
+    caller falls back to XEM and arithmetic as before.
+    """
+    if not imdb_id or season is None or episode is None:
+        return None, ()
+    rows = load_battery_episode_rows(imdb_id)
+    if rows is None:
+        return None, ()
+    absolute, verdict, candidates = absolute_episode_from_identity(
+        rows, season, episode, episode_title, release_date, estimate)
+    positional = next((r.absolute_episode for r in rows
+                       if r.season_number == season and r.episode_number == episode), None)
+    line = f"Absolute episode {imdb_id} S{season:02d}E{episode:02d}: {verdict}"
+    if absolute is not None and positional != absolute:
+        line += f" (positional {positional} -> {absolute})"
+    if candidates:
+        line += f" candidates={tuple(candidates)}"
+    logging.info(line)
+    alternates = tuple(c for c in candidates if c != absolute) if verdict == ABS_AMBIGUOUS else ()
+    return absolute, alternates
 
 
 def get_max_absolute_episode_from_database(imdb_id: str) -> Optional[int]:
@@ -203,17 +247,26 @@ def get_max_absolute_episode_from_database(imdb_id: str) -> Optional[int]:
             f"Error getting maximum absolute episode from database: {e}")
         return None
 
-def convert_anime_episode_format(season: int, episode: int, season_episode_counts: Dict[int, int], xem_mapping: Optional[List[Dict]] = None, tmdb_id: Optional[str] = None, imdb_id: Optional[str] = None, multi: bool = False) -> Dict[str, str]:
+def convert_anime_episode_format(season: int, episode: int, season_episode_counts: Dict[int, int], xem_mapping: Optional[List[Dict]] = None, tmdb_id: Optional[str] = None, imdb_id: Optional[str] = None, multi: bool = False,
+                                 battery_absolute: Optional[int] = None, battery_absolute_alt: Optional[int] = None,
+                                 battery_checked: bool = False) -> Dict[str, str]:
     """Convert anime episode numbers into different formats using XEM mapping when available.
-    
+
     For single episodes (multi=False), returns:
     - regular: S04E01
-    - absolute: 60 (no leading zeros)  
+    - absolute: 60 (no leading zeros)
     - combined: S04E60
-    
+
     For season packs (multi=True), returns:
     - season: S02
     - absolute: 25 (no leading zeros)
+
+    ``battery_checked`` says the caller already resolved the battery's number
+    by identity (scrape() does it once per item and passes it to every call);
+    ``battery_absolute`` is then used as-is, None falling through to XEM and
+    arithmetic. ``battery_absolute_alt`` is a second number the same episode
+    is known by on a dual numbering tree; it is emitted as 'absolute_alt',
+    a key the Prowlarr keyword search asks for and Nyaa ignores.
     """
     logging.info(f"Converting anime episode format - Season: {season}, Episode: {episode}, Multi: {multi}, Counts: {season_episode_counts}")
 
@@ -299,12 +352,16 @@ def convert_anime_episode_format(season: int, episode: int, season_episode_count
         return formats
 
     # Original logic for single episodes
-    # Try to get absolute episode from database first (most accurate for One Piece)
+    # The battery's number, resolved by identity, is the most accurate source
+    # (One Piece, Pokemon). scrape() resolves it once and hands it in; the
+    # positional lookup below only serves callers that did not.
     absolute_episode = None
-    if imdb_id:
-        absolute_episode = get_absolute_episode_from_database(imdb_id, season, episode)
-        if absolute_episode is not None:
-            logging.info(f"Using absolute episode number {absolute_episode} from database for S{season}E{episode}")
+    if battery_checked:
+        absolute_episode = battery_absolute
+    elif imdb_id:
+        absolute_episode, _ = get_absolute_episode_from_database(imdb_id, season, episode)
+    if absolute_episode is not None:
+        logging.info(f"Using absolute episode number {absolute_episode} from database for S{season}E{episode}")
     
     # If not in database, try XEM mapping as fallback
     if absolute_episode is None and xem_mapping:
@@ -386,8 +443,14 @@ def convert_anime_episode_format(season: int, episode: int, season_episode_count
     formats = {
         'regular': f"S{season:02d}E{episode:02d}",
         'absolute': str(absolute_episode),  # No leading zeros
-        'combined': f"S{season:02d}E{absolute_episode}"
     }
+    # Directly after 'absolute': the keyword search takes the first
+    # _MAX_ANIME_KEYWORD_QUERIES searchable formats in insertion order, so the
+    # alternate displaces the padded form for the items that have one.
+    if battery_checked and battery_absolute is not None and battery_absolute_alt is not None \
+            and battery_absolute_alt != absolute_episode:
+        formats['absolute_alt'] = str(battery_absolute_alt)
+    formats['combined'] = f"S{season:02d}E{absolute_episode}"
     # Long-running shows are released as 'Title - 015'; Nyaa's full-text
     # search will not find '015' with the query '15'.
     if absolute_episode and f"{absolute_episode:03d}" != str(absolute_episode):
@@ -395,6 +458,40 @@ def convert_anime_episode_format(season: int, episode: int, season_episode_count
     
     logging.info(f"Generated single episode formats: {formats}")
     return formats
+
+def _arithmetic_absolute(season: int, episode: int, season_episode_counts: Dict[int, int]) -> Optional[int]:
+    """The library layout's own arithmetic absolute: the sum of the preceding
+    seasons' episode counts plus the episode number. The weakest identity
+    evidence -- only a tiebreak."""
+    if season is None or episode is None:
+        return None
+    try:
+        preceding = sum(int(season_episode_counts.get(s, 0) or 0)
+                        for s in season_episode_counts
+                        if isinstance(s, int) and 0 < s < int(season))
+        return preceding + int(episode)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _resolve_battery_absolute(imdb_id: str, season: int, episode: int,
+                              episode_title: Optional[str],
+                              season_episode_counts: Dict[int, int]) -> Tuple[Optional[int], Optional[int]]:
+    """Resolve the battery's absolute number for one library row by identity.
+
+    Reads the row's own title and release date (the title may already be in
+    hand from the identity-gate context) and returns (absolute, alternate);
+    the alternate is the second number a dual-tree episode is known by, or
+    None.
+    """
+    details = get_episode_details(imdb_id, season, episode) or {}
+    title = episode_title or details.get('episode_title')
+    absolute, alternates = get_absolute_episode_from_database(
+        imdb_id, season, episode, episode_title=title,
+        release_date=details.get('release_date'),
+        estimate=_arithmetic_absolute(season, episode, season_episode_counts or {}))
+    return absolute, (alternates[0] if alternates else None)
+
 
 def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str, version: str, season: int = None, episode: int = None, multi: bool = False, genres: List[str] = None, skip_cache_check: bool = False, check_pack_wantedness: bool = False) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
     from metadata.metadata import get_tmdb_id_and_media_type, get_metadata, get_media_country_code
@@ -559,6 +656,9 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
         genres = filter_genres(genres)
         is_anime = genres and any('anime' in g.lower() for g in genres)
         episode_formats = None
+        battery_absolute: Optional[int] = None
+        battery_absolute_alt: Optional[int] = None
+        battery_checked = False
         if is_anime and content_type.lower() == 'episode' and season is not None:
             # For season packs (multi=True), we don't have an episode number, but we need to generate
             # formats to find the pack. We'll use episode 1 of the requested season as a proxy.
@@ -567,10 +667,22 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
 
             logging.info(f"Detected anime content: {title}")
             season_episode_counts = get_all_season_episode_counts(tmdb_id)
-            
+
+            # Resolve the battery's absolute number ONCE, by the library row's
+            # own identity, and hand it to every format generation below. The
+            # per-call positional lookup this replaces read the wrong episode
+            # on re-split shows, and the post-XEM call at that probed the
+            # battery with a scene coordinate.
+            if not multi and original_episode is not None:
+                battery_absolute, battery_absolute_alt = _resolve_battery_absolute(
+                    imdb_id, original_season, original_episode, target_episode_title,
+                    season_episode_counts)
+                battery_checked = True
+
             # Initial format generation (XEM mapping not available yet)
             episode_formats = convert_anime_episode_format(
-                season, target_episode, season_episode_counts, xem_mapping=None, tmdb_id=tmdb_id, imdb_id=imdb_id, multi=multi
+                season, target_episode, season_episode_counts, xem_mapping=None, tmdb_id=tmdb_id, imdb_id=imdb_id, multi=multi,
+                battery_absolute=battery_absolute, battery_absolute_alt=battery_absolute_alt, battery_checked=battery_checked
             )
             # Capture the initially calculated absolute episode number (no leading zeros)
             try:
@@ -989,25 +1101,31 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                     # Generate formats using the mapped S/E so absolute stays correct (e.g., abs 15 -> S02E03, combined S02E15)
                     logging.info(f"Generating formats for XEM-mapped absolute: S{season}E{target_episode} (calc_abs={calc_absolute_episode})")
                     episode_formats = convert_anime_episode_format(
-                        season, target_episode, season_episode_counts, xem_mapping=xem_mapping_list, tmdb_id=tmdb_id, imdb_id=imdb_id, multi=multi
+                        season, target_episode, season_episode_counts, xem_mapping=xem_mapping_list, tmdb_id=tmdb_id, imdb_id=imdb_id, multi=multi,
+                        battery_absolute=battery_absolute, battery_absolute_alt=battery_absolute_alt, battery_checked=battery_checked
                     )
                     logging.info(f"Absolute-mapped episode formats: {episode_formats}")
                 else:
                     # This is a regular XEM-mapped episode
                     # Generate formats using the XEM-mapped season/episode
                     episode_formats = convert_anime_episode_format(
-                        season, target_episode, season_episode_counts, xem_mapping=xem_mapping_list, tmdb_id=tmdb_id, imdb_id=imdb_id, multi=multi
+                        season, target_episode, season_episode_counts, xem_mapping=xem_mapping_list, tmdb_id=tmdb_id, imdb_id=imdb_id, multi=multi,
+                        battery_absolute=battery_absolute, battery_absolute_alt=battery_absolute_alt, battery_checked=battery_checked
                     )
                     logging.info(f"XEM-mapped episode formats: {episode_formats}")
-                    
-                    # Also generate formats for original season/episode if different
+
+                    # Also generate formats for original season/episode if different.
+                    # Both calls now share the one identity-resolved absolute, so
+                    # the merge below keeps only the scene-coordinate forms
+                    # ('orig_regular'); 'orig_absolute' dedups by value.
                     if original_season != season or original_episode != target_episode:
                         original_target_episode = original_episode if original_episode is not None else 1
                         original_episode_formats = convert_anime_episode_format(
-                            original_season, original_target_episode, season_episode_counts, xem_mapping=xem_mapping_list, tmdb_id=tmdb_id, imdb_id=imdb_id, multi=multi
+                            original_season, original_target_episode, season_episode_counts, xem_mapping=xem_mapping_list, tmdb_id=tmdb_id, imdb_id=imdb_id, multi=multi,
+                            battery_absolute=battery_absolute, battery_absolute_alt=battery_absolute_alt, battery_checked=battery_checked
                         )
                         logging.info(f"Original episode formats: {original_episode_formats}")
-                        
+
                         # Merge unique formats
                         for key, value in original_episode_formats.items():
                             if value not in episode_formats.values():
@@ -1080,13 +1198,16 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                             absolute_episode_formats = {
                                 'regular': f"S{original_season:02d}E{original_episode:02d}",
                                 'absolute': str(calc_absolute_episode),
-                                'combined': f"S{original_season:02d}E{calc_absolute_episode}"
                             }
+                            if battery_absolute_alt is not None and battery_absolute_alt != calc_absolute_episode:
+                                absolute_episode_formats['absolute_alt'] = str(battery_absolute_alt)
+                            absolute_episode_formats['combined'] = f"S{original_season:02d}E{calc_absolute_episode}"
                             logging.info(f"Using pre-calculated absolute episode {calc_absolute_episode} for episode {original_episode}")
                         else:
                             # Fallback to the original logic if calc_absolute_episode is not available
                             absolute_episode_formats = convert_anime_episode_format(
-                                1, original_episode, season_episode_counts, xem_mapping=xem_mapping_list, tmdb_id=tmdb_id, imdb_id=imdb_id, multi=multi
+                                1, original_episode, season_episode_counts, xem_mapping=xem_mapping_list, tmdb_id=tmdb_id, imdb_id=imdb_id, multi=multi,
+                                battery_absolute=battery_absolute, battery_absolute_alt=battery_absolute_alt, battery_checked=battery_checked
                             )
                             logging.info(f"Fallback: Absolute episode formats for episode {original_episode}: {absolute_episode_formats}")
                         
@@ -1399,6 +1520,12 @@ def scrape(imdb_id: str, tmdb_id: str, title: str, year: int, content_type: str,
                     abs_str = episode_formats.get('absolute')  # Now always without padding
                     if abs_str and str(abs_str).isdigit():
                         normalized_result['target_abs_episode'] = int(abs_str)
+                    # The second number a dual-tree episode is known by. The
+                    # identity gate treats it as one more candidate; the other
+                    # consumers of target_abs_episode keep reading the primary.
+                    alt_str = episode_formats.get('absolute_alt')
+                    if alt_str and str(alt_str).isdigit():
+                        normalized_result['target_abs_episode_alt'] = int(alt_str)
                 if is_alias:
                     normalized_result['alias_country'] = alias_country
                 normalized_results.append(normalized_result)
