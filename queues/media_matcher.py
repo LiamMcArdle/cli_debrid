@@ -38,6 +38,8 @@ class MediaMatcher:
 
     def __init__(self, relaxed_matching: bool = False):
         self.episode_count_cache: Dict[str, Dict[int, int]] = {}
+        # (imdb_id, tmdb_id, season, episode) -> absolute candidates; see _absolute_candidates_for_item
+        self._absolute_cache: Dict[Tuple[Any, Any, int, int], Tuple[int, ...]] = {}
         self.episode_title_cache: Dict[str, Dict[Tuple[int, int], str]] = {}
         self.official_titles_cache: Dict[str, Optional[List[str]]] = {}
         self.relaxed_matching = relaxed_matching
@@ -217,39 +219,69 @@ class MediaMatcher:
             logging.debug(f"Could not fetch season episode counts for tmdb_id={tmdb_id}: {e}")
             return None
 
-    def _compute_absolute_episode_for_item(self, item: Dict[str, Any]) -> Optional[int]:
-        """Compute the absolute episode number for an item using cached counts or detect_absolute_numbering."""
+    def _absolute_candidates_for_item(self, item: Dict[str, Any]) -> Tuple[int, ...]:
+        """Every absolute number this episode may be released under.
+
+        The same identity resolution the scraper used to find the release:
+        the battery's rows matched by the row's own title and date, which is
+        the only source that survives a re-split season layout (One Piece
+        S21E77 is 968; the library's arithmetic says 967 and the old
+        "high season and episode means the episode number is already
+        absolute" heuristic said 77, so the file the scraper correctly chose
+        could never be matched). A dual-tree episode yields both numbers.
+        Arithmetic over the library's own layout is the fallback, the
+        heuristic the last resort for shows the battery does not know.
+        """
         try:
-            tmdb_id = item.get('tmdb_id')
             target_season = item.get('season') or item.get('season_number')
             target_episode = item.get('episode') or item.get('episode_number')
-            if tmdb_id is None or target_season is None or target_episode is None:
-                return None
+            if target_season is None or target_episode is None:
+                return ()
+            imdb_id = item.get('imdb_id')
+            tmdb_id = item.get('tmdb_id')
+            key = (imdb_id, tmdb_id, int(target_season), int(target_episode))
+            cached = self._absolute_cache.get(key)
+            if cached is not None:
+                return cached
 
-            series_title = item.get('series_title') or item.get('title')
-            uses_absolute, detected_absolute = detect_absolute_numbering(series_title, target_season, target_episode, tmdb_id)
-            if uses_absolute and detected_absolute:
-                return detected_absolute
-
-            season_episode_counts = self._get_season_episode_counts_cached(tmdb_id)
-            if not season_episode_counts:
-                return None
-
-            # Season 0 must be excluded. Absolute numbering counts broadcast
-            # episodes only, so folding in the specials shifts every absolute
-            # number by the length of season 0 -- for Demon Slayer that is 18,
-            # turning S05E04's true absolute 59 into 77 and making genuine
-            # absolute-numbered releases unmatchable.
-            target_absolute_episode = 0
-            sorted_seasons = sorted([s for s in season_episode_counts.keys()
-                                     if isinstance(s, int) and 0 < s < target_season])
-            for s_num in sorted_seasons:
-                target_absolute_episode += season_episode_counts.get(s_num, 0)
-            target_absolute_episode += target_episode
-            return target_absolute_episode
+            candidates: List[int] = []
+            season_episode_counts = self._get_season_episode_counts_cached(tmdb_id) or {}
+            if imdb_id:
+                from scraper.scraper import _resolve_battery_absolute
+                absolute, alternate = _resolve_battery_absolute(
+                    imdb_id, int(target_season), int(target_episode),
+                    item.get('episode_title'), season_episode_counts)
+                for number in (absolute, alternate):
+                    if number is not None and number not in candidates:
+                        candidates.append(int(number))
+            if not candidates and season_episode_counts:
+                # Season 0 must be excluded. Absolute numbering counts broadcast
+                # episodes only, so folding in the specials shifts every absolute
+                # number by the length of season 0 -- for Demon Slayer that is 18,
+                # turning S05E04's true absolute 59 into 77 and making genuine
+                # absolute-numbered releases unmatchable.
+                preceding = sum(count for s_num, count in season_episode_counts.items()
+                                if isinstance(s_num, int) and 0 < s_num < int(target_season))
+                candidates.append(preceding + int(target_episode))
+            if not candidates:
+                series_title = item.get('series_title') or item.get('title') or ''
+                uses_absolute, detected = detect_absolute_numbering(
+                    series_title, int(target_season), int(target_episode), tmdb_id)
+                if uses_absolute and detected:
+                    candidates.append(int(detected))
+            result = tuple(candidates)
+            if len(self._absolute_cache) > 2048:
+                self._absolute_cache.clear()
+            self._absolute_cache[key] = result
+            return result
         except Exception as e:
             logging.debug(f"Could not compute absolute episode for item: {e}")
-            return None
+            return ()
+
+    def _compute_absolute_episode_for_item(self, item: Dict[str, Any]) -> Optional[int]:
+        """The primary absolute number for an item; see _absolute_candidates_for_item."""
+        candidates = self._absolute_candidates_for_item(item)
+        return candidates[0] if candidates else None
 
     def _build_parsed_file_indexes(self, parsed_files: List[Dict[str, Any]]):
         """Build fast lookups for parsed files to avoid scanning all files for every item."""
@@ -681,7 +713,7 @@ class MediaMatcher:
                 file_seasons=ptt_result.get('seasons'),
                 file_numbers=file_numbers,
                 filename=filename,
-                absolute_episode=self._compute_absolute_episode_for_item(item)
+                absolute_episode=self._absolute_candidates_for_item(item)
                 if is_anime else None,
                 container_season=container_season_from_path(file_path),
                 is_anime=is_anime,
@@ -733,7 +765,7 @@ class MediaMatcher:
                 item_for_abs = dict(item)
                 item_for_abs['season'] = item_for_abs['season_number'] = target_season
                 item_for_abs['episode'] = item_for_abs['episode_number'] = target_episode
-                absolute_episode = self._compute_absolute_episode_for_item(item_for_abs)
+                absolute_episode = self._absolute_candidates_for_item(item_for_abs) or None
 
             season_match, season_reason = season_verdict(
                 file_seasons=ptt_result.get('seasons'),
@@ -748,8 +780,8 @@ class MediaMatcher:
 
             # An absolute-numbered release names the absolute episode, not the
             # in-season one, so the episode check has to accept that number too.
-            if season_match and not episode_match and absolute_episode is not None \
-                    and absolute_episode in file_numbers:
+            if season_match and not episode_match and absolute_episode \
+                    and any(number in file_numbers for number in absolute_episode):
                 episode_match = True
                 logging.debug(f"Episode matched via absolute number {absolute_episode}")
             # --- End season matching ---------------------------------------
@@ -851,7 +883,7 @@ class MediaMatcher:
                         item_for_abs = dict(item)
                         item_for_abs['season'] = item_for_abs['season_number'] = target_season
                         item_for_abs['episode'] = item_for_abs['episode_number'] = target_episode
-                        absolute_episode = self._compute_absolute_episode_for_item(item_for_abs)
+                        absolute_episode = self._absolute_candidates_for_item(item_for_abs) or None
 
                     if using_xem and target_season is None and not ptt_result.get('seasons'):
                         season_match, season_reason = True, 'XEM mapped to no season'
@@ -871,8 +903,8 @@ class MediaMatcher:
                                 target_season, target_episode)
 
                     episode_match = target_episode in file_numbers
-                    if season_match and not episode_match and absolute_episode is not None \
-                            and absolute_episode in file_numbers:
+                    if season_match and not episode_match and absolute_episode \
+                            and any(number in file_numbers for number in absolute_episode):
                         episode_match = True
                         logging.debug(f"Strict: episode matched via absolute {absolute_episode}")
 
@@ -1124,8 +1156,7 @@ class MediaMatcher:
                             seen_ids.add(id(pf)); candidate_files.append(pf)
                 # Anime absolute-numbered files, mirroring find_related_items.
                 if is_anime:
-                    abs_ep = self._compute_absolute_episode_for_item(item)
-                    if abs_ep is not None:
+                    for abs_ep in self._absolute_candidates_for_item(item):
                         for pf in by_episode_only.get(abs_ep, []):
                             if id(pf) not in seen_ids:
                                 seen_ids.add(id(pf)); candidate_files.append(pf)
@@ -1587,8 +1618,7 @@ class MediaMatcher:
                         if target_episode is not None:
                             item_clone_for_abs['episode'] = target_episode
                             item_clone_for_abs['episode_number'] = target_episode
-                        abs_ep = self._compute_absolute_episode_for_item(item_clone_for_abs)
-                        if abs_ep is not None:
+                        for abs_ep in self._absolute_candidates_for_item(item_clone_for_abs):
                             for pf in by_episode_only.get(abs_ep, []):
                                 if id(pf) not in seen_ids:
                                     seen_ids.add(id(pf)); candidate_files.append(pf)

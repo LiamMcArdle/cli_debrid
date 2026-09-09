@@ -281,6 +281,27 @@ class TestAllRefusedIsHeldNotFailed(unittest.TestCase):
         self.assertFalse(kwargs.get('hold_rung', False))
 
 
+class TestNoSiblingSweep(unittest.TestCase):
+    def test_a_failure_flags_only_the_item_itself(self):
+        """One item finding nothing addable said nothing about its siblings,
+        yet the flag was copied onto every later episode of the season: 50
+        Pokemon rows in one stroke on 2026-09-09."""
+        from queues.adding_queue import AddingQueue
+        aq = AddingQueue.__new__(AddingQueue)
+        aq.items = []
+        qm = MagicMock()
+        item = {'id': 7, 'type': 'episode', 'title': 'Pokemon', 'season_number': 18,
+                'episode_number': 95, 'version': 'Anime'}
+        with patch('database.get_media_item_by_id', create=True, return_value={'fall_back_to_single_scraper': False}), \
+                patch('database.update_media_item', create=True) as update, \
+                patch('database.stream_all_media_items', create=True) as stream, \
+                patch('queues.adding_queue.get_setting', return_value=True):
+            aq._handle_failed_item(item, "No valid results found after cache/uncached processing", qm)
+        update.assert_called_once_with(7, fall_back_to_single_scraper=True)
+        stream.assert_not_called()
+        qm.move_to_scraping.assert_called_once()
+
+
 def _manager():
     from queues.queue_manager import QueueManager
     qm = QueueManager.__new__(QueueManager)

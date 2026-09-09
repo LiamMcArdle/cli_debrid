@@ -1000,35 +1000,14 @@ class AddingQueue:
                 logging.info(f"Falling back to single scraper for {item_identifier} due to error: {error}")
                 if item_id: update_media_item(item_id, fall_back_to_single_scraper=True)
 
-                # Update related items (keep existing logic)
-                if item_id and item.get('type') == 'episode':
-                    series_title = item.get('series_title', '') or item.get('title', '')
-                    season = item.get('season') or item.get('season_number')
-                    current_episode = item.get('episode') or item.get('episode_number')
-                    version = item.get('version')
-
-                    # Stream items from DB to avoid loading entire table into memory
-                    from database import stream_all_media_items  # Local import
-
-                    for candidate in stream_all_media_items(state=None, media_type='episode'):
-                        try:
-                            if ((candidate.get('series_title', '') or candidate.get('title', '')) != series_title):
-                                continue
-                            if (candidate.get('season') or candidate.get('season_number')) != season:
-                                continue
-                            if (candidate.get('episode') or candidate.get('episode_number', -1)) <= current_episode:
-                                continue
-                            if candidate.get('version') != version:
-                                continue
-                            if candidate.get('fall_back_to_single_scraper'):
-                                continue
-
-                            match_id = candidate.get('id')
-                            if match_id:
-                                update_media_item(match_id, fall_back_to_single_scraper=True)
-                                logging.debug(f"Enabled single scraper fallback for related item ID: {match_id} ({candidate.get('title')})")
-                        except Exception as iter_err:
-                            logging.error(f"Error while streaming candidate items for single scraper fallback: {iter_err}")
+                # No sibling sweep. This flag used to be copied onto every later
+                # episode of the season and version, so one item that found
+                # nothing addable put the whole season into single-episode mode
+                # -- 50 Pokemon rows in one stroke on 2026-09-09, on an error
+                # ("No valid results found") that was not even a pack failure.
+                # The item's own next scrape is single-episode; its siblings
+                # decide for themselves, and the final pack attempt keeps pack
+                # mode regardless (scrape_with_fallback, force_multi_pack).
 
                 queue_manager.move_to_scraping(item, "Adding")
                 # move_to_scraping handles removal from self.items
