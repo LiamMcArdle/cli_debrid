@@ -207,6 +207,14 @@ def _make_request(
 
     except api.exceptions.HTTPError as e:
         # Handle HTTP errors that were raised by api_tracker's raise_for_status()
+        # api_tracker raises before the status checks above can run, so this is
+        # where a 451 actually arrives: RD's takedown list refusing this hash.
+        if e.response is not None and e.response.status_code == 451 and endpoint != '/user':
+            error, error_code = _error_body(e.response)
+            logging.warning(f"Real-Debrid 451 on {endpoint}: error={error!r} error_code={error_code}")
+            raise ContentBlockedError(
+                f"Real-Debrid refuses this content (HTTP 451, {error or 'no body'})",
+                error=error, error_code=error_code)
         # Check for 404 on addMagnet
         if e.response is not None and e.response.status_code == 404:
             if method == 'POST' and endpoint == '/torrents/addMagnet':

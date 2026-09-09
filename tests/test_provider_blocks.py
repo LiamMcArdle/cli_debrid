@@ -47,21 +47,45 @@ def _resp(status, body=None, text=''):
     return r
 
 
+def _raised(resp):
+    """What api_tracker actually does: raise_for_status() before returning.
+
+    The first deploy classified 451 only on a returned response and so never
+    fired live -- six real 451s parked the provider as an outage instead."""
+    return requests.exceptions.HTTPError(f"{resp.status_code} Client Error", response=resp)
+
+
 class TestApiLayerClassifies451(unittest.TestCase):
-    def test_451_on_add_raises_content_blocked_with_the_body(self):
-        with patch.object(rd_api.api, 'post', return_value=_resp(451, {'error': 'infringing_file', 'error_code': 35})), \
+    def test_451_raised_by_api_tracker_becomes_content_blocked(self):
+        resp = _resp(451, {'error': 'infringing_file', 'error_code': 35})
+        with patch.object(rd_api.api, 'post', side_effect=_raised(resp)), \
                 patch.object(rd_api, '_wait_for_rate_limit'):
             with self.assertRaises(ContentBlockedError) as cm:
                 rd_api.make_request('POST', '/torrents/addMagnet', 'key', data={'magnet': MAGNET})
         self.assertEqual(cm.exception.error, 'infringing_file')
         self.assertEqual(cm.exception.error_code, 35)
 
+    def test_451_returned_as_a_response_also_classifies(self):
+        with patch.object(rd_api.api, 'post', return_value=_resp(451, {'error': 'infringing_file', 'error_code': 35})), \
+                patch.object(rd_api, '_wait_for_rate_limit'):
+            with self.assertRaises(ContentBlockedError):
+                rd_api.make_request('POST', '/torrents/addMagnet', 'key', data={'magnet': MAGNET})
+
     def test_451_without_json_body_still_classifies(self):
-        with patch.object(rd_api.api, 'post', return_value=_resp(451, None, text='Unavailable')), \
+        resp = _resp(451, None, text='Unavailable')
+        with patch.object(rd_api.api, 'post', side_effect=_raised(resp)), \
                 patch.object(rd_api, '_wait_for_rate_limit'):
             with self.assertRaises(ContentBlockedError) as cm:
                 rd_api.make_request('POST', '/torrents/addMagnet', 'key', data={})
         self.assertIsNone(cm.exception.error_code)
+
+    def test_a_raised_503_is_still_provider_level(self):
+        for fn in (rd_api.make_request, rd_api.make_request_strict):
+            fn.retry.sleep = lambda *_: None
+        with patch.object(rd_api.api, 'post', side_effect=_raised(_resp(503, None, text='down'))), \
+                patch.object(rd_api, '_wait_for_rate_limit'):
+            with self.assertRaises(ProviderUnavailableError):
+                rd_api.make_request_strict('POST', '/torrents/addMagnet', 'key', data={})
 
     def test_451_on_user_still_returns_the_user(self):
         with patch.object(rd_api.api, 'get', return_value=_resp(451, {'id': 1, 'username': 'x'})), \
