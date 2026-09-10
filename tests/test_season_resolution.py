@@ -519,6 +519,29 @@ class SeasonTitleTier(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(reason, IDENTITY_SEASON_TITLE)
 
+    ONE_PIECE = {14: ['Fishman Island'], 15: ['Punk Hazard'], 20: ['Levely Arc']}
+
+    def test_provider_spelling_finds_the_release_spelling(self):
+        # Trakt says 'Fishman Island'; the release says 'Fish-Man Island Saga'.
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(14, 13)], file_seasons=[], file_numbers=[13],
+            filename='[Sick-Fansubs] One Piece Log - Fish-Man Island Saga - 13 [1080p].mp4',
+            absolute_episode=None, is_anime=True, series_title='One Piece',
+            season_titles=self.ONE_PIECE)
+        self.assertTrue(ok)
+        self.assertEqual(reason, IDENTITY_SEASON_TITLE)
+
+    def test_another_seasons_arc_name_is_a_conflicting_coordinate(self):
+        # Grabbed for S20E13 on the bare 13 and refused at the add on 2026-09-09.
+        ok, reason = episode_identity_verdict(
+            target_coordinates=[(20, 13)], file_seasons=[], file_numbers=[13],
+            filename='[Sick-Fansubs] One Piece Log - Fish-Man Island Saga - 13 [1080p].mp4',
+            absolute_episode=None, is_anime=True, series_title='One Piece',
+            season_titles=self.ONE_PIECE)
+        self.assertFalse(ok)
+        self.assertEqual(reason, _sr.IDENTITY_SEASON_TITLE_CONFLICT)
+        self.assertNotIn(reason, _sr.INCONCLUSIVE_IDENTITY_REASONS)
+
     def test_bare_number_is_not_promoted(self):
         ok, reason = self._verdict('[SubsPlease] Bleach - 01 (1080p).mkv')
         self.assertFalse(ok)

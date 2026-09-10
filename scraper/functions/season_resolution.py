@@ -178,6 +178,7 @@ TITLE_AMBIGUOUS = 'another episode of this show also fits this filename'
 IDENTITY_COORDINATE = 'file names the requested coordinate'
 IDENTITY_ABSOLUTE = 'file names the requested absolute episode'
 IDENTITY_SEASON_TITLE = 'file names the requested season by its title'
+IDENTITY_SEASON_TITLE_CONFLICT = 'file names a different season by its title'
 IDENTITY_DATE = 'file airdate identifies the requested episode'
 IDENTITY_TITLE = TITLE_MATCH
 IDENTITY_EXPLICIT_CONFLICT = 'file explicitly names a conflicting coordinate'
@@ -272,11 +273,29 @@ def episode_title_is_usable(episode_title: str) -> bool:
         normalize_title_text(_strip_part_marker(episode_title)))
 
 
+def _names_within(target: str, haystack: str, loose_spacing: bool) -> bool:
+    """Whether the normalized ``target`` occurs in the normalized ``haystack``.
+
+    With ``loose_spacing`` the comparison also ignores word breaks, so a
+    provider's 'Fishman Island' finds a release's 'Fish-Man Island Saga'.
+    Only for names long enough that a run of letters cannot appear by
+    accident inside other words.
+    """
+    if ' %s ' % target in ' %s ' % haystack:
+        return True
+    if loose_spacing:
+        packed = target.replace(' ', '')
+        if len(packed) >= 8 and packed in haystack.replace(' ', ''):
+            return True
+    return False
+
+
 def episode_title_verdict(
     episode_title: Optional[str],
     filename: Optional[str],
     other_episode_titles: Optional[List[str]] = None,
     series_title: Optional[str] = None,
+    loose_spacing: bool = False,
 ) -> Tuple[bool, str]:
     """Decide whether `filename` names the episode called `episode_title`.
 
@@ -305,8 +324,8 @@ def episode_title_verdict(
         if show and target in show:
             return False, TITLE_NOT_DISTINCTIVE
 
-    haystack = ' %s ' % normalize_title_text(filename)
-    if ' %s ' % target not in haystack:
+    haystack = normalize_title_text(filename)
+    if not _names_within(target, haystack, loose_spacing):
         return False, TITLE_ABSENT
 
     # If another episode's title also fits this filename, the filename does not
@@ -319,7 +338,7 @@ def episode_title_verdict(
         other_norm = normalize_title_text(_strip_part_marker(other))
         if not other_norm or not episode_title_is_distinctive(other_norm):
             continue
-        if len(other_norm) >= len(target) and ' %s ' % other_norm in haystack:
+        if len(other_norm) >= len(target) and _names_within(other_norm, haystack, loose_spacing):
             return False, TITLE_AMBIGUOUS
 
     return True, TITLE_MATCH
@@ -510,28 +529,40 @@ def episode_identity_verdict(
                 by_season[int(key)] = [n for n in (names or []) if n]
             except (TypeError, ValueError):
                 continue
+        def _claimed(name, others):
+            for text in (filename, container_text):
+                if not text:
+                    continue
+                ok, _ = episode_title_verdict(name, text, other_episode_titles=others,
+                                              series_title=series_title, loose_spacing=True)
+                if ok:
+                    return True
+            return False
+
         for target_season, target_episode in coordinates:
-            if target_season is None or target_season < 2:
+            if target_season is None:
                 continue
             names = by_season.get(target_season) or []
-            if not names:
-                continue
             others = [n for s, ns in by_season.items() if s != target_season for n in ns]
-            for name in names:
-                claimed = False
-                for text in (filename, container_text):
-                    if not text:
-                        continue
-                    ok, _ = episode_title_verdict(name, text, other_episode_titles=others,
-                                                  series_title=series_title)
-                    if ok:
-                        claimed = True
-                        break
-                if claimed and target_episode in numbers:
-                    blocked = _number_blocked(target_episode) if is_anime else None
-                    if blocked:
-                        return False, blocked
-                    return True, IDENTITY_SEASON_TITLE
+            if target_season >= 2 and names:
+                for name in names:
+                    if _claimed(name, others) and target_episode in numbers:
+                        blocked = _number_blocked(target_episode) if is_anime else None
+                        if blocked:
+                            return False, blocked
+                        return True, IDENTITY_SEASON_TITLE
+            # A file that names ANOTHER season's arc is a claim for that season.
+            # 'One Piece Log - Fish-Man Island Saga - 13' is episode 13 of the
+            # Fish-Man Island season; for S20E13 the bare 13 matched and the
+            # file was grabbed, then refused at the add. An explicit arc name
+            # is a coordinate and conflicts like one.
+            for other_season, other_names in by_season.items():
+                if other_season == target_season:
+                    continue
+                rest = [n for s, ns in by_season.items() if s != other_season for n in ns]
+                for other_name in other_names:
+                    if _claimed(other_name, rest):
+                        return False, IDENTITY_SEASON_TITLE_CONFLICT
 
     # A complete/batch range can contain both the requested in-season number
     # and its absolute number while still belonging to a different adaptation.
