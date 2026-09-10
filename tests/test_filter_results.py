@@ -955,6 +955,28 @@ class TestFilterResultsAnimeXEM(unittest.TestCase):
             **extra,
         )[0]
 
+    def test_show_year_on_the_torrent_is_accepted_for_any_season(self):
+        """'Pokemon (1997) Season 19' is season 19 of the 1997 show. The rule
+        used to demand the season air year be within five years of the show
+        year, which rejected every pack of a long-running show past its fifth
+        year: ~1,600 a day on 2026-09-09."""
+        from unittest.mock import patch
+        result = self._coord_result(
+            "Test Anime 2020 S19E20 1080p WEB-DL AAC H.264-SubsPlease", [19], [20], id_based=False)
+        result['parsed_info']['year'] = self.year          # the show's own year
+        with patch('database.database_reading.get_season_year', return_value=self.year + 10):
+            kept = self._filter_with_coords([result], (19, 20), (19, 20))
+        self.assertEqual(len(kept), 1, result.get('filter_reason'))
+
+    def test_a_different_year_is_still_a_different_show(self):
+        from unittest.mock import patch
+        result = self._coord_result(
+            "Test Anime 2023 S19E20 1080p WEB-DL AAC H.264-SubsPlease", [19], [20], id_based=False)
+        result['parsed_info']['year'] = 2023
+        with patch('database.database_reading.get_season_year', return_value=self.year + 10):
+            kept = self._filter_with_coords([result], (19, 20), (19, 20))
+        self.assertEqual(kept, [])
+
     def test_coordinate_applies_per_result_not_per_batch(self):
         """Each result is judged at the coordinate its own scraper answers in.
 

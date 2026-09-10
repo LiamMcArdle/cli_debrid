@@ -1156,14 +1156,16 @@ def filter_results(
                                         py_int = int(py)
                                         year_difference = abs(py_int - target_year)
                                         
-                                        # If the torrent year matches the original show year exactly, be more lenient
+                                        # The show's own year names the show, not the season:
+                                        # 'Pokemon (1997) Season 19' is season 19 of the 1997
+                                        # show. A distance test against the season's air year
+                                        # rejected every pack of a long-running show past its
+                                        # fifth year (Pokemon, One Piece, JoJo: ~1,600 packs a
+                                        # day on 2026-09-09). The season and episode checks
+                                        # below decide whether the release is the right one.
                                         if py_int == year and target_year != year:
-                                            # Torrent uses original show year, but we have a different season year
-                                            # Allow if the season year is within a reasonable range (e.g., ±5 years)
-                                            max_year_difference = 5  # More lenient for TV shows
-                                            if year_difference <= max_year_difference:
-                                                year_matches.append(py_int)
-                                                logging.info(f"Accepting torrent with original show year ({py_int}) for season {season} (air date: {target_year}) - within {max_year_difference} year tolerance for '{original_title}'")
+                                            year_matches.append(py_int)
+                                            logging.info(f"Accepting torrent with original show year ({py_int}) for season {season} (air date: {target_year}) for '{original_title}'")
                                         else:
                                             # Standard ±1 year tolerance for other cases
                                             if year_difference <= 1:
@@ -1187,17 +1189,11 @@ def filter_results(
                             year_difference = abs(parsed_year_int - target_year)
                             
                             
-                            # If the torrent year matches the original show year exactly, be more lenient
+                            # The show's own year names the show, not the season (see the
+                            # list branch above): accept it and let the season and episode
+                            # checks decide.
                             if parsed_year_int == year and target_year != year:
-                                # Torrent uses original show year, but we have a different season year
-                                # Allow if the season year is within a reasonable range (e.g., ±5 years)
-                                max_year_difference = 5  # More lenient for TV shows
-                                if year_difference <= max_year_difference:
-                                    logging.info(f"Accepting torrent with original show year ({parsed_year_int}) for season {season} (air date: {target_year}) - within {max_year_difference} year tolerance for '{original_title}'")
-                                else:
-                                    result['filter_reason'] = f"Year mismatch: {parsed_year} (expected: {target_year}, original show: {year}) - torrent uses original show year but season air date is too far"
-                                    logging.info(f"Rejected: TV year {parsed_year} (original show year) too far from season year {target_year} for '{original_title}' (Size: {result['size']:.2f}GB)")
-                                    continue
+                                logging.info(f"Accepting torrent with original show year ({parsed_year_int}) for season {season} (air date: {target_year}) for '{original_title}'")
                             else:
                                 # Standard ±1 year tolerance for other cases
                                 if year_difference > 1:
