@@ -281,6 +281,39 @@ class TestAllRefusedIsHeldNotFailed(unittest.TestCase):
         self.assertFalse(kwargs.get('hold_rung', False))
 
 
+class TestStaleRememberedTorrentId(unittest.TestCase):
+    """The cache check adds a torrent, sees it is not cached, removes it -- and
+    left its id in the provider's hash map. The hybrid pass then "reused" the
+    id, got a 404 and reported a failed add: 260 of 262 reuses on 2026-09-09,
+    so no uncached download was ever made."""
+
+    def test_a_vanished_id_is_forgotten_and_the_torrent_added_fresh(self):
+        provider = MagicMock(PROVIDER_NAME='Real-Debrid')
+        provider._all_torrent_ids = {MAGNET.split('btih:')[1][:40].lower(): 'STALE'}
+        provider.get_torrent_info.return_value = None
+        provider.get_active_downloads.return_value = (0, 10)
+        tp = _processor(provider)
+        item = {'id': 1, 'title': 'Show'}
+        with patch('queues.torrent_processor.get_debrid_providers', return_value=[provider]), \
+                patch('queues.torrent_processor.is_blocked_everywhere', return_value=False), \
+                patch.object(tp, 'check_cache_status', return_value=(False, 'direct_check')), \
+                patch.object(tp, 'add_to_account', return_value=None) as add:
+            tp.process_results([{'title': 'A', 'magnet': MAGNET}], accept_uncached=True, item=item)
+        add.assert_called_once()
+        self.assertNotIn('STALE', provider._all_torrent_ids.values())
+
+    def test_cache_check_forgets_the_id_it_removed(self):
+        c = _rd_client()
+        c.add_torrent = MagicMock(return_value='T1')
+        c.get_torrent_info = MagicMock(return_value={'id': 'T1', 'status': 'downloading', 'filename': 'x',
+                                                     'files': [{'id': 1, 'path': '/x.mkv', 'bytes': 10}]})
+        c.remove_torrent = MagicMock()
+        with patch('debrid.real_debrid.client.update_cache_check_removal', create=True), \
+                patch('database.torrent_tracking.update_cache_check_removal'):
+            asyncio.run(c.is_cached(MAGNET, result_title='t'))
+        self.assertEqual(c._all_torrent_ids, {})
+
+
 class TestNoSiblingSweep(unittest.TestCase):
     def test_a_failure_flags_only_the_item_itself(self):
         """One item finding nothing addable said nothing about its siblings,

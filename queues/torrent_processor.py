@@ -1135,9 +1135,18 @@ class TorrentProcessor:
                                     logging.warning(f"[{item_identifier}] Could not remove errored torrent {existing_torrent_id}: {remove_err}")
                                 logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] PHASE: Addition - Adding to debrid service (after removing errored torrent)")
                                 info = self.add_to_account(original_link)
-                            else:
+                            elif existing_info:
                                 logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] Reusing existing torrent ID: {existing_torrent_id}")
                                 info = existing_info
+                            else:
+                                # The remembered id is gone from the account (the
+                                # cache check removed it): forget it and add fresh.
+                                logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] Remembered torrent {existing_torrent_id} no longer exists; adding fresh")
+                                try:
+                                    self.debrid_provider._all_torrent_ids.pop(hash_value, None)
+                                except Exception:
+                                    pass
+                                info = self.add_to_account(original_link)
                         else:
                             logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] PHASE: Addition - Adding to debrid service")
                             info = self.add_to_account(original_link)

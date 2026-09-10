@@ -456,6 +456,13 @@ class RealDebridProvider(DebridProvider):
                     elif local_remove_uncached:
                         try:
                             self.remove_torrent(torrent_id, "Torrent is not cached - removed after cache check")
+                            # remove_torrent learns the hash from the torrent
+                            # it just deleted, so it cannot: the id stayed in
+                            # the map, the hybrid pass "reused" it, got a 404
+                            # and reported a failed add -- 260 of 262 reuses on
+                            # 2026-09-09, every uncached download this library
+                            # would have made.
+                            self._all_torrent_ids.pop(hash_value, None)
                             from database.torrent_tracking import update_cache_check_removal
                             update_cache_check_removal(hash_value)
                         except Exception as e:
